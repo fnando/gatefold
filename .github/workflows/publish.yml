@@ -108,18 +108,33 @@ jobs:
             --detach-sign --output SHA256SUMS.sig SHA256SUMS
           gpg --batch --verify SHA256SUMS.sig SHA256SUMS
           rm -rf "$GNUPGHOME"
-      # GitHub refuses to create a release with the workflow's own token when the
-      # changes since the previous release touch .github/workflows (it would need
-      # the `workflows` permission, which GITHUB_TOKEN can't have). RELEASE_TOKEN,
-      # a fine-grained PAT with Contents and Workflows read/write on this repo,
-      # covers that; it falls back to the workflow token when unset.
+      # The tag is created first, and the release then points at it rather than
+      # at a commit: with the workflow's own token, GitHub only accepts a release
+      # target that is still the head of the branch, which stops being true as
+      # soon as anything else lands on main (say, during a rerun after the macOS
+      # builds had to wait for a runner).
+      - name: Tag the merge commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SHA: ${{ needs.version.outputs.sha }}
+        run: |
+          if existing=$(gh api "repos/${{ github.repository }}/git/ref/tags/v$VERSION" --jq .object.sha 2>/dev/null); then
+            if [ "$existing" != "$SHA" ]; then
+              echo "::error::v$VERSION already points at $existing, not $SHA"
+              exit 1
+            fi
+          else
+            gh api -X POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/v$VERSION" -f sha="$SHA" --silent
+          fi
       - name: Create the release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           gh release create "v$VERSION" dist/* \
             --repo "${{ github.repository }}" \
-            --target "${{ needs.version.outputs.sha }}" \
+            --verify-tag \
             --title "v$VERSION" \
             --generate-notes
