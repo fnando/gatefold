@@ -39,6 +39,10 @@ you already have.
   Artist images are create-only too unless `--replace-artist-images` is set, which keeps the
   previous files, dated, in `<artist>/primary/` and `<artist>/backdrops/` before writing the
   new ones.
+- **Keep your own images** with empty marker files: `.gatefold-keep` in an artist or album
+  folder means its existing images are never replaced, even when replacing (missing ones are
+  still written), and granular markers keep one kind each. See
+  [Keeping your own images](#keeping-your-own-images).
 - Optional `--verify`: each tag write is applied to a temp copy, validated with `ffprobe`,
   and only then atomically swapped over the original — a failed check never leaves a
   corrupted file.
@@ -222,6 +226,46 @@ earlier photo) is dropped rather than archived twice. Unchanged images are left 
 replace run on an up-to-date library is a no-op apart from the page fetches. Jellyfin plays everything in `backdrops/` as the artist's theme
 videos, so a previous motion backdrop kept there rotates with the current one; delete the
 dated copies once you're happy with the new one.
+
+### Keeping your own images
+
+For artists and albums whose art you picked yourself (a small artist with no photo on Apple
+Music, a better scan than the Cover Art Archive has), drop an empty marker file next to it.
+gatefold then never replaces (or archives) those images, even with `--replace-artist-images`
+/ `--replace-cover`. A kept image that's missing is still written, as on any run, so a marker
+only matters to replace runs. Lyrics are never affected.
+
+`.gatefold-keep` keeps everything its folder governs. Without it, the granular markers keep
+one kind each:
+
+| Marker | Where | Keeps |
+| --- | --- | --- |
+| `.gatefold-keep` | artist folder | `folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4`, and the covers of every album below it |
+| `.gatefold-keep` | album folder | the album's cover (embedded in each track + `cover.jpg`) |
+| `.gatefold-primary-keep` | artist folder | `folder.jpg` (the image archived in `primary/` on replace) |
+| `.gatefold-backdrop-keep` | artist folder | `backdrop.jpg` |
+| `.gatefold-video-keep` | artist folder | `backdrops/backdrop.mp4` |
+| `.gatefold-cover-keep` | album folder, or artist folder for all its albums | the album cover (embedded + `cover.jpg`) |
+
+```
+Music/
+    Bad Cop Bad Cop/
+        .gatefold-keep              # artist images and every album cover below: yours
+        folder.jpg
+        2017 - Warriors/
+    Kemuri/
+        .gatefold-primary-keep      # folder.jpg is yours; backdrop + video from Apple Music
+        folder.jpg
+        backdrop.jpg
+        1997 - Little Playmate/
+            .gatefold-cover-keep    # this album's cover is yours
+            cover.jpg
+```
+
+For covers, gatefold checks the album folder and every folder above it up to the scanned
+root, so markers above the root don't count. An artist split across two roots follows each
+folder's own markers. On a replace run where every image an artist or album has is kept,
+gatefold skips the lookups and the summary counts it as `kept`.
 
 ### Incremental runs (`--new-only`)
 

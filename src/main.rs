@@ -3,6 +3,7 @@ mod artist;
 mod backup;
 mod cli;
 mod coverart;
+mod keep;
 mod lrclib;
 mod metadata;
 mod musicbrainz;
@@ -397,6 +398,7 @@ fn process_track(
     if cli.cover_enabled() {
         match process_cover(
             cli,
+            root,
             state,
             services,
             progress,
@@ -560,6 +562,9 @@ fn fetch_lyrics(
 /// What happened to a track's cover art.
 enum CoverOutcome {
     SkippedNoMbid,
+    /// `--replace-cover`, but a `.gatefold-keep` / `.gatefold-cover-keep` marker
+    /// covers the album and its cover is already there.
+    Kept,
     SkippedNothingToDo,
     SkippedByFilter,
     NotFound,
@@ -578,6 +583,7 @@ enum CoverOutcome {
 #[allow(clippy::too_many_arguments)]
 fn process_cover(
     cli: &Cli,
+    root: &Path,
     state: &State,
     services: &Services,
     progress: &Progress,
@@ -600,12 +606,19 @@ fn process_cover(
         .filter(|s| !s.trim().is_empty());
 
     let folder = path.parent();
-    // With --replace-cover we (re)write even when a cover is already present.
-    let need_embed = !meta.has_cover_art || cli.replace_cover;
-    let need_sidecar =
-        folder.is_some_and(|dir| !writer::folder_has_cover(dir) || cli.replace_cover);
+    // With --replace-cover we (re)write even when a cover is already present —
+    // unless a keep marker covers the album: then a missing cover is still
+    // written, but an existing one is never replaced.
+    let kept = folder.is_some_and(|dir| keep::cover(dir, root));
+    let replace = cli.replace_cover && !kept;
+    let need_embed = !meta.has_cover_art || replace;
+    let need_sidecar = folder.is_some_and(|dir| !writer::folder_has_cover(dir) || replace);
     if !need_embed && !need_sidecar {
-        return Ok(CoverOutcome::SkippedNothingToDo);
+        return Ok(if cli.replace_cover && kept {
+            CoverOutcome::Kept
+        } else {
+            CoverOutcome::SkippedNothingToDo
+        });
     }
 
     // The art cache is keyed by release id (plus the source/size variant, so a
@@ -653,7 +666,7 @@ fn process_cover(
             path,
             &art.mime,
             &art.data,
-            cli.replace_cover,
+            replace,
             cli.verify,
             Some(backup),
         )?
@@ -662,7 +675,7 @@ fn process_cover(
     };
     let sidecar = match folder {
         Some(dir) if need_sidecar => {
-            writer::write_cover_sidecar(dir, &art.ext, &art.data, cli.replace_cover, Some(backup))?
+            writer::write_cover_sidecar(dir, &art.ext, &art.data, replace, Some(backup))?
         }
         _ => writer::Write::Skipped,
     };
@@ -783,6 +796,9 @@ fn collect_artist(
 /// What happened to an artist's images.
 enum ArtistOutcome {
     NoFolder,
+    /// `--replace-artist-images`, but every artist folder keeps all its images
+    /// (`.gatefold-keep` & co) and has them already.
+    Kept,
     SkippedNothingToDo,
     SkippedByFilter,
     NoLinks,
@@ -815,7 +831,9 @@ fn process_artist(
 ) -> Result<ArtistOutcome> {
     let (mb, resolver) = (&services.musicbrainz, &services.resolver);
     let mbid = job.mbid.as_str();
-    let replacing = cli.replace_artist_images;
+    // Keep markers in every folder turn a replace run into a plain one: missing
+    // files are still written, existing ones are left alone.
+    let replacing = cli.replace_artist_images && !fully_kept(job);
     if job.folders.is_empty() && !cli.cache_only {
         return Ok(ArtistOutcome::NoFolder);
     }
@@ -827,7 +845,11 @@ fn process_artist(
     // Every folder already complete and not replacing: nothing to do, and no
     // reason to touch the network.
     if !replacing && !cli.cache_only && folders_complete(job, record.as_ref(), services.videos) {
-        return Ok(ArtistOutcome::SkippedNothingToDo);
+        return Ok(if cli.replace_artist_images {
+            ArtistOutcome::Kept
+        } else {
+            ArtistOutcome::SkippedNothingToDo
+        });
     }
 
     // --new-only: only artists never looked up. --miss-only: only recorded misses.
@@ -932,14 +954,22 @@ fn process_artist(
     }
 }
 
+/// True when every artist folder keeps all its artist images (`keep` markers), so
+/// a replace run has nothing to replace.
+fn fully_kept(job: &ArtistJob) -> bool {
+    !job.folders.is_empty() && job.folders.iter().all(|dir| keep::all_artist_images(dir))
+}
+
 /// True when some artist folder lacks a file the resolution can provide (or a
-/// replace is due, which rewrites regardless).
+/// replace is due for a file no keep marker protects).
 fn missing_files(job: &ArtistJob, resolved: &Resolved, replace: bool, want_video: bool) -> bool {
     job.folders.iter().any(|dir| {
-        replace
-            || ArtistImage::Avatar.existing(dir).is_none()
-            || (resolved.backdrop_url.is_some() && ArtistImage::Backdrop.existing(dir).is_none())
-            || (want_video && ArtistImage::Video.existing(dir).is_none())
+        let needs = |kind: ArtistImage, wanted: bool| {
+            wanted && (kind.existing(dir).is_none() || (replace && !keep::artist_image(dir, kind)))
+        };
+        needs(ArtistImage::Avatar, true)
+            || needs(ArtistImage::Backdrop, resolved.backdrop_url.is_some())
+            || needs(ArtistImage::Video, want_video)
     })
 }
 
@@ -1017,6 +1047,8 @@ fn write_artist_images(
     for dir in &job.folders {
         for (kind, art) in &files {
             let Some(art) = art else { continue };
+            // Hand-curated in this folder: written if missing, never replaced.
+            let replace = replace && !keep::artist_image(dir, *kind);
             let (wrote, kept) =
                 writer::write_artist_image(dir, *kind, &art.ext, &art.data, replace, revisions)?;
             let slot = match kind {
@@ -1204,9 +1236,11 @@ fn log_lyrics(progress: &Progress, name: &str, outcome: &LyricsOutcome) {
 fn log_cover(progress: &Progress, name: &str, outcome: &CoverOutcome) {
     match outcome {
         // Missing MBID, "nothing to do", and filter skips are common; keep them quiet.
+        // Kept covers would log once per track of the album; the summary counts them.
         CoverOutcome::SkippedNoMbid
         | CoverOutcome::SkippedNothingToDo
-        | CoverOutcome::SkippedByFilter => {}
+        | CoverOutcome::SkippedByFilter
+        | CoverOutcome::Kept => {}
         CoverOutcome::NotFound => {
             progress.info(format!("· {name}: cover art not found"));
         }
@@ -1252,6 +1286,7 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             "· {name}: no artist folder above {}",
             job.sample_dir.display()
         )),
+        ArtistOutcome::Kept => progress.info(format!("· {name}: artist images kept")),
         ArtistOutcome::NoLinks => {
             progress.info(format!(
                 "· {name}: no Apple Music/Spotify link on MusicBrainz"
@@ -1317,6 +1352,7 @@ struct Summary {
     wrote_cover_sidecar: u64,
     replaced_cover_sidecar: u64,
     cover_skipped: u64,
+    cover_kept: u64,
     cover_not_found: u64,
     cover_cache_only: u64,
     cover_errors: u64,
@@ -1325,6 +1361,7 @@ struct Summary {
     artist_replaced: u64,
     artist_unchanged: u64,
     artist_skipped: u64,
+    artist_kept: u64,
     artist_no_folder: u64,
     artist_no_links: u64,
     artist_no_image: u64,
@@ -1364,6 +1401,7 @@ impl Summary {
                 self.cover_skipped += 1;
             }
             CoverOutcome::NotFound => self.cover_not_found += 1,
+            CoverOutcome::Kept => self.cover_kept += 1,
             CoverOutcome::CacheOnly { .. } => self.cover_cache_only += 1,
             CoverOutcome::Applied {
                 embedded, sidecar, ..
@@ -1388,6 +1426,7 @@ impl Summary {
                 self.artist_skipped += 1;
             }
             ArtistOutcome::NoFolder => self.artist_no_folder += 1,
+            ArtistOutcome::Kept => self.artist_kept += 1,
             ArtistOutcome::NoLinks => self.artist_no_links += 1,
             ArtistOutcome::NoImage => self.artist_no_image += 1,
             ArtistOutcome::Unchanged => self.artist_unchanged += 1,
@@ -1437,9 +1476,10 @@ impl Summary {
             ));
         }
         progress.info(format!(
-            "  unchanged {}, skipped {}, no folder {}, no links {}, no image {}, errors {}",
+            "  unchanged {}, skipped {}, kept {}, no folder {}, no links {}, no image {}, errors {}",
             self.artist_unchanged,
             self.artist_skipped,
+            self.artist_kept,
             self.artist_no_folder,
             self.artist_no_links,
             self.artist_no_image,
@@ -1479,8 +1519,8 @@ impl Summary {
             ));
         }
         progress.info(format!(
-            "  skipped {}, not found {}, errors {}",
-            self.cover_skipped, self.cover_not_found, self.cover_errors
+            "  skipped {}, kept {}, not found {}, errors {}",
+            self.cover_skipped, self.cover_kept, self.cover_not_found, self.cover_errors
         ));
     }
 }
