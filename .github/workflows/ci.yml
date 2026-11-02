@@ -52,4 +52,4 @@ jobs:
           key: lint-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: lint-${{ runner.os }}-
       - run: cargo fmt --check
-      - run: cargo clippy --locked --quiet -- -Dwarnings -Dclippy::all -Dclippy::pedantic
+      - run: cargo clippy --all-targets --locked --quiet -- -Dwarnings -Dclippy::all -Dclippy::pedantic

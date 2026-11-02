@@ -338,7 +338,7 @@ mod tests {
             "results": [
                 { "wrapperType": "artist", "artistName": "Radiohead" },
                 { "wrapperType": "collection", "collectionType": "Album",
-                  "collectionId": 1097861387, "collectionName": "OK Computer",
+                  "collectionId": 1_097_861_387, "collectionName": "OK Computer",
                   "artworkUrl100": format!("{BASE}/100x100bb.jpg") }
             ]
         });

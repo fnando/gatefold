@@ -1,7 +1,7 @@
 .PHONY: check fmt build
 
 check:
-	cargo clippy --quiet -- -Dwarnings -Dclippy::all -Dclippy::pedantic
+	cargo clippy --all-targets --quiet -- -Dwarnings -Dclippy::all -Dclippy::pedantic
 	cargo fmt --all -- --check
 
 fmt:
