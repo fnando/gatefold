@@ -42,12 +42,13 @@ pub struct Progress {
     multi: MultiProgress,
     bar: ProgressBar,
     total: u32,
+    /// What the bar counts, for log lines ("track" / "artist").
+    unit: &'static str,
     estimator: RefCell<Estimator>,
 }
 
 impl Progress {
     pub fn new(total: usize, seed_secs: f64) -> Self {
-        let total = u32::try_from(total).unwrap_or(u32::MAX);
         // Off a TTY (e.g. cron), indicatif can't reposition the cursor to redraw the
         // bar, which garbles and duplicates the explicit log lines. Hide the live
         // rendering there so each line is emitted once; interactive runs are unchanged.
@@ -56,6 +57,23 @@ impl Progress {
         } else {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
+        Self::on(multi, "processing", "track", total, seed_secs)
+    }
+
+    /// A follow-up phase sharing this reporter's terminal: a fresh bar (the previous
+    /// one stays finished above it) with its own total, unit, and ETA estimator.
+    pub fn phase(&self, prefix: &str, unit: &'static str, total: usize, seed_secs: f64) -> Self {
+        Self::on(self.multi.clone(), prefix, unit, total, seed_secs)
+    }
+
+    fn on(
+        multi: MultiProgress,
+        prefix: &str,
+        unit: &'static str,
+        total: usize,
+        seed_secs: f64,
+    ) -> Self {
+        let total = u32::try_from(total).unwrap_or(u32::MAX);
         let bar = multi.add(ProgressBar::new(u64::from(total)));
         bar.set_style(
             ProgressStyle::with_template(
@@ -64,11 +82,12 @@ impl Progress {
             .unwrap()
             .progress_chars("=> "),
         );
-        bar.set_prefix("processing");
+        bar.set_prefix(prefix.to_string());
         Self {
             multi,
             bar,
             total,
+            unit,
             estimator: RefCell::new(Estimator::new(seed_secs)),
         }
     }
@@ -111,8 +130,9 @@ impl Progress {
     /// Log the initial estimate before any track is processed.
     pub fn log_initial_estimate(&self) {
         self.info(format!(
-            "estimated time for {} tracks: ~{} (will refine as it runs)",
+            "estimated time for {} {}s: ~{} (will refine as it runs)",
             self.total,
+            self.unit,
             format_duration(self.eta())
         ));
     }
@@ -126,9 +146,10 @@ impl Progress {
         };
         if pos > 0 {
             self.info(format!(
-                "progress {}/{} · avg {avg:.1}s/track · ETA ~{}",
+                "progress {}/{} · avg {avg:.1}s/{} · ETA ~{}",
                 pos,
                 self.total,
+                self.unit,
                 format_duration(self.eta())
             ));
         }

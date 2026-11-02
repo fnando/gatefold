@@ -1,12 +1,20 @@
-use crate::net::{RateLimitWaiter, retry_after, with_jitter};
-use anyhow::{Result, anyhow, bail};
+use crate::net::{self, Policy, RateLimitWaiter};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::thread::sleep;
 use std::time::Duration;
 use ureq::Agent;
 
 const ENDPOINT: &str = "https://lrclib.net/api/get";
+/// lrclib's `Retry-After` is authoritative: keep waiting for as long as it asks.
+const POLICY: Policy<'static> = Policy {
+    service: "lrclib",
+    max_rate_limit_retries: None,
+    default_wait_secs: (5, 1),
+    throttle_statuses: net::THROTTLE,
+};
+/// Lyrics responses are small; anything bigger is not what we asked for.
+const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A lyrics record as returned by lrclib. Serialized verbatim into the cache,
 /// so field names stay camelCase to match the API.
@@ -86,13 +94,8 @@ impl Client {
         api_key: Option<String>,
         delay: Duration,
     ) -> Self {
-        // Disable "status >= 400 is an error" so we can inspect 404/429/503 responses.
-        let agent: Agent = Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .into();
         Self {
-            agent,
+            agent: net::agent(),
             user_agent,
             app_id,
             api_key,
@@ -102,9 +105,7 @@ impl Client {
 
     /// Fetch lyrics, transparently retrying `429`/`503` by honoring `Retry-After`.
     pub fn get<W: RateLimitWaiter>(&self, query: &Query<'_>, waiter: &W) -> Result<Fetched> {
-        loop {
-            sleep(self.delay);
-
+        let build = || {
             let mut request = self
                 .agent
                 .get(ENDPOINT)
@@ -125,46 +126,28 @@ impl Client {
             if let Some(api_key) = &self.api_key {
                 request = request.header("Lrclib-Api-Key", api_key.as_str());
             }
+            request
+        };
+        let mut response = net::get(build, self.delay, &POLICY, waiter)?;
 
-            let mut response = request.call().map_err(|e| anyhow!("request failed: {e}"))?;
-            let status = response.status().as_u16();
-
-            match status {
-                200 => {
-                    let is_json = response
-                        .headers()
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|v| v.contains("json"));
-                    let body = response
-                        .body_mut()
-                        .read_to_string()
-                        .map_err(|e| anyhow!("reading body: {e}"))?;
-                    if !is_json {
-                        bail!("unexpected non-JSON 200 response");
-                    }
-                    let record: LyricsRecord = serde_json::from_str(&body)?;
-                    return Ok(Fetched::Found(record));
+        match response.status().as_u16() {
+            200 => {
+                let is_json = net::content_type(&response, "").contains("json");
+                let body = net::read_text(&mut response, MAX_BODY_BYTES)?;
+                if !is_json {
+                    bail!("unexpected non-JSON 200 response");
                 }
-                404 => return Ok(Fetched::NotFound),
-                401 => {
-                    let body = response.body_mut().read_to_string().unwrap_or_default();
-                    return Err(anyhow::Error::new(Unauthorized(summarize(&body))));
-                }
-                429 | 503 => {
-                    let default = if status == 503 { 1 } else { 5 };
-                    let wait = retry_after(&response).unwrap_or(default);
-                    let reason = if status == 503 {
-                        "server overloaded"
-                    } else {
-                        "rate limited"
-                    };
-                    waiter.wait(with_jitter(wait), reason);
-                }
-                other => {
-                    let body = response.body_mut().read_to_string().unwrap_or_default();
-                    bail!("lrclib returned {other}: {}", summarize(&body));
-                }
+                let record: LyricsRecord = serde_json::from_str(&body)?;
+                Ok(Fetched::Found(record))
+            }
+            404 => Ok(Fetched::NotFound),
+            401 => {
+                let body = net::read_text(&mut response, MAX_BODY_BYTES).unwrap_or_default();
+                Err(anyhow::Error::new(Unauthorized(summarize(&body))))
+            }
+            other => {
+                let body = net::read_text(&mut response, MAX_BODY_BYTES).unwrap_or_default();
+                bail!("lrclib returned {other}: {}", summarize(&body));
             }
         }
     }

@@ -5,11 +5,13 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// A cover-art image restored from the cache.
+/// An image restored from the cache.
 pub struct CachedArt {
     pub mime: String,
     pub ext: String,
     pub data: Vec<u8>,
+    /// Where it came from (e.g. `apple music`), when recorded.
+    pub source: Option<String>,
 }
 
 /// Sidecar describing the bytes stored next to it at `art/<digest>.<ext>`.
@@ -17,16 +19,23 @@ pub struct CachedArt {
 struct ArtMeta {
     ext: String,
     mime: String,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 /// On-disk cache rooted at `--state-dir`, holding parallel trees:
 /// `metadata/<digest>.json` (extracted tags), `lrc/<digest>.json` (lyrics
-/// responses), and `art/<digest>.{json,<ext>}` (cover-art images).
+/// responses), `art/<digest>.{json,<ext>}` (downloaded images, cover and artist
+/// alike), `artist/<mbid>.{mb.json,json,miss}` (per-artist link lookups, resolved
+/// image URLs, and misses), and `release/<mbid>.{mb.json,json,miss}` (the same for
+/// a release's Apple Music artwork, plus `release/group-<mbid>.mb.json` browses).
 #[allow(clippy::struct_field_names)] // the `_dir` suffix is meaningful here
 pub struct State {
     metadata_dir: PathBuf,
     lrc_dir: PathBuf,
     art_dir: PathBuf,
+    artist_dir: PathBuf,
+    release_dir: PathBuf,
     backup_dir: PathBuf,
 }
 
@@ -36,14 +45,25 @@ impl State {
         let metadata_dir = root.join("metadata");
         let lrc_dir = root.join("lrc");
         let art_dir = root.join("art");
+        let artist_dir = root.join("artist");
+        let release_dir = root.join("release");
         let backup_dir = root.join("backup");
-        for dir in [&metadata_dir, &lrc_dir, &art_dir, &backup_dir] {
+        for dir in [
+            &metadata_dir,
+            &lrc_dir,
+            &art_dir,
+            &artist_dir,
+            &release_dir,
+            &backup_dir,
+        ] {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         Ok(Self {
             metadata_dir,
             lrc_dir,
             art_dir,
+            artist_dir,
+            release_dir,
             backup_dir,
         })
     }
@@ -71,6 +91,34 @@ impl State {
 
     fn art_miss_path(&self, key: &str) -> PathBuf {
         self.art_dir.join(format!("{key}.miss"))
+    }
+
+    fn musicbrainz_artist_path(&self, mbid: &str) -> PathBuf {
+        self.artist_dir.join(format!("{mbid}.mb.json"))
+    }
+
+    fn artist_record_path(&self, mbid: &str) -> PathBuf {
+        self.artist_dir.join(format!("{mbid}.json"))
+    }
+
+    fn artist_miss_path(&self, mbid: &str) -> PathBuf {
+        self.artist_dir.join(format!("{mbid}.miss"))
+    }
+
+    fn musicbrainz_release_path(&self, mbid: &str) -> PathBuf {
+        self.release_dir.join(format!("{mbid}.mb.json"))
+    }
+
+    fn musicbrainz_group_path(&self, mbid: &str) -> PathBuf {
+        self.release_dir.join(format!("group-{mbid}.mb.json"))
+    }
+
+    fn release_art_path(&self, mbid: &str) -> PathBuf {
+        self.release_dir.join(format!("{mbid}.json"))
+    }
+
+    fn release_miss_path(&self, mbid: &str) -> PathBuf {
+        self.release_dir.join(format!("{mbid}.miss"))
     }
 
     pub fn load_metadata<T: DeserializeOwned>(&self, digest: &str) -> Result<Option<T>> {
@@ -134,8 +182,85 @@ impl State {
         self.has_art(key) || self.has_cover_miss(key)
     }
 
-    /// Persist a fetched cover image: metadata sidecar plus the raw bytes.
-    pub fn save_art(&self, digest: &str, ext: &str, mime: &str, data: &[u8]) -> Result<()> {
+    /// The raw `MusicBrainz` artist lookup (with URL relations), cached per artist.
+    pub fn load_musicbrainz_artist(&self, mbid: &str) -> Result<Option<serde_json::Value>> {
+        read_json(&self.musicbrainz_artist_path(mbid))
+    }
+
+    pub fn save_musicbrainz_artist(&self, mbid: &str, value: &serde_json::Value) -> Result<()> {
+        write_json(&self.musicbrainz_artist_path(mbid), value)
+    }
+
+    /// The resolved image URLs (and what was last written) for an artist.
+    pub fn load_artist_record<T: DeserializeOwned>(&self, mbid: &str) -> Result<Option<T>> {
+        read_json(&self.artist_record_path(mbid))
+    }
+
+    pub fn save_artist_record<T: Serialize>(&self, mbid: &str, value: &T) -> Result<()> {
+        write_json(&self.artist_record_path(mbid), value)?;
+        remove_if_exists(&self.artist_miss_path(mbid))
+    }
+
+    pub fn has_artist_record(&self, mbid: &str) -> bool {
+        self.artist_record_path(mbid).is_file()
+    }
+
+    /// Record that an artist has no usable links or no usable image.
+    pub fn save_artist_miss(&self, mbid: &str) -> Result<()> {
+        touch(&self.artist_miss_path(mbid))
+    }
+
+    pub fn has_artist_miss(&self, mbid: &str) -> bool {
+        self.artist_miss_path(mbid).is_file()
+    }
+
+    /// True once an artist lookup has been recorded either way (record or miss).
+    pub fn has_artist_state(&self, mbid: &str) -> bool {
+        self.has_artist_record(mbid) || self.has_artist_miss(mbid)
+    }
+
+    /// The raw `MusicBrainz` release lookup (with URL relations), cached per release.
+    pub fn load_musicbrainz_release(&self, mbid: &str) -> Result<Option<serde_json::Value>> {
+        read_json(&self.musicbrainz_release_path(mbid))
+    }
+
+    pub fn save_musicbrainz_release(&self, mbid: &str, value: &serde_json::Value) -> Result<()> {
+        write_json(&self.musicbrainz_release_path(mbid), value)
+    }
+
+    /// The raw `MusicBrainz` browse of a release group's releases.
+    pub fn load_musicbrainz_group(&self, mbid: &str) -> Result<Option<serde_json::Value>> {
+        read_json(&self.musicbrainz_group_path(mbid))
+    }
+
+    pub fn save_musicbrainz_group(&self, mbid: &str, value: &serde_json::Value) -> Result<()> {
+        write_json(&self.musicbrainz_group_path(mbid), value)
+    }
+
+    /// Where a release's Apple Music artwork was found.
+    pub fn load_release_art<T: DeserializeOwned>(&self, mbid: &str) -> Result<Option<T>> {
+        read_json(&self.release_art_path(mbid))
+    }
+
+    pub fn save_release_art<T: Serialize>(&self, mbid: &str, value: &T) -> Result<()> {
+        write_json(&self.release_art_path(mbid), value)?;
+        remove_if_exists(&self.release_miss_path(mbid))
+    }
+
+    /// Record that no Apple Music artwork could be found for a release.
+    pub fn save_release_miss(&self, mbid: &str) -> Result<()> {
+        touch(&self.release_miss_path(mbid))
+    }
+
+    /// Persist a fetched image: metadata sidecar plus the raw bytes.
+    pub fn save_art(
+        &self,
+        digest: &str,
+        ext: &str,
+        mime: &str,
+        source: Option<&str>,
+        data: &[u8],
+    ) -> Result<()> {
         let bytes_path = self.art_dir.join(format!("{digest}.{ext}"));
         fs::write(&bytes_path, data)
             .with_context(|| format!("writing {}", bytes_path.display()))?;
@@ -144,6 +269,7 @@ impl State {
             &ArtMeta {
                 ext: ext.to_string(),
                 mime: mime.to_string(),
+                source: source.map(str::to_string),
             },
         )?;
         self.clear_cover_miss(digest)
@@ -161,6 +287,7 @@ impl State {
             mime: meta.mime,
             ext: meta.ext,
             data,
+            source: meta.source,
         }))
     }
 }
@@ -173,8 +300,13 @@ pub fn digest_for(path: &Path) -> String {
 /// `sha256` of an arbitrary string, hex-encoded; used e.g. to key the art cache
 /// by `MusicBrainz` release id so it's shared across a release's tracks.
 pub fn digest_str(value: &str) -> String {
+    digest_bytes(value.as_bytes())
+}
+
+/// `sha256` of arbitrary bytes, hex-encoded.
+pub fn digest_bytes(value: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
+    hasher.update(value);
     hex::encode(hasher.finalize())
 }
 
