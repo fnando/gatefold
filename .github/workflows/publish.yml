@@ -108,9 +108,14 @@ jobs:
             --detach-sign --output SHA256SUMS.sig SHA256SUMS
           gpg --batch --verify SHA256SUMS.sig SHA256SUMS
           rm -rf "$GNUPGHOME"
+      # GitHub refuses to create a release with the workflow's own token when the
+      # changes since the previous release touch .github/workflows (it would need
+      # the `workflows` permission, which GITHUB_TOKEN can't have). RELEASE_TOKEN,
+      # a fine-grained PAT with Contents and Workflows read/write on this repo,
+      # covers that; it falls back to the workflow token when unset.
       - name: Create the release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           gh release create "v$VERSION" dist/* \
