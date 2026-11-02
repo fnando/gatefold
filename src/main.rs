@@ -306,6 +306,13 @@ fn run_summary(cli: &Cli, mb_host: Option<&str>) -> String {
     } else {
         "all"
     };
+    let select = match cli.retry_missed_after {
+        Some(window) => format!(
+            "{select} (misses within {} left alone)",
+            cli::format_duration(window)
+        ),
+        None => select.to_string(),
+    };
     let replace = join_enabled(&[
         ("lyrics", cli.replace_lyrics),
         ("cover", cli.replace_cover),
@@ -482,9 +489,13 @@ fn process_lyrics(
     if cli.miss_only && !state.has_lyrics_miss(digest) {
         return Ok(LyricsOutcome::SkippedByFilter);
     }
+    if miss_fresh(cli, state.lyrics_miss_age(digest)) {
+        return Ok(LyricsOutcome::SkippedByFilter);
+    }
 
     // Reuse a cached hit; otherwise (re)query. A recorded miss is deliberately
-    // ignored here — only --new-only consults it — so a normal run rechecks it.
+    // ignored here (--new-only and --retry-missed-after consult it above), so a
+    // normal run rechecks it.
     let (record, reused) = if state.has_response(digest) {
         (state.load_response(digest)?, true)
     } else {
@@ -640,10 +651,14 @@ fn process_cover(
     if cli.miss_only && !state.has_cover_miss(&key) {
         return Ok(CoverOutcome::SkippedByFilter);
     }
+    if miss_fresh(cli, state.cover_miss_age(&key)) {
+        return Ok(CoverOutcome::SkippedByFilter);
+    }
 
     // Reuse a cached hit; else a within-run miss (so a release without art isn't
     // re-queried for every track); else look it up. The persisted `.miss` marker is
-    // deliberately ignored outside --new-only, so a normal run rechecks it.
+    // deliberately ignored here (--new-only and --retry-missed-after consult it
+    // above), so a normal run rechecks it.
     let (art, reused) = if state.has_art(&key) {
         (state.load_art(&key)?, true)
     } else if cover_misses.contains(&key) {
@@ -964,9 +979,16 @@ fn process_artist(
 }
 
 /// `--new-only`: only artists never looked up. `--miss-only`: only recorded misses.
+/// `--retry-missed-after`: not a miss recorded within the window.
 fn artist_filtered_out(cli: &Cli, state: &State, mbid: &str) -> bool {
     (cli.new_only && state.has_artist_state(mbid))
         || (cli.miss_only && !state.has_artist_miss(mbid))
+        || miss_fresh(cli, state.artist_miss_age(mbid))
+}
+
+/// True when `--retry-missed-after` is set and this miss was recorded within its window.
+fn miss_fresh(cli: &Cli, miss_age: Option<Duration>) -> bool {
+    matches!((cli.retry_missed_after, miss_age), (Some(window), Some(age)) if age < window)
 }
 
 /// Whether this artist's existing images are up for replacement on this run.

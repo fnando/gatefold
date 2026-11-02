@@ -87,6 +87,7 @@ gatefold --state-dir <DIR> [OPTIONS] [PATH]
 | `--verify` | Validate each tag write with `ffprobe` on a temp copy before atomically swapping it in. |
 | `--new-only` | Only look up items with no result on record yet — fast incremental re-runs. |
 | `--miss-only` | Only re-check items previously recorded as "not found" (conflicts with `--new-only`). |
+| `--retry-missed-after <DURATION>` | Don't retry an item recorded as "not found" within this long ago (`7d`, `12h`, …). Applies to normal runs, `--miss-only`, and artist replace runs. |
 | `--lyrics-only` | Process lyrics only; skip cover art (conflicts with `--cover-only`). |
 | `--cover-only` | Process cover art only; skip lyrics (conflicts with `--lyrics-only`). |
 | `--artist-images-only` | Process artist images only; skip lyrics and cover art. |
@@ -293,6 +294,13 @@ small `.miss` marker next to it. A hit later clears any stale `.miss` for that i
 processed and compose with the above — e.g. `--cover-only --miss-only` retries only the
 cover-art misses. For artists, a miss (no Apple Music / Spotify link on `MusicBrainz`, or no
 usable image) is recorded as `artist/<id>.miss`; `--miss-only` re-fetches the links for those.
+
+Retrying every miss on every run adds up once the list of things lrclib or Apple Music
+simply don't have settles. `--retry-missed-after 7d` leaves alone any miss recorded (or last
+confirmed) less than a week ago, so each miss is retried about weekly no matter how often
+the script runs. It applies wherever a miss would otherwise be rechecked: normal runs,
+`--miss-only`, and `--replace-artist-images` (which rechecks artist misses). The marker's
+own timestamp is the clock, and a retry that misses again refreshes it.
 
 ### Verifying writes
 

@@ -102,6 +102,12 @@ pub struct Cli {
     #[arg(long, conflicts_with = "new_only")]
     pub miss_only: bool,
 
+    /// Don't retry an item recorded as "not found" within this long ago (e.g. `7d`,
+    /// `12h`; units: s, m, h, d, w). Applies wherever a miss would be rechecked: normal
+    /// runs, --miss-only, and --replace-artist-images.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub retry_missed_after: Option<Duration>,
+
     /// Only process lyrics; skip cover art and artist images entirely.
     #[arg(long, conflicts_with = "cover_only")]
     pub lyrics_only: bool,

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// An image restored from the cache.
 pub struct CachedArt {
@@ -151,6 +152,11 @@ impl State {
         self.lrc_miss_path(digest).is_file()
     }
 
+    /// How long ago the lyrics miss was (last) recorded, if there is one.
+    pub fn lyrics_miss_age(&self, digest: &str) -> Option<Duration> {
+        age(&self.lrc_miss_path(digest))
+    }
+
     fn clear_lyrics_miss(&self, digest: &str) -> Result<()> {
         remove_if_exists(&self.lrc_miss_path(digest))
     }
@@ -171,6 +177,11 @@ impl State {
 
     pub fn has_cover_miss(&self, key: &str) -> bool {
         self.art_miss_path(key).is_file()
+    }
+
+    /// How long ago the cover miss was (last) recorded, if there is one.
+    pub fn cover_miss_age(&self, key: &str) -> Option<Duration> {
+        age(&self.art_miss_path(key))
     }
 
     fn clear_cover_miss(&self, key: &str) -> Result<()> {
@@ -212,6 +223,11 @@ impl State {
 
     pub fn has_artist_miss(&self, mbid: &str) -> bool {
         self.artist_miss_path(mbid).is_file()
+    }
+
+    /// How long ago the artist miss was (last) recorded, if there is one.
+    pub fn artist_miss_age(&self, mbid: &str) -> Option<Duration> {
+        age(&self.artist_miss_path(mbid))
     }
 
     /// True once an artist lookup has been recorded either way (record or miss).
@@ -328,8 +344,16 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 /// Create an empty marker file (used for persisted "not found" results).
+/// Write (or rewrite) an empty marker, so its mtime is when it was last recorded.
 fn touch(path: &Path) -> Result<()> {
     fs::write(path, []).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Time since a marker was last written; `None` when it doesn't exist. A marker
+/// from the future (clock skew) counts as just written.
+fn age(path: &Path) -> Option<Duration> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.elapsed().unwrap_or(Duration::ZERO))
 }
 
 /// Remove a file, treating "already gone" as success.
@@ -338,5 +362,21 @@ fn remove_if_exists(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn age_is_time_since_the_marker_was_written() {
+        let dir = std::env::temp_dir().join(format!("gatefold-age-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("x.miss");
+        assert_eq!(age(&marker), None);
+        touch(&marker).unwrap();
+        assert!(age(&marker).unwrap() < Duration::from_secs(60));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
