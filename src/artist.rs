@@ -110,6 +110,14 @@ impl ArtistRecord {
         self.version == RECORD_VERSION
     }
 
+    /// The same record, its page checked again just now.
+    pub fn rechecked(self, now: u64) -> Self {
+        Self {
+            resolved_at: now,
+            ..self
+        }
+    }
+
     pub fn resolved(&self) -> Resolved {
         Resolved {
             source: self.source,

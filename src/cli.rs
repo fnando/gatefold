@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Scan a folder of music files and backfill lyrics, cover art, and artist images.
 #[derive(Debug, Parser)]
@@ -78,6 +79,13 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["skip_artist_images", "lyrics_only", "cover_only"])]
     pub replace_artist_images: bool,
 
+    /// On a --replace-artist-images run, don't re-check an artist's page if it was
+    /// last checked within this long ago (e.g. `30d`, `12h`; units: s, m, h, d, w).
+    /// Keeps a scheduled replace run from hitting Apple Music/Spotify for every
+    /// artist every time. Missing images are still written.
+    #[arg(long, value_name = "DURATION", requires = "replace_artist_images", value_parser = parse_duration)]
+    pub artist_refresh_after: Option<Duration>,
+
     /// Validate each tag write with ffprobe before it replaces the original: changes
     /// are applied to a temp copy, verified, then atomically swapped in. Requires
     /// ffprobe (ffmpeg) on PATH.
@@ -116,6 +124,42 @@ pub struct Cli {
     pub skip_artist_videos: bool,
 }
 
+/// `30d`, `12h`, `90m`, `45s`, `2w`: a whole number plus a unit.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let digits = text.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &text[digits.len()..];
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("expected a number followed by s/m/h/d/w, got `{text}`"))?;
+    let secs = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => {
+            return Err(format!(
+                "unknown unit `{unit}` in `{text}`; use s, m, h, d or w"
+            ));
+        }
+    };
+    n.checked_mul(secs)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("`{text}` is too long"))
+}
+
+/// `30d` / `12h` / `90m` / `45s`, using the largest unit that divides evenly.
+pub fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    for (unit, size) in [("w", 7 * 86_400), ("d", 86_400), ("h", 3600), ("m", 60)] {
+        if secs > 0 && secs.is_multiple_of(size) {
+            return format!("{}{unit}", secs / size);
+        }
+    }
+    format!("{secs}s")
+}
+
 impl Cli {
     /// Resolve the `User-Agent`, falling back to a descriptive default.
     pub fn user_agent(&self) -> String {
@@ -138,5 +182,51 @@ impl Cli {
     /// `--lyrics-only` / `--cover-only` mean "only that", so they skip this pass too.
     pub fn artist_images_enabled(&self) -> bool {
         !self.skip_artist_images && !self.lyrics_only && !self.cover_only
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_units() {
+        assert_eq!(parse_duration("45s").unwrap(), Duration::from_secs(45));
+        assert_eq!(parse_duration("90m").unwrap(), Duration::from_mins(90));
+        assert_eq!(parse_duration("12h").unwrap(), Duration::from_hours(12));
+        assert_eq!(parse_duration("30d").unwrap(), Duration::from_hours(720));
+        assert_eq!(parse_duration("2w").unwrap(), Duration::from_hours(336));
+        assert_eq!(parse_duration(" 1d ").unwrap(), Duration::from_hours(24));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        for bad in ["", "30", "d", "30x", "-1d", "1.5h", "99999999999999999999d"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn formats_with_largest_even_unit() {
+        assert_eq!(format_duration(Duration::from_hours(720)), "30d");
+        assert_eq!(format_duration(Duration::from_hours(336)), "2w");
+        assert_eq!(format_duration(Duration::from_mins(90)), "90m");
+        assert_eq!(format_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(format_duration(Duration::ZERO), "0s");
+    }
+
+    #[test]
+    fn refresh_window_requires_replace() {
+        let base = ["gatefold", "--state-dir", "/tmp/s"];
+        assert!(
+            Cli::try_parse_from(base.iter().chain(["--artist-refresh-after", "30d"].iter()))
+                .is_err()
+        );
+        let cli = Cli::try_parse_from(
+            base.iter()
+                .chain(["--replace-artist-images", "--artist-refresh-after", "30d"].iter()),
+        )
+        .unwrap();
+        assert_eq!(cli.artist_refresh_after, Some(Duration::from_hours(720)));
     }
 }

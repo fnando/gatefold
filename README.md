@@ -83,6 +83,7 @@ gatefold --state-dir <DIR> [OPTIONS] [PATH]
 | `--replace-lyrics` | Overwrite an existing embedded lyrics tag (backing up the previous value). |
 | `--replace-cover` | Overwrite an existing embedded cover and `cover.jpg` sidecar (backing up the previous values), e.g. to upgrade to Apple Music's larger artwork. |
 | `--replace-artist-images` | Overwrite an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop when the artist's image has changed; the previous files are kept, dated, in `primary/` and `backdrops/`. |
+| `--artist-refresh-after <DURATION>` | With `--replace-artist-images`, don't re-check an artist's page if it was last checked within this long ago (`30d`, `12h`, `90m`, `45s`, `2w`). Missing images are still written. |
 | `--verify` | Validate each tag write with `ffprobe` on a temp copy before atomically swapping it in. |
 | `--new-only` | Only look up items with no result on record yet — fast incremental re-runs. |
 | `--miss-only` | Only re-check items previously recorded as "not found" (conflicts with `--new-only`). |
@@ -217,6 +218,13 @@ the new ones are written — into the artist folder's own archive subfolders, da
     backdrops/backdrop-<YYYY-MM-DD>.jpg   # previous backdrop(s)
     backdrops/backdrop-<YYYY-MM-DD>.mp4   # previous motion backdrop(s)
 ```
+
+Every replace run fetches each artist's page to learn the current image URLs, and that's
+usually the whole cost of the run on an up-to-date library. `--artist-refresh-after 30d`
+skips the page fetch for artists checked less than 30 days ago (the check time is recorded
+whether or not the images changed), so a scheduled replace run only re-checks a slice of the
+library each time. Images an artist folder is missing are still written from the cached
+resolution, as on any run; the summary counts the skipped artists as `fresh`.
 
 A second replace run on the same day appends `-2`, `-3`, … rather than overwriting. Every
 artist file gatefold writes, current or archived, gets a `<file>.sha256` sidecar with its

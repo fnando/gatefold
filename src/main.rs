@@ -311,6 +311,13 @@ fn run_summary(cli: &Cli, mb_host: Option<&str>) -> String {
         ("cover", cli.replace_cover),
         ("artist images", cli.replace_artist_images),
     ]);
+    let replace = match cli.artist_refresh_after {
+        Some(window) => format!(
+            "{replace} (artists checked within {} left alone)",
+            cli::format_duration(window)
+        ),
+        None => replace,
+    };
     let verify = if cli.verify { "on" } else { "off" };
     let mb = mb_host.map_or_else(String::new, |host| format!(" · musicbrainz: {host}"));
     format!(
@@ -799,6 +806,9 @@ enum ArtistOutcome {
     /// `--replace-artist-images`, but every artist folder keeps all its images
     /// (`.gatefold-keep` & co) and has them already.
     Kept,
+    /// `--replace-artist-images --artist-refresh-after`, but the artist's page was
+    /// checked within the window, so it wasn't re-resolved.
+    Fresh,
     SkippedNothingToDo,
     SkippedByFilter,
     NoLinks,
@@ -831,9 +841,6 @@ fn process_artist(
 ) -> Result<ArtistOutcome> {
     let (mb, resolver) = (&services.musicbrainz, &services.resolver);
     let mbid = job.mbid.as_str();
-    // Keep markers in every folder turn a replace run into a plain one: missing
-    // files are still written, existing ones are left alone.
-    let replacing = cli.replace_artist_images && !fully_kept(job);
     if job.folders.is_empty() && !cli.cache_only {
         return Ok(ArtistOutcome::NoFolder);
     }
@@ -841,22 +848,21 @@ fn process_artist(
     let record: Option<ArtistRecord> = state
         .load_artist_record::<ArtistRecord>(mbid)?
         .filter(ArtistRecord::is_current);
+    let now = revisions.stamp();
+    let mode = replace_mode(cli, job, record.as_ref(), now);
+    let replacing = mode == ReplaceMode::Replace;
 
     // Every folder already complete and not replacing: nothing to do, and no
     // reason to touch the network.
     if !replacing && !cli.cache_only && folders_complete(job, record.as_ref(), services.videos) {
-        return Ok(if cli.replace_artist_images {
-            ArtistOutcome::Kept
-        } else {
-            ArtistOutcome::SkippedNothingToDo
+        return Ok(match mode {
+            ReplaceMode::Kept => ArtistOutcome::Kept,
+            ReplaceMode::Fresh => ArtistOutcome::Fresh,
+            ReplaceMode::Plain | ReplaceMode::Replace => ArtistOutcome::SkippedNothingToDo,
         });
     }
 
-    // --new-only: only artists never looked up. --miss-only: only recorded misses.
-    if cli.new_only && state.has_artist_state(mbid) {
-        return Ok(ArtistOutcome::SkippedByFilter);
-    }
-    if cli.miss_only && !state.has_artist_miss(mbid) {
+    if artist_filtered_out(cli, state, mbid) {
         return Ok(ArtistOutcome::SkippedByFilter);
     }
     // A recorded miss is rechecked from scratch (links included), like cover art.
@@ -885,11 +891,14 @@ fn process_artist(
 
     // Churn guard: only overwrite when the images differ from what was written.
     let replace = replacing && record.as_ref().is_none_or(|r| !r.same_images(&resolved));
-    let now = revisions.stamp();
-    let mut new_record = record
-        .clone()
-        .filter(|r| r.same_images(&resolved))
-        .unwrap_or_else(|| ArtistRecord::new(mbid, &job.name, &resolved, now));
+    // A fresh page check is worth remembering even when nothing changed, so
+    // --artist-refresh-after can count from it.
+    let mut new_record = match record.clone().filter(|r| r.same_images(&resolved)) {
+        Some(record) if reused => record,
+        Some(record) => record.rechecked(now),
+        None => ArtistRecord::new(mbid, &job.name, &resolved, now),
+    };
+    let record_changed = record.is_none() || !reused;
     let nothing_to_do = if replacing {
         ArtistOutcome::Unchanged
     } else {
@@ -899,7 +908,7 @@ fn process_artist(
     let want_video = services.videos && resolved.video_url.is_some();
     let needs_write = cli.cache_only || missing_files(job, &resolved, replace, want_video);
     if !needs_write {
-        if record.is_none() {
+        if record_changed {
             state.save_artist_record(mbid, &new_record)?;
         }
         return Ok(nothing_to_do);
@@ -947,10 +956,54 @@ fn process_artist(
             kept: written.kept,
         })
     } else {
-        if record.is_none() {
+        if record_changed {
             state.save_artist_record(mbid, &new_record)?;
         }
         Ok(nothing_to_do)
+    }
+}
+
+/// `--new-only`: only artists never looked up. `--miss-only`: only recorded misses.
+fn artist_filtered_out(cli: &Cli, state: &State, mbid: &str) -> bool {
+    (cli.new_only && state.has_artist_state(mbid))
+        || (cli.miss_only && !state.has_artist_miss(mbid))
+}
+
+/// Whether this artist's existing images are up for replacement on this run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplaceMode {
+    /// No `--replace-artist-images`: only missing files are written.
+    Plain,
+    Replace,
+    /// Every folder keeps all its images (`.gatefold-keep` & co).
+    Kept,
+    /// Checked within the `--artist-refresh-after` window.
+    Fresh,
+}
+
+/// Keep markers in every folder turn a replace run into a plain one: missing
+/// files are still written, existing ones are left alone. So does a record
+/// resolved within the `--artist-refresh-after` window.
+fn replace_mode(
+    cli: &Cli,
+    job: &ArtistJob,
+    record: Option<&ArtistRecord>,
+    now: u64,
+) -> ReplaceMode {
+    if !cli.replace_artist_images {
+        return ReplaceMode::Plain;
+    }
+    if fully_kept(job) {
+        return ReplaceMode::Kept;
+    }
+    let fresh = match (cli.artist_refresh_after, record) {
+        (Some(window), Some(record)) => now.saturating_sub(record.resolved_at) < window.as_secs(),
+        _ => false,
+    };
+    if fresh {
+        ReplaceMode::Fresh
+    } else {
+        ReplaceMode::Replace
     }
 }
 
@@ -1287,6 +1340,7 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             job.sample_dir.display()
         )),
         ArtistOutcome::Kept => progress.info(format!("· {name}: artist images kept")),
+        ArtistOutcome::Fresh => progress.info(format!("· {name}: artist page checked recently")),
         ArtistOutcome::NoLinks => {
             progress.info(format!(
                 "· {name}: no Apple Music/Spotify link on MusicBrainz"
@@ -1362,6 +1416,7 @@ struct Summary {
     artist_unchanged: u64,
     artist_skipped: u64,
     artist_kept: u64,
+    artist_fresh: u64,
     artist_no_folder: u64,
     artist_no_links: u64,
     artist_no_image: u64,
@@ -1427,6 +1482,7 @@ impl Summary {
             }
             ArtistOutcome::NoFolder => self.artist_no_folder += 1,
             ArtistOutcome::Kept => self.artist_kept += 1,
+            ArtistOutcome::Fresh => self.artist_fresh += 1,
             ArtistOutcome::NoLinks => self.artist_no_links += 1,
             ArtistOutcome::NoImage => self.artist_no_image += 1,
             ArtistOutcome::Unchanged => self.artist_unchanged += 1,
@@ -1476,10 +1532,11 @@ impl Summary {
             ));
         }
         progress.info(format!(
-            "  unchanged {}, skipped {}, kept {}, no folder {}, no links {}, no image {}, errors {}",
+            "  unchanged {}, skipped {}, kept {}, fresh {}, no folder {}, no links {}, no image {}, errors {}",
             self.artist_unchanged,
             self.artist_skipped,
             self.artist_kept,
+            self.artist_fresh,
             self.artist_no_folder,
             self.artist_no_links,
             self.artist_no_image,
