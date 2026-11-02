@@ -1,0 +1,122 @@
+name: Publish
+
+# Once a release PR (from the Release workflow) is merged: build the binaries,
+# tag the merge commit and publish a GitHub release with them.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Read the version
+    if: github.event.pull_request.merged && startsWith(github.head_ref, 'release/v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ github.event.pull_request.merge_commit_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "release/v$version" != "${{ github.head_ref }}" ]; then
+            echo "::error::Cargo.toml says $version, but the branch is ${{ github.head_ref }}"
+            exit 1
+          fi
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "::error::v$version is already released"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: Install musl
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir dist
+          tar -C target/${{ matrix.target }}/release -czf dist/gatefold-${{ matrix.target }}.tar.gz gatefold
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gatefold-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish v${{ needs.version.outputs.version }}
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+      # Like yt-dlp: a detached GPG signature of the checksums, made with the
+      # key whose public half is in the repo (gatefold-signing-key.asc).
+      - name: Sign the checksums
+        working-directory: dist
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          SIGNING_PASSPHRASE: ${{ secrets.RELEASE_SIGNING_PASSPHRASE }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::The RELEASE_SIGNING_KEY secret isn't set; not publishing unsigned binaries"
+            exit 1
+          fi
+          export GNUPGHOME="$(mktemp -d)"
+          echo "$SIGNING_KEY" | gpg --batch --quiet --import
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$SIGNING_PASSPHRASE" \
+            --detach-sign --output SHA256SUMS.sig SHA256SUMS
+          gpg --batch --verify SHA256SUMS.sig SHA256SUMS
+          rm -rf "$GNUPGHOME"
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ needs.version.outputs.sha }}" \
+            --title "v$VERSION" \
+            --generate-notes
