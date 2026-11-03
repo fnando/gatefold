@@ -1,5 +1,6 @@
-//! Artist images (a square avatar and a wide backdrop) resolved from an artist's
-//! public Apple Music page, falling back to Spotify for the avatar only.
+//! Artist images (a square avatar, a wide backdrop and, for some artists, a
+//! logo) resolved from an artist's public Apple Music page, falling back to
+//! Spotify for the avatar only.
 //!
 //! Neither service exposes these through a key-less API; the public pages are
 //! fetched (identifying as gatefold) and the image URLs read out of their
@@ -30,6 +31,9 @@ const POLICY: Policy<'static> = Policy {
 /// size), `<w>x<h>sr` scales and centre-crops to exactly that aspect ratio.
 pub const AVATAR_RENDITION: &str = "4000x4000bb.jpg";
 pub const BACKDROP_RENDITION: &str = "3840x2160sr.jpg";
+/// Logos are wordmarks on a transparent background, so PNG; `bb` caps at the
+/// source size, and the box is larger than any logo Apple serves.
+pub const LOGO_RENDITION: &str = "9999x9999bb.png";
 /// Artist photos live under this path; when an artist has none, Apple shows an
 /// album cover (`…/Music…/cover.jpg/…`) instead, which we must not use.
 const APPLE_ARTIST_ASSET_MARKER: &str = "AMCArtistImages";
@@ -61,11 +65,14 @@ pub struct Resolved {
     pub backdrop_url: Option<String>,
     /// Apple's 16:9 motion backdrop (an HLS master playlist), when the artist has one.
     pub video_url: Option<String>,
+    /// Apple's transparent logo (wordmark), when the artist has one.
+    pub logo_url: Option<String>,
 }
 
-/// Bumped when a record gains fields a run needs to act on (v2: `video_url`), so
-/// older records are re-resolved instead of silently lacking them.
-pub const RECORD_VERSION: u32 = 2;
+/// Bumped when a record gains fields a run needs to act on (v2: `video_url`,
+/// v3: `logo_url`), so older records are re-resolved instead of silently
+/// lacking them.
+pub const RECORD_VERSION: u32 = 3;
 
 /// What was resolved for an artist and, if anything, what was last written —
 /// cached as `artist/<mbid>.json`. The URLs double as provenance: a replace run
@@ -83,6 +90,8 @@ pub struct ArtistRecord {
     pub backdrop_url: Option<String>,
     #[serde(default)]
     pub video_url: Option<String>,
+    #[serde(default)]
+    pub logo_url: Option<String>,
     /// Unix seconds.
     pub resolved_at: u64,
     /// Unix seconds; `None` after a `--cache-only` resolution.
@@ -101,6 +110,7 @@ impl ArtistRecord {
             avatar_url: resolved.avatar_url.clone(),
             backdrop_url: resolved.backdrop_url.clone(),
             video_url: resolved.video_url.clone(),
+            logo_url: resolved.logo_url.clone(),
             resolved_at: now,
             written_at: None,
         }
@@ -125,6 +135,7 @@ impl ArtistRecord {
             avatar_url: self.avatar_url.clone(),
             backdrop_url: self.backdrop_url.clone(),
             video_url: self.video_url.clone(),
+            logo_url: self.logo_url.clone(),
         }
     }
 
@@ -133,6 +144,7 @@ impl ArtistRecord {
         self.avatar_url == other.avatar_url
             && self.backdrop_url == other.backdrop_url
             && self.video_url == other.video_url
+            && self.logo_url == other.logo_url
     }
 }
 
@@ -151,8 +163,8 @@ impl Resolver {
         }
     }
 
-    /// Apple Music first (avatar + backdrop); if it has no artist photo, Spotify
-    /// (avatar only). `None` when neither yields a usable image.
+    /// Apple Music first (avatar + backdrop, and a logo when the artist has one);
+    /// if it has no artist photo, Spotify (avatar only). `None` when neither yields a usable image.
     pub fn resolve<W: RateLimitWaiter>(
         &self,
         links: &ArtistLinks,
@@ -185,6 +197,7 @@ impl Resolver {
             )),
             avatar_url: rendition(&art.avatar, AVATAR_RENDITION),
             video_url: art.video,
+            logo_url: art.logo.map(|base| rendition(&base, LOGO_RENDITION)),
         }))
     }
 
@@ -201,6 +214,7 @@ impl Resolver {
                 avatar_url,
                 backdrop_url: None,
                 video_url: None,
+                logo_url: None,
             }))
     }
 
@@ -288,12 +302,15 @@ pub struct AppleArtwork {
     pub wide: Option<String>,
     /// HLS master playlist of the 16:9 motion backdrop, when the artist has one.
     pub video: Option<String>,
+    /// Asset base of the artist's logo (a wordmark on transparency), when Apple
+    /// has one. Not an `AMCArtistImages` asset, and never an album fallback.
+    pub logo: Option<String>,
 }
 
 /// Apple's artwork for the artist. Prefers the page's embedded JSON (which
 /// distinguishes the artist photo from the album-cover fallback shown for artists
-/// without one, and is the only place the banner and video appear) and falls back
-/// to `og:image`.
+/// without one, and is the only place the banner, video and logo appear) and
+/// falls back to `og:image`.
 pub fn apple_artwork(html: &str) -> Option<AppleArtwork> {
     if let Some(json) = serialized_server_data(html)
         && let Ok(value) = serde_json::from_str::<Value>(json)
@@ -308,10 +325,18 @@ pub fn apple_artwork(html: &str) -> Option<AppleArtwork> {
             .and_then(Value::as_str)
             .filter(|url| url.starts_with("https://"))
             .map(str::to_string);
+        let logo = header
+            .get("artistLogo")
+            .and_then(|a| a.get("dictionary"))
+            .and_then(|d| d.get("url"))
+            .and_then(Value::as_str)
+            .filter(|url| url.starts_with("https://"))
+            .and_then(asset_base);
         return Some(AppleArtwork {
             avatar,
             wide: artwork_base(header.get("wideArtwork")),
             video,
+            logo,
         });
     }
     let base = asset_base(&og_image(html)?)?;
@@ -319,6 +344,7 @@ pub fn apple_artwork(html: &str) -> Option<AppleArtwork> {
         avatar: base,
         wide: None,
         video: None,
+        logo: None,
     })
 }
 
@@ -452,7 +478,8 @@ mod tests {
             Some(AppleArtwork {
                 avatar: APPLE_BASE.to_string(),
                 wide: None,
-                video: None
+                video: None,
+                logo: None
             })
         );
 
@@ -472,11 +499,13 @@ mod tests {
             Some(APPLE_BASE.to_string())
         );
 
-        // A wide banner and a motion backdrop are picked up from the same header object.
+        // A wide banner, a motion backdrop and a logo are picked up from the same
+        // header object. The logo lives outside the artist-images path.
         let wide = "https://is1-ssl.mzstatic.com/image/thumb/AMCArtistImages211/v4/00/wide.png";
         let video = "https://mvod.itunes.apple.com/itunes-assets/HLSMusic113/v4/x/P1_default.m3u8";
+        let logo = "https://is1-ssl.mzstatic.com/image/thumb/V7EGiP85yrXypisuC8mDZA";
         let json = format!(
-            r#"[{{"wideArtwork":{{"dictionary":{{"url":"{wide}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"circleArtwork":{{"dictionary":{{"url":"{APPLE_BASE}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"wideVideoArtwork":{{"dictionary":{{"motionArtistFullscreen16x9":{{"video":"{video}"}}}}}}}}]"#
+            r#"[{{"artistLogo":{{"dictionary":{{"url":"{logo}/{{w}}x{{h}}{{c}}.{{f}}","width":6090,"height":2100}},"cropStyle":"bb"}},"wideArtwork":{{"dictionary":{{"url":"{wide}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"circleArtwork":{{"dictionary":{{"url":"{APPLE_BASE}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"wideVideoArtwork":{{"dictionary":{{"motionArtistFullscreen16x9":{{"video":"{video}"}}}}}}}}]"#
         );
         let html = format!(r#"<script id="serialized-server-data">{json}</script>"#);
         assert_eq!(
@@ -484,9 +513,17 @@ mod tests {
             Some(AppleArtwork {
                 avatar: APPLE_BASE.to_string(),
                 wide: Some(wide.to_string()),
-                video: Some(video.to_string())
+                video: Some(video.to_string()),
+                logo: Some(logo.to_string())
             })
         );
+
+        // `"artistLogo": null` (most artists) is simply no logo.
+        let json = format!(
+            r#"[{{"artistLogo":null,"circleArtwork":{{"dictionary":{{"url":"{APPLE_BASE}/{{w}}x{{h}}{{c}}.{{f}}"}}}}}}]"#
+        );
+        let html = format!(r#"<script id="serialized-server-data">{json}</script>"#);
+        assert_eq!(apple_artwork(&html).and_then(|a| a.logo), None);
     }
 
     #[test]
@@ -503,6 +540,7 @@ mod tests {
             Duration::ZERO,
         );
         let apple = resolver.apple("657515", &NoWait).unwrap().unwrap();
+        assert_eq!(apple.logo_url, None, "Radiohead has no logo on Apple Music");
         assert_eq!(apple.source, Source::Apple);
         assert!(
             apple.avatar_url.ends_with(AVATAR_RENDITION),
@@ -516,6 +554,14 @@ mod tests {
                 .unwrap()
                 .ends_with(BACKDROP_RENDITION)
         );
+        // Metallica has a logo.
+        let metallica = resolver.apple("3996865", &NoWait).unwrap().unwrap();
+        let logo_url = metallica
+            .logo_url
+            .expect("Metallica has a logo on Apple Music");
+        assert!(logo_url.ends_with(LOGO_RENDITION), "{logo_url}");
+        let logo = resolver.fetch_image(&logo_url, &NoWait).unwrap().unwrap();
+        assert_eq!(logo.mime, "image/png");
         let spotify = resolver
             .spotify("4Z8W4fKeB5YxbusRsdQVPb", &NoWait)
             .unwrap()

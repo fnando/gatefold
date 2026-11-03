@@ -14,10 +14,11 @@ you already have.
   The front cover is embedded in the file and written once per album as `cover.jpg`.
 - **Artist images** come from the artist's public [Apple Music](https://music.apple.com)
   page (square avatar + wide backdrop, plus the artist's motion backdrop as
-  `backdrops/backdrop.mp4` when they have one and `ffmpeg` is installed), falling back to
+  `backdrops/backdrop.mp4` when they have one and `ffmpeg` is installed, and their
+  transparent logo as `logo.png` when they have one), falling back to
   [Spotify](https://open.spotify.com) (avatar only). The page URLs are looked up on
   `MusicBrainz` from the album-artist id in the tags, and the images are written to the
-  artist folder as `folder.jpg` and `backdrop.jpg` — the names Jellyfin reads.
+  artist folder as `folder.jpg`, `backdrop.jpg` and `logo.png` — the names Jellyfin reads.
 
 ## Features
 
@@ -82,7 +83,7 @@ gatefold --state-dir <DIR> [OPTIONS] [PATH]
 | `--cache-only` | Populate the caches but make no changes to music files. |
 | `--replace-lyrics` | Overwrite an existing embedded lyrics tag (backing up the previous value). |
 | `--replace-cover` | Overwrite an existing embedded cover and `cover.jpg` sidecar (backing up the previous values), e.g. to upgrade to Apple Music's larger artwork. |
-| `--replace-artist-images` | Overwrite an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop when the artist's image has changed; the previous files are kept, dated, in `primary/` and `backdrops/`. |
+| `--replace-artist-images` | Overwrite an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop / `logo.png` when the artist's image has changed; the previous files are kept, dated, in `primary/`, `backdrops/` and `logos/`. |
 | `--artist-refresh-after <DURATION>` | With `--replace-artist-images`, don't re-check an artist's page if it was last checked within this long ago (`30d`, `12h`, `90m`, `45s`, `2w`). Missing images are still written. |
 | `--verify` | Validate each tag write with `ffprobe` on a temp copy before atomically swapping it in. |
 | `--new-only` | Only look up items with no result on record yet — fast incremental re-runs. |
@@ -171,10 +172,11 @@ id in the tags; "Various Artists" is skipped):
    served as HLS, so when `ffmpeg` is on `PATH` the best SDR H.264 rendition at or under
    1080p is remuxed (no re-encoding) into `backdrops/backdrop.mp4` — Jellyfin's theme-video
    folder, where it plays as the artist's background rather than being imported as a music
-   video (`--skip-artist-videos` opts out). The resolved URLs are cached at
-   `<state-dir>/artist/<id>.json` and the bytes under `art/`, keyed by URL. When applying,
-   the files are written as `folder.jpg`, `backdrop.jpg` (and `backdrops/backdrop.mp4`) into
-   the **artist folder**: walking up from the track's folder, the
+   video (`--skip-artist-videos` opts out). Some artists also have a **logo** (their
+   wordmark on a transparent background), requested at its native size as a PNG. The
+   resolved URLs are cached at `<state-dir>/artist/<id>.json` and the bytes under `art/`,
+   keyed by URL. When applying, the files are written as `folder.jpg`, `backdrop.jpg` (and
+   `backdrops/backdrop.mp4` and `logo.png`) into the **artist folder**: walking up from the track's folder, the
    nearest ancestor whose name matches the album artist (ignoring case and punctuation, so
    `AC/DC` matches `AC-DC`) and that holds no audio files itself — album folders are never
    used, even for self-titled albums, because `folder.jpg` there would be read as the album
@@ -214,10 +216,12 @@ the new ones are written — into the artist folder's own archive subfolders, da
 <artist folder>/
     folder.jpg                            # current avatar
     backdrop.jpg                          # current backdrop
+    logo.png                              # current logo (artists that have one)
     primary/folder-<YYYY-MM-DD>.jpg       # previous avatar(s)
     backdrops/backdrop.mp4                # current motion backdrop (Jellyfin theme video)
     backdrops/backdrop-<YYYY-MM-DD>.jpg   # previous backdrop(s)
     backdrops/backdrop-<YYYY-MM-DD>.mp4   # previous motion backdrop(s)
+    logos/logo-<YYYY-MM-DD>.png           # previous logo(s)
 ```
 
 Every replace run fetches each artist's page to learn the current image URLs, and that's
@@ -249,11 +253,12 @@ one kind each:
 
 | Marker | Where | Keeps |
 | --- | --- | --- |
-| `.gatefold-keep` | artist folder | `folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4`, and the covers of every album below it |
+| `.gatefold-keep` | artist folder | `folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`, and the covers of every album below it |
 | `.gatefold-keep` | album folder | the album's cover (embedded in each track + `cover.jpg`) |
 | `.gatefold-primary-keep` | artist folder | `folder.jpg` (the image archived in `primary/` on replace) |
 | `.gatefold-backdrop-keep` | artist folder | `backdrop.jpg` |
 | `.gatefold-video-keep` | artist folder | `backdrops/backdrop.mp4` |
+| `.gatefold-logo-keep` | artist folder | `logo.png` |
 | `.gatefold-cover-keep` | album folder, or artist folder for all its albums | the album cover (embedded + `cover.jpg`) |
 
 ```
@@ -263,7 +268,7 @@ Music/
         folder.jpg
         2017 - Warriors/
     Kemuri/
-        .gatefold-primary-keep      # folder.jpg is yours; backdrop + video from Apple Music
+        .gatefold-primary-keep      # folder.jpg is yours; backdrop, video + logo from Apple Music
         folder.jpg
         backdrop.jpg
         1997 - Little Playmate/

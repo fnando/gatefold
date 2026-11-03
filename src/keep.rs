@@ -9,8 +9,9 @@
 //!   folder, that album's cover.
 //! - Without it, granular markers keep one kind each: `.gatefold-primary-keep`
 //!   (`folder.jpg`), `.gatefold-backdrop-keep` (`backdrop.jpg`),
-//!   `.gatefold-video-keep` (`backdrops/backdrop.mp4`) and `.gatefold-cover-keep`
-//!   (embedded covers + `cover.jpg`, in an album folder or any folder above it).
+//!   `.gatefold-video-keep` (`backdrops/backdrop.mp4`), `.gatefold-logo-keep`
+//!   (`logo.png`) and `.gatefold-cover-keep` (embedded covers + `cover.jpg`, in an
+//!   album folder or any folder above it).
 //!
 //! Lyrics are never affected.
 
@@ -23,10 +24,11 @@ pub const ALL: &str = ".gatefold-keep";
 pub const COVER: &str = ".gatefold-cover-keep";
 
 /// Every artist file, for "is all of it kept?" checks.
-pub const ARTIST_IMAGES: [ArtistImage; 3] = [
+pub const ARTIST_IMAGES: [ArtistImage; 4] = [
     ArtistImage::Avatar,
     ArtistImage::Backdrop,
     ArtistImage::Video,
+    ArtistImage::Logo,
 ];
 
 /// The granular marker for one artist file. Named after the archive folders
@@ -36,6 +38,7 @@ pub fn artist_marker(kind: ArtistImage) -> &'static str {
         ArtistImage::Avatar => ".gatefold-primary-keep",
         ArtistImage::Backdrop => ".gatefold-backdrop-keep",
         ArtistImage::Video => ".gatefold-video-keep",
+        ArtistImage::Logo => ".gatefold-logo-keep",
     }
 }
 
@@ -103,6 +106,7 @@ mod tests {
         assert!(artist_image(&artist, ArtistImage::Avatar));
         assert!(!artist_image(&artist, ArtistImage::Backdrop));
         assert!(!artist_image(&artist, ArtistImage::Video));
+        assert!(!artist_image(&artist, ArtistImage::Logo));
         assert!(!all_artist_images(&artist));
         assert!(!cover(&album, &root));
         fs::remove_dir_all(&root).unwrap();

@@ -32,6 +32,8 @@ pub enum ArtistImage {
     /// Motion background, `backdrops/backdrop.mp4` (Jellyfin's theme-video folder,
     /// which keeps the video out of the music scan).
     Video,
+    /// Transparent wordmark, `logo.png`.
+    Logo,
 }
 
 impl ArtistImage {
@@ -39,6 +41,7 @@ impl ArtistImage {
         match self {
             ArtistImage::Avatar => "folder",
             ArtistImage::Backdrop | ArtistImage::Video => "backdrop",
+            ArtistImage::Logo => "logo",
         }
     }
 
@@ -53,13 +56,14 @@ impl ArtistImage {
                 "backdrop.mov",
                 "backdrop.webm",
             ],
+            ArtistImage::Logo => &["logo.png", "logo.jpg", "logo.jpeg"],
         }
     }
 
     /// Subfolder of the artist folder this file lives in, if not the folder itself.
     fn subdir(self) -> Option<&'static str> {
         match self {
-            ArtistImage::Avatar | ArtistImage::Backdrop => None,
+            ArtistImage::Avatar | ArtistImage::Backdrop | ArtistImage::Logo => None,
             ArtistImage::Video => Some("backdrops"),
         }
     }
@@ -69,6 +73,7 @@ impl ArtistImage {
         match self {
             ArtistImage::Avatar => "primary",
             ArtistImage::Backdrop | ArtistImage::Video => "backdrops",
+            ArtistImage::Logo => "logos",
         }
     }
 

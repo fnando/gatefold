@@ -838,6 +838,7 @@ enum ArtistOutcome {
         avatar: writer::Write,
         backdrop: writer::Write,
         video: writer::Write,
+        logo: writer::Write,
         source: Source,
         reused: bool,
         /// Where replaced files were moved, relative to the artist folder.
@@ -930,7 +931,7 @@ fn process_artist(
     }
 
     // 3. Bytes (cached by image URL, so a changed photo is a fresh download).
-    let Some((avatar, backdrop)) = artist_images(state, resolver, progress, job, &resolved)? else {
+    let Some(images) = artist_images(state, resolver, progress, job, &resolved)? else {
         if record.is_none() {
             state.save_artist_miss(mbid)?;
         }
@@ -951,21 +952,19 @@ fn process_artist(
     }
 
     // 4. Write into every artist folder.
-    let written = write_artist_images(
-        job,
-        &avatar,
-        backdrop.as_ref(),
-        video.as_ref(),
-        replace,
-        revisions,
-    )?;
-    if written.avatar.happened() || written.backdrop.happened() || written.video.happened() {
+    let written = write_artist_images(job, &images, video.as_ref(), replace, revisions)?;
+    if written.avatar.happened()
+        || written.backdrop.happened()
+        || written.video.happened()
+        || written.logo.happened()
+    {
         new_record.written_at = Some(now);
         state.save_artist_record(mbid, &new_record)?;
         Ok(ArtistOutcome::Applied {
             avatar: written.avatar,
             backdrop: written.backdrop,
             video: written.video,
+            logo: written.logo,
             source: resolved.source,
             reused,
             kept: written.kept,
@@ -1045,19 +1044,23 @@ fn missing_files(job: &ArtistJob, resolved: &Resolved, replace: bool, want_video
         needs(ArtistImage::Avatar, true)
             || needs(ArtistImage::Backdrop, resolved.backdrop_url.is_some())
             || needs(ArtistImage::Video, want_video)
+            || needs(ArtistImage::Logo, resolved.logo_url.is_some())
     })
 }
 
 /// True when every artist folder already has the files the source can provide
 /// (a Spotify-sourced artist has no backdrop to wait for; a video only counts
-/// when the artist is known to have one and ffmpeg is available).
+/// when the artist is known to have one and ffmpeg is available; a logo only
+/// when the artist is known to have one).
 fn folders_complete(job: &ArtistJob, record: Option<&ArtistRecord>, videos: bool) -> bool {
     let has_backdrop_source = record.is_none_or(|r| r.backdrop_url.is_some());
     let has_video_source = videos && record.is_none_or(|r| r.video_url.is_some());
+    let has_logo_source = record.is_none_or(|r| r.logo_url.is_some());
     job.folders.iter().all(|dir| {
         ArtistImage::Avatar.existing(dir).is_some()
             && (!has_backdrop_source || ArtistImage::Backdrop.existing(dir).is_some())
             && (!has_video_source || ArtistImage::Video.existing(dir).is_some())
+            && (!has_logo_source || ArtistImage::Logo.existing(dir).is_some())
     })
 }
 
@@ -1093,17 +1096,17 @@ struct Written {
     avatar: writer::Write,
     backdrop: writer::Write,
     video: writer::Write,
+    logo: writer::Write,
     /// Where replaced files were moved, relative to the artist folder.
     kept: Vec<String>,
 }
 
-/// Write the avatar (and backdrop and video, when there are any) into every
-/// folder of the job. A replace moves the previous file into its archive folder
-/// (`primary/`, `backdrops/`) first.
+/// Write the avatar (and backdrop, video and logo, when there are any) into
+/// every folder of the job. A replace moves the previous file into its archive
+/// folder (`primary/`, `backdrops/`, `logos/`) first.
 fn write_artist_images(
     job: &ArtistJob,
-    avatar: &state::CachedArt,
-    backdrop: Option<&state::CachedArt>,
+    images: &ArtistImages,
     video: Option<&state::CachedArt>,
     replace: bool,
     revisions: &Revisions,
@@ -1112,12 +1115,14 @@ fn write_artist_images(
         avatar: writer::Write::Skipped,
         backdrop: writer::Write::Skipped,
         video: writer::Write::Skipped,
+        logo: writer::Write::Skipped,
         kept: Vec::new(),
     };
     let files = [
-        (ArtistImage::Avatar, Some(avatar)),
-        (ArtistImage::Backdrop, backdrop),
+        (ArtistImage::Avatar, Some(&images.avatar)),
+        (ArtistImage::Backdrop, images.backdrop.as_ref()),
         (ArtistImage::Video, video),
+        (ArtistImage::Logo, images.logo.as_ref()),
     ];
     for dir in &job.folders {
         for (kind, art) in &files {
@@ -1130,6 +1135,7 @@ fn write_artist_images(
                 ArtistImage::Avatar => &mut written.avatar,
                 ArtistImage::Backdrop => &mut written.backdrop,
                 ArtistImage::Video => &mut written.video,
+                ArtistImage::Logo => &mut written.logo,
             };
             *slot = strongest(*slot, wrote);
             written.kept.extend(kept);
@@ -1138,32 +1144,41 @@ fn write_artist_images(
     Ok(written)
 }
 
-/// The avatar and (when the source has one) backdrop bytes for a resolution.
-/// `None` when the avatar is unavailable; a missing backdrop is logged and skipped.
+/// The still images fetched for an artist.
+struct ArtistImages {
+    avatar: state::CachedArt,
+    backdrop: Option<state::CachedArt>,
+    logo: Option<state::CachedArt>,
+}
+
+/// The avatar and (when the source has them) backdrop and logo bytes for a
+/// resolution. `None` when the avatar is unavailable; a missing backdrop or logo
+/// is logged and skipped.
 fn artist_images(
     state: &State,
     resolver: &artist::Resolver,
     progress: &Progress,
     job: &ArtistJob,
     urls: &Resolved,
-) -> Result<Option<(state::CachedArt, Option<state::CachedArt>)>> {
+) -> Result<Option<ArtistImages>> {
     let Some(avatar) = artist_image(state, resolver, progress, &urls.avatar_url)? else {
         return Ok(None);
     };
-    let backdrop = match &urls.backdrop_url {
-        Some(url) => {
-            let image = artist_image(state, resolver, progress, url)?;
-            if image.is_none() {
-                progress.info(format!(
-                    "· {}: backdrop unavailable, keeping avatar only",
-                    job.name
-                ));
-            }
-            image
+    let optional = |url: &Option<String>, what: &str| -> Result<Option<state::CachedArt>> {
+        let Some(url) = url else { return Ok(None) };
+        let image = artist_image(state, resolver, progress, url)?;
+        if image.is_none() {
+            progress.info(format!("· {}: {what} unavailable, skipping it", job.name));
         }
-        None => None,
+        Ok(image)
     };
-    Ok(Some((avatar, backdrop)))
+    let backdrop = optional(&urls.backdrop_url, "backdrop")?;
+    let logo = optional(&urls.logo_url, "logo")?;
+    Ok(Some(ArtistImages {
+        avatar,
+        backdrop,
+        logo,
+    }))
 }
 
 /// An artist's motion backdrop: from the art cache, else the best fitting HLS
@@ -1380,6 +1395,7 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             avatar,
             backdrop,
             video,
+            logo,
             source,
             reused,
             kept,
@@ -1389,6 +1405,7 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
                 (ArtistImage::Avatar, "jpg", avatar),
                 (ArtistImage::Backdrop, "jpg", backdrop),
                 (ArtistImage::Video, "mp4", video),
+                (ArtistImage::Logo, "png", logo),
             ] {
                 let name = kind.label(ext);
                 match write {
@@ -1513,9 +1530,10 @@ impl Summary {
                 avatar,
                 backdrop,
                 video,
+                logo,
                 ..
             } => {
-                if [avatar, backdrop, video].contains(&&writer::Write::Replaced) {
+                if [avatar, backdrop, video, logo].contains(&&writer::Write::Replaced) {
                     self.artist_replaced += 1;
                 } else {
                     self.artist_wrote += 1;
