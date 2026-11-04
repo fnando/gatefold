@@ -14,6 +14,7 @@ mod scanner;
 mod state;
 mod verify;
 mod video;
+mod wikidata;
 mod writer;
 
 use anyhow::{Context, Result};
@@ -96,6 +97,7 @@ fn main() -> Result<()> {
         musicbrainz: mb_client,
         lookup: apple::Lookup::new(cli.user_agent(), delay),
         resolver: artist::Resolver::new(cli.user_agent(), delay),
+        wikidata: wikidata::Client::new(cli.user_agent(), delay),
         videos: ffmpeg,
     };
     let revisions = Revisions::new();
@@ -143,6 +145,7 @@ struct Services {
     musicbrainz: musicbrainz::Client,
     lookup: apple::Lookup,
     resolver: artist::Resolver,
+    wikidata: wikidata::Client,
     /// Motion backdrops are wanted and ffmpeg is available to remux them.
     videos: bool,
 }
@@ -855,7 +858,7 @@ fn process_artist(
     progress: &Progress,
     job: &ArtistJob,
 ) -> Result<ArtistOutcome> {
-    let (mb, resolver) = (&services.musicbrainz, &services.resolver);
+    let resolver = &services.resolver;
     let mbid = job.mbid.as_str();
     if job.folders.is_empty() && !cli.cache_only {
         return Ok(ArtistOutcome::NoFolder);
@@ -884,8 +887,8 @@ fn process_artist(
     // A recorded miss is rechecked from scratch (links included), like cover art.
     let rechecking = state.has_artist_miss(mbid);
 
-    // 1. Links, via MusicBrainz (cached per artist).
-    let Some(links) = artist_links(state, mb, progress, mbid, rechecking)? else {
+    // 1. Links, via MusicBrainz, then Wikidata (both cached per artist).
+    let Some(links) = artist_links(state, services, progress, job, rechecking)? else {
         state.save_artist_miss(mbid)?;
         return Ok(ArtistOutcome::NoLinks);
     };
@@ -1068,15 +1071,18 @@ fn folders_complete(job: &ArtistJob, record: Option<&ArtistRecord>, videos: bool
     })
 }
 
-/// The artist's streaming links from its `MusicBrainz` lookup (cached per artist).
-/// `None` when the artist is unknown or has no Apple Music / Spotify link.
+/// The artist's streaming links from its `MusicBrainz` lookup, topped up from
+/// its Wikidata item when `MusicBrainz` has no Apple Music link (both cached per
+/// artist). `None` when the artist is unknown or has no Apple Music / Spotify
+/// link anywhere.
 fn artist_links(
     state: &State,
-    mb: &musicbrainz::Client,
+    services: &Services,
     progress: &Progress,
-    mbid: &str,
+    job: &ArtistJob,
     rechecking: bool,
 ) -> Result<Option<musicbrainz::ArtistLinks>> {
+    let mbid = job.mbid.as_str();
     let cached = if rechecking {
         None
     } else {
@@ -1085,13 +1091,37 @@ fn artist_links(
     let lookup = if let Some(value) = cached {
         value
     } else {
-        let Some(value) = mb.artist(mbid, progress)? else {
+        let Some(value) = services.musicbrainz.artist(mbid, progress)? else {
             return Ok(None);
         };
         state.save_musicbrainz_artist(mbid, &value)?;
         value
     };
-    let links = musicbrainz::links_from(&lookup);
+    let mut links = musicbrainz::links_from(&lookup);
+    if links.apple_id.is_none() {
+        let cached = if rechecking {
+            None
+        } else {
+            state.load_wikidata_artist(mbid)?
+        };
+        let result = if let Some(value) = cached {
+            Some(value)
+        } else {
+            let qid = musicbrainz::wikidata_id(&lookup);
+            let value = services
+                .wikidata
+                .artist_links(mbid, qid.as_deref(), progress)?;
+            if let Some(value) = &value {
+                state.save_wikidata_artist(mbid, value)?;
+            }
+            value
+        };
+        if let Some(result) = result
+            && links.fill_from(wikidata::links_from(&result))
+        {
+            progress.info(format!("· {}: streaming link found on Wikidata", job.name));
+        }
+    }
     Ok((!links.is_empty()).then_some(links))
 }
 
@@ -1384,7 +1414,7 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
         ArtistOutcome::Fresh => progress.info(format!("· {name}: artist page checked recently")),
         ArtistOutcome::NoLinks => {
             progress.info(format!(
-                "· {name}: no Apple Music/Spotify link on MusicBrainz"
+                "· {name}: no Apple Music/Spotify link on MusicBrainz or Wikidata"
             ));
         }
         ArtistOutcome::NoImage => {

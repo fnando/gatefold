@@ -27,8 +27,8 @@ struct ArtMeta {
 /// On-disk cache rooted at `--state-dir`, holding parallel trees:
 /// `metadata/<digest>.json` (extracted tags), `lrc/<digest>.json` (lyrics
 /// responses), `art/<digest>.{json,<ext>}` (downloaded images, cover and artist
-/// alike), `artist/<mbid>.{mb.json,json,miss}` (per-artist link lookups, resolved
-/// image URLs, and misses), and `release/<mbid>.{mb.json,json,miss}` (the same for
+/// alike), `artist/<mbid>.{mb.json,wikidata.json,json,miss}` (per-artist link
+/// lookups, resolved image URLs, and misses), and `release/<mbid>.{mb.json,json,miss}` (the same for
 /// a release's Apple Music artwork, plus `release/group-<mbid>.mb.json` browses).
 #[allow(clippy::struct_field_names)] // the `_dir` suffix is meaningful here
 pub struct State {
@@ -96,6 +96,10 @@ impl State {
 
     fn musicbrainz_artist_path(&self, mbid: &str) -> PathBuf {
         self.artist_dir.join(format!("{mbid}.mb.json"))
+    }
+
+    fn wikidata_artist_path(&self, mbid: &str) -> PathBuf {
+        self.artist_dir.join(format!("{mbid}.wikidata.json"))
     }
 
     fn artist_record_path(&self, mbid: &str) -> PathBuf {
@@ -200,6 +204,15 @@ impl State {
 
     pub fn save_musicbrainz_artist(&self, mbid: &str, value: &serde_json::Value) -> Result<()> {
         write_json(&self.musicbrainz_artist_path(mbid), value)
+    }
+
+    /// The raw Wikidata streaming-links query result (rows or none), cached per artist.
+    pub fn load_wikidata_artist(&self, mbid: &str) -> Result<Option<serde_json::Value>> {
+        read_json(&self.wikidata_artist_path(mbid))
+    }
+
+    pub fn save_wikidata_artist(&self, mbid: &str, value: &serde_json::Value) -> Result<()> {
+        write_json(&self.wikidata_artist_path(mbid), value)
     }
 
     /// The resolved image URLs (and what was last written) for an artist.

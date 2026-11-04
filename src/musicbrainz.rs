@@ -32,6 +32,21 @@ impl ArtistLinks {
     pub fn is_empty(&self) -> bool {
         self.apple_id.is_none() && self.spotify_id.is_none()
     }
+
+    /// Take `other`'s ids for whichever services this has none for. True when
+    /// anything was taken.
+    pub fn fill_from(&mut self, other: ArtistLinks) -> bool {
+        let mut filled = false;
+        if self.apple_id.is_none() && other.apple_id.is_some() {
+            self.apple_id = other.apple_id;
+            filled = true;
+        }
+        if self.spotify_id.is_none() && other.spotify_id.is_some() {
+            self.spotify_id = other.spotify_id;
+            filled = true;
+        }
+        filled
+    }
 }
 
 pub struct Client {
@@ -182,6 +197,33 @@ pub fn links_from(artist: &Value) -> ArtistLinks {
         }
     }
     links
+}
+
+/// The Wikidata item id (`Q44190`) among an artist's URL relations, if any.
+pub fn wikidata_id(artist: &Value) -> Option<String> {
+    artist
+        .get("relations")?
+        .as_array()?
+        .iter()
+        .filter(|r| r.get("ended").and_then(Value::as_bool) != Some(true))
+        .filter_map(|r| r.get("url")?.get("resource")?.as_str())
+        .find_map(wikidata_item_id)
+}
+
+/// `https://www.wikidata.org/wiki/Q44190` → `Q44190`.
+pub fn wikidata_item_id(url: &str) -> Option<String> {
+    let host = host_of(url)?;
+    if host != "www.wikidata.org" && host != "wikidata.org" && host != "m.wikidata.org" {
+        return None;
+    }
+    path_of(url)
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .find(|s| {
+            s.strip_prefix('Q')
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_string)
 }
 
 /// `https://music.apple.com/gb/artist/radiohead/657515` → `657515`. Also accepts
@@ -351,6 +393,40 @@ mod tests {
         assert_eq!(links.spotify_id.as_deref(), Some("NEW1"));
         assert_eq!(links.apple_id.as_deref(), Some("657515"));
         assert!(links_from(&json!({})).is_empty());
+        assert_eq!(wikidata_id(&artist).as_deref(), Some("Q44190"));
+        assert_eq!(wikidata_id(&json!({})), None);
+    }
+
+    #[test]
+    fn fills_missing_links_only() {
+        let mut links = ArtistLinks {
+            apple_id: None,
+            spotify_id: Some("MINE".into()),
+        };
+        assert!(links.fill_from(ArtistLinks {
+            apple_id: Some("1".into()),
+            spotify_id: Some("THEIRS".into()),
+        }));
+        assert_eq!(links.apple_id.as_deref(), Some("1"));
+        assert_eq!(links.spotify_id.as_deref(), Some("MINE"));
+        assert!(!links.fill_from(ArtistLinks::default()));
+    }
+
+    #[test]
+    fn parses_wikidata_urls() {
+        assert_eq!(
+            wikidata_item_id("https://www.wikidata.org/wiki/Q44190").as_deref(),
+            Some("Q44190")
+        );
+        assert_eq!(
+            wikidata_item_id("https://wikidata.org/entity/Q44190#sitelinks").as_deref(),
+            Some("Q44190")
+        );
+        assert_eq!(wikidata_item_id("https://www.wikidata.org/wiki/P434"), None);
+        assert_eq!(
+            wikidata_item_id("https://en.wikipedia.org/wiki/Q44190"),
+            None
+        );
     }
 
     #[test]

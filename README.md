@@ -17,8 +17,9 @@ you already have.
   `backdrops/backdrop.mp4` when they have one and `ffmpeg` is installed, and their
   transparent logo as `logo.png` when they have one), falling back to
   [Spotify](https://open.spotify.com) (avatar only). The page URLs are looked up on
-  `MusicBrainz` from the album-artist id in the tags, and the images are written to the
-  artist folder as `folder.jpg`, `backdrop.jpg` and `logo.png` — the names Jellyfin reads.
+  `MusicBrainz` from the album-artist id in the tags (with [Wikidata](https://www.wikidata.org)
+  as a fallback when `MusicBrainz` has no Apple Music link), and the images are written to
+  the artist folder as `folder.jpg`, `backdrop.jpg` and `logo.png` — the names Jellyfin reads.
 
 ## Features
 
@@ -77,7 +78,7 @@ gatefold --state-dir <DIR> [OPTIONS] [PATH]
 | `--api-key <KEY>` | Secret `Lrclib-Api-Key` header (server-side model). Pair with `--app-id`. Prefer `--env-file` on shared hosts — a flag value shows up in `ps`. (env: `GATEFOLD_LRCLIB_API_KEY`) |
 | `--app-id <ID>` | `Lrclib-App-Id` header. Required alongside `--api-key` to unlock the higher rate-limit tier. (env: `GATEFOLD_LRCLIB_APP_ID`) |
 | `--env-file <FILE>` | Load `GATEFOLD_LRCLIB_API_KEY` / `GATEFOLD_LRCLIB_APP_ID` / `GATEFOLD_USER_AGENT` / `GATEFOLD_MUSICBRAINZ_URL` from a `KEY=VALUE` env file instead of passing them as flags. Flags and real environment variables override the file; a read failure exits with an error. |
-| `--user-agent <UA>` | Override the `User-Agent` sent to lrclib.net, the Cover Art Archive, and `MusicBrainz`. (env: `GATEFOLD_USER_AGENT`) |
+| `--user-agent <UA>` | Override the `User-Agent` sent to lrclib.net, the Cover Art Archive, `MusicBrainz`, and Wikidata. (env: `GATEFOLD_USER_AGENT`) |
 | `--musicbrainz-url <URL>` | Base URL of the `MusicBrainz` web service (default `https://musicbrainz.org`). Point it at a local mirror to skip the public server's 1 request/second floor, which gatefold applies only to `musicbrainz.org`. (env: `GATEFOLD_MUSICBRAINZ_URL`) |
 | `--delay-ms <MS>` | Delay between API requests in milliseconds (default `300`; docs recommend 200–500). |
 | `--cache-only` | Populate the caches but make no changes to music files. |
@@ -162,7 +163,11 @@ id in the tags; "Various Artists" is skipped):
 
 4. **Artist images**: the artist's URL relations are fetched from `MusicBrainz`
    (`/ws/2/artist/{id}?inc=url-rels`, cached at `<state-dir>/artist/<id>.mb.json`) to find
-   its Apple Music and Spotify pages. The Apple Music page is fetched first: it carries the
+   its Apple Music and Spotify pages. When `MusicBrainz` has no Apple Music link, the
+   artist's Wikidata item is asked for one (and for a Spotify id, if that's missing too):
+   one query to the public SPARQL endpoint, by the Wikidata item `MusicBrainz` links to or
+   else by `MusicBrainz` artist id, cached at `<state-dir>/artist/<id>.wikidata.json`
+   whether or not it found anything. The Apple Music page is fetched first: it carries the
    artist's photo as a resizable asset, from which a native-size square avatar
    (`…/4000x4000bb.jpg`) and a 3840×2160 centre-cropped backdrop (`…/3840x2160sr.jpg`) are
    requested — when Apple has a dedicated wide banner for the artist, that is used for the
