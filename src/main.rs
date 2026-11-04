@@ -906,7 +906,11 @@ fn process_artist(
     };
 
     // Churn guard: only overwrite when the images differ from what was written.
-    let replace = replacing && record.as_ref().is_none_or(|r| !r.same_images(&resolved));
+    // Spotify only ever provides an avatar, and a lower-quality one than Apple's —
+    // so never let a Spotify fall-through overwrite an existing file.
+    let replace = replacing
+        && resolved.source != Source::Spotify
+        && record.as_ref().is_none_or(|r| !r.same_images(&resolved));
     // A fresh page check is worth remembering even when nothing changed, so
     // --artist-refresh-after can count from it.
     let mut new_record = match record.clone().filter(|r| r.same_images(&resolved)) {

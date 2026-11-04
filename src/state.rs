@@ -376,7 +376,7 @@ mod tests {
         let marker = dir.join("x.miss");
         assert_eq!(age(&marker), None);
         touch(&marker).unwrap();
-        assert!(age(&marker).unwrap() < Duration::from_secs(60));
+        assert!(age(&marker).unwrap() < Duration::from_mins(1));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
