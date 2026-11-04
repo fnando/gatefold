@@ -34,9 +34,12 @@ pub const BACKDROP_RENDITION: &str = "3840x2160sr.jpg";
 /// Logos are wordmarks on a transparent background, so PNG; `bb` caps at the
 /// source size, and the box is larger than any logo Apple serves.
 pub const LOGO_RENDITION: &str = "9999x9999bb.png";
-/// Artist photos live under this path; when an artist has none, Apple shows an
-/// album cover (`…/Music…/cover.jpg/…`) instead, which we must not use.
-const APPLE_ARTIST_ASSET_MARKER: &str = "AMCArtistImages";
+/// Album covers and other catalogue art live under `…/image/thumb/Music<n>/…`
+/// on Apple's image host, and that's what the page shows in place of an artist
+/// photo when there is none. Artist photos come from other paths
+/// (`AMCArtistImages<n>` for artist-uploaded ones, `Features<n>` for editorial
+/// ones, …), so anything *not* under `Music<n>` is taken as the artist.
+const APPLE_CATALOGUE_ART_PREFIX: &str = "/image/thumb/Music";
 const SPOTIFY_IMAGE_PREFIX: &str = "https://i.scdn.co/image/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,7 +306,7 @@ pub struct AppleArtwork {
     /// HLS master playlist of the 16:9 motion backdrop, when the artist has one.
     pub video: Option<String>,
     /// Asset base of the artist's logo (a wordmark on transparency), when Apple
-    /// has one. Not an `AMCArtistImages` asset, and never an album fallback.
+    /// has one. Lives on its own path, so it skips the artist-photo check.
     pub logo: Option<String>,
 }
 
@@ -316,6 +319,8 @@ pub fn apple_artwork(html: &str) -> Option<AppleArtwork> {
         && let Ok(value) = serde_json::from_str::<Value>(json)
         && let Some(header) = object_with_key(&value, "circleArtwork")
         && let Some(avatar) = artwork_base(header.get("circleArtwork"))
+        // Belt and braces: the page names its own album-cover stand-in.
+        && artwork_base(header.get("fallbackArtwork")).as_deref() != Some(&avatar)
     {
         let video = header
             .get("wideVideoArtwork")
@@ -359,8 +364,11 @@ fn artwork_base(artwork: Option<&Value>) -> Option<String> {
     is_artist_asset(&base).then_some(base)
 }
 
+/// True unless `base` is catalogue art (`…/image/thumb/Music123/…`).
 fn is_artist_asset(base: &str) -> bool {
-    base.contains(APPLE_ARTIST_ASSET_MARKER)
+    !base.find(APPLE_CATALOGUE_ART_PREFIX).is_some_and(|i| {
+        base[i + APPLE_CATALOGUE_ART_PREFIX.len()..].starts_with(|c: char| c.is_ascii_digit())
+    })
 }
 
 /// Depth-first search for the first object that has `key`.
@@ -490,6 +498,26 @@ mod tests {
         let html = format!(
             r#"<meta property="og:image" content="{cover}/1200x630cw.png"><script id="serialized-server-data">{json}</script>"#
         );
+        assert_eq!(apple_artwork(&html), None);
+
+        // Editorial photos live under `Features…`, not `AMCArtistImages…`.
+        let features =
+            "https://is1-ssl.mzstatic.com/image/thumb/Features115/v4/25/6f/d7/x/mzl.wqgsietm.jpg";
+        let json = format!(
+            r#"{{"items":[{{"circleArtwork":{{"dictionary":{{"url":"{features}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"fallbackArtwork":{{"dictionary":{{"url":"{cover}/{{w}}x{{h}}{{c}}.{{f}}"}}}}}}]}}"#
+        );
+        let html = format!(r#"<script id="serialized-server-data">{json}</script>"#);
+        assert_eq!(
+            apple_artwork(&html).map(|a| a.avatar),
+            Some(features.to_string())
+        );
+
+        // Whatever the path, the page's own fallback is never the artist.
+        let odd = "https://is1-ssl.mzstatic.com/image/thumb/Other1/v4/aa/x.jpg";
+        let json = format!(
+            r#"{{"items":[{{"circleArtwork":{{"dictionary":{{"url":"{odd}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"fallbackArtwork":{{"dictionary":{{"url":"{odd}/{{w}}x{{h}}{{c}}.{{f}}"}}}}}}]}}"#
+        );
+        let html = format!(r#"<script id="serialized-server-data">{json}</script>"#);
         assert_eq!(apple_artwork(&html), None);
 
         // No JSON: fall back to og:image.
