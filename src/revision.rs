@@ -144,6 +144,14 @@ pub fn relocate(file: &Path, archive_dir: &Path) -> Result<()> {
     write_digest(&target, &digest)
 }
 
+/// Move `from` (whose SHA-256 is `digest`) to `to`, its digest sidecar with it.
+pub fn move_file(from: &Path, to: &Path, digest: &str) -> Result<()> {
+    fs::rename(from, to)
+        .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+    let _ = fs::remove_file(digest_path(from));
+    write_digest(to, digest)
+}
+
 /// An archived file with the given digest, if any. Each file's digest comes from
 /// its `.sha256` sidecar, computed (and written) on first sight.
 fn find_archived(archive_dir: &Path, digest: &str) -> Result<Option<PathBuf>> {

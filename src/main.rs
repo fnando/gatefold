@@ -9,6 +9,7 @@ mod metadata;
 mod musicbrainz;
 mod net;
 mod progress;
+mod restore;
 mod revision;
 mod scanner;
 mod skip;
@@ -38,8 +39,8 @@ fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
 
-    if let Some(cli::Command::Skip { images }) = &cli.command {
-        return skip_images(images);
+    if let Some(command) = &cli.command {
+        return run_command(command);
     }
     let state_dir = cli
         .state_dir
@@ -145,6 +146,21 @@ fn main() -> Result<()> {
     progress.section("Summary");
     summary.print(&progress, &cli);
     Ok(())
+}
+
+/// The subcommands, which work on the music folder directly (no state dir).
+fn run_command(command: &cli::Command) -> Result<()> {
+    match command {
+        cli::Command::Skip { images } => skip_images(images),
+        cli::Command::Restore { dir, file } => {
+            let target = match (dir, file) {
+                (Some(dir), _) => restore::Target::Dir(dir),
+                (None, Some(file)) => restore::Target::File(file),
+                (None, None) => unreachable!("clap requires --dir or --file"),
+            };
+            restore::run(&target)
+        }
+    }
 }
 
 /// `gatefold skip`: mark each image as unwanted. Every image is attempted; the

@@ -152,6 +152,24 @@ pub enum Command {
         #[arg(required = true, value_name = "IMAGE")]
         images: Vec<PathBuf>,
     },
+    /// Bring back an artist file from an artist folder's `.gatefold-archive/`.
+    /// The file it replaces is skipped (see `skip`) and archived.
+    Restore {
+        /// Artist folder: list what's in its `.gatefold-archive/` and ask which
+        /// one to restore.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "file",
+            conflicts_with = "file"
+        )]
+        dir: Option<PathBuf>,
+
+        /// A file in an artist folder's `.gatefold-archive/`, restored without
+        /// asking.
+        #[arg(long, value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
 }
 
 /// `30d`, `12h`, `90m`, `45s`, `2w`: a whole number plus a unit.
@@ -276,6 +294,26 @@ mod tests {
             [PathBuf::from("a/folder.jpg"), PathBuf::from("b/cover.jpg")]
         );
         assert!(Cli::try_parse_from(["gatefold", "skip"]).is_err());
+    }
+
+    #[test]
+    fn restore_takes_either_a_dir_or_a_file() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["gatefold", "restore"].iter().chain(args));
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["Kemuri"]).is_err(), "no positional path");
+        assert!(parse(&["--dir", "a", "--file", "b"]).is_err());
+        let Some(Command::Restore { dir, file }) = parse(&["--dir", "Kemuri"]).unwrap().command
+        else {
+            panic!("expected the restore subcommand");
+        };
+        assert_eq!((dir, file), (Some(PathBuf::from("Kemuri")), None));
+        assert!(
+            parse(&[
+                "--file",
+                "Kemuri/.gatefold-archive/primary/folder-2026-01-31.jpg"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

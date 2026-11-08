@@ -322,6 +322,36 @@ You can skip `cover.jpg` / `cover.jpeg` / `cover.png` and the artist files (`fol
 `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Delete the marker to undo. A folder
 named `skip` can still be scanned as `gatefold ./skip ...`.
 
+### Restoring an archived image
+
+To bring back a previous artist photo, backdrop, motion backdrop or logo, point
+`gatefold restore --dir` at the artist folder. It lists what's in its `.gatefold-archive/`
+(newest first, marking versions you skipped) and asks which one to restore:
+
+```
+$ gatefold restore --dir "Music/Kemuri"
+Archived artist files in Music/Kemuri:
+
+  Avatar (current: folder.jpg)
+    1) folder-2026-03-01.jpg  412 KB
+    2) folder-2026-01-31.jpg  380 KB
+
+  Logo (current: logo.png)
+    3) logo-2026-02-01.png  24 KB
+
+Restore which? [1-3, empty to cancel]: 2
+✓ restored folder-2026-01-31.jpg as folder.jpg
+  folder.jpg skipped and archived as .gatefold-archive/primary/folder-2026-11-08.jpg
+```
+
+Use `--file` with an archived file to restore it without the menu:
+`gatefold restore --file "Music/Kemuri/.gatefold-archive/primary/folder-2026-01-31.jpg"`. Like `skip`, this needs no `--state-dir`.
+
+The file being replaced is [skipped](#skipping-an-image) and then archived, so later runs don't
+write it back. If the restored image had been skipped, its marker is removed. A
+`--replace-artist-images` run still replaces the restored image if the artist's photo changes
+upstream. Add a [keep marker](#keeping-your-own-images) if you want it to stay for good.
+
 ### Incremental runs (`--new-only`)
 
 Every lookup records a result: a hit is cached (`lrc/`, `art/`), and a "not found" writes a
