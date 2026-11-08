@@ -152,13 +152,14 @@ fn main() -> Result<()> {
 fn run_command(command: &cli::Command) -> Result<()> {
     match command {
         cli::Command::Skip { images } => skip_images(images),
-        cli::Command::Restore { dir, file } => {
+        cli::Command::Keep { paths } => keep_paths(paths),
+        cli::Command::Restore { dir, file, keep } => {
             let target = match (dir, file) {
                 (Some(dir), _) => restore::Target::Dir(dir),
                 (None, Some(file)) => restore::Target::File(file),
                 (None, None) => unreachable!("clap requires --dir or --file"),
             };
-            restore::run(&target)
+            restore::run(&target, *keep)
         }
     }
 }
@@ -185,6 +186,36 @@ fn skip_images(images: &[PathBuf]) -> Result<()> {
     }
     if failed > 0 {
         anyhow::bail!("{failed} image(s) could not be skipped");
+    }
+    Ok(())
+}
+
+/// `gatefold keep`: write the keep marker for each image or folder. Every path is
+/// attempted; the command fails if any of them couldn't be kept.
+fn keep_paths(paths: &[PathBuf]) -> Result<()> {
+    let mut failed = 0;
+    for path in paths {
+        match keep::mark(path) {
+            Ok(kept) => {
+                let marker = kept.marker.path().display();
+                match kept.marker {
+                    keep::Marked::Created(_) => println!("✓ {}: kept ({marker})", path.display()),
+                    keep::Marked::AlreadyKept(_) => {
+                        println!("· {}: already kept ({marker})", path.display());
+                    }
+                }
+                if let Some(unskipped) = kept.unskipped {
+                    println!("  skip taken back (removed {})", unskipped.display());
+                }
+            }
+            Err(err) => {
+                failed += 1;
+                eprintln!("✗ {err:#}");
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} path(s) could not be kept");
     }
     Ok(())
 }

@@ -43,8 +43,8 @@ you already have.
   new ones.
 - **Keep your own images** with empty marker files: `.gatefold-keep` in an artist or album
   folder means its existing images are never replaced, even when replacing (missing ones are
-  still written), and granular markers keep one kind each. See
-  [Keeping your own images](#keeping-your-own-images).
+  still written), and granular markers keep one kind each; `gatefold keep <image|folder>`
+  writes them for you. See [Keeping your own images](#keeping-your-own-images).
 - **Skip an image you don't want** with `gatefold skip <image>`. A different one replaces it
   as soon as one is available, and those exact contents are never written again. See
   [Skipping an image](#skipping-an-image).
@@ -262,6 +262,17 @@ gatefold then never replaces (or archives) those images, even with `--replace-ar
 / `--replace-cover`. A kept image that's missing is still written, as on any run, so a marker
 only matters to replace runs. Lyrics are never affected.
 
+`gatefold keep` writes the markers for you: give it an image and it writes the marker for that
+kind of image, in the folder that governs it; give it a folder and it writes `.gatefold-keep`.
+Keeping an image you had [skipped](#skipping-an-image) takes the skip back. Like `skip`, it
+needs no `--state-dir`.
+
+```sh
+gatefold keep "Music/Kemuri/folder.jpg"                        # .gatefold-primary-keep
+gatefold keep "Music/Kemuri/1997 - Little Playmate/cover.jpg"  # .gatefold-cover-keep in the album
+gatefold keep "Music/Bad Cop Bad Cop"                          # .gatefold-keep
+```
+
 `.gatefold-keep` keeps everything its folder governs. Without it, the granular markers keep
 one kind each:
 
@@ -350,7 +361,8 @@ Use `--file` with an archived file to restore it without the menu:
 The file being replaced is [skipped](#skipping-an-image) and then archived, so later runs don't
 write it back. If the restored image had been skipped, its marker is removed. A
 `--replace-artist-images` run still replaces the restored image if the artist's photo changes
-upstream. Add a [keep marker](#keeping-your-own-images) if you want it to stay for good.
+upstream; pass `--keep` to also write its [keep marker](#keeping-your-own-images)
+(`.gatefold-primary-keep` for an avatar, and so on), so it stays.
 
 ### Incremental runs (`--new-only`)
 

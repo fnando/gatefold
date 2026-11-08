@@ -105,27 +105,55 @@ pub fn mark(image: &Path) -> Result<Marked> {
     Ok(Marked::Created(marker))
 }
 
-/// True for the files a run would replace: album cover sidecars and artist
-/// files (a motion backdrop only inside `backdrops/`). Anything else (archived
-/// versions, audio) would get a marker no run ever reads.
+/// True for the files a run would replace (see [`classify`]). Anything else
+/// (archived versions, audio) would get a marker no run ever reads.
 fn managed(image: &Path) -> bool {
-    let Some(name) = image.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let name = name.to_ascii_lowercase();
-    let in_backdrops = image
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|dir| dir == "backdrops");
-    COVER_NAMES.contains(&name.as_str())
-        || [
-            ArtistImage::Avatar,
-            ArtistImage::Backdrop,
-            ArtistImage::Logo,
-        ]
-        .iter()
-        .any(|kind| kind.names().contains(&name.as_str()))
-        || (in_backdrops && ArtistImage::Video.names().contains(&name.as_str()))
+    classify(image).is_some()
+}
+
+/// An image a run writes and may replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Managed {
+    /// An album cover sidecar (`cover.*`), standing for the album's cover.
+    Cover,
+    Artist(ArtistImage),
+}
+
+/// What `image` is, by name: an album cover sidecar or an artist file (a
+/// motion backdrop only inside `backdrops/`), with the folder it belongs to
+/// (the album folder for a cover, the artist folder for an artist file).
+pub fn classify(image: &Path) -> Option<(Managed, PathBuf)> {
+    let name = image.file_name()?.to_str()?.to_ascii_lowercase();
+    let parent = image.parent().unwrap_or_else(|| Path::new("."));
+    let in_backdrops = parent.file_name().is_some_and(|dir| dir == "backdrops");
+    if COVER_NAMES.contains(&name.as_str()) {
+        return Some((Managed::Cover, parent.to_path_buf()));
+    }
+    if in_backdrops && ArtistImage::Video.names().contains(&name.as_str()) {
+        let artist = parent.parent().unwrap_or_else(|| Path::new("."));
+        return Some((Managed::Artist(ArtistImage::Video), artist.to_path_buf()));
+    }
+    [
+        ArtistImage::Avatar,
+        ArtistImage::Backdrop,
+        ArtistImage::Logo,
+    ]
+    .into_iter()
+    .find(|kind| kind.names().contains(&name.as_str()))
+    .map(|kind| (Managed::Artist(kind), parent.to_path_buf()))
+}
+
+/// Take back a skip of `image`'s contents: remove the marker next to it, if
+/// any. Returns the removed marker.
+pub fn unmark(image: &Path) -> Result<Option<PathBuf>> {
+    let bytes = fs::read(image).with_context(|| format!("reading {}", image.display()))?;
+    let dir = image.parent().unwrap_or_else(|| Path::new("."));
+    let marker = dir.join(marker_name(&digest_bytes(&bytes)));
+    if !marker.is_file() {
+        return Ok(None);
+    }
+    fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
+    Ok(Some(marker))
 }
 
 #[cfg(test)]
@@ -182,6 +210,43 @@ mod tests {
         assert!(!cover(&dir));
         mark(&dir.join("cover.jpg")).unwrap();
         assert!(cover(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn classifies_by_name_and_folder() {
+        let album = Path::new("Music/Kemuri/1997 - Little Playmate");
+        let artist = Path::new("Music/Kemuri");
+        assert_eq!(
+            classify(&album.join("Cover.JPG")),
+            Some((Managed::Cover, album.to_path_buf()))
+        );
+        assert_eq!(
+            classify(&artist.join("backdrops/backdrop.mp4")),
+            Some((Managed::Artist(ArtistImage::Video), artist.to_path_buf()))
+        );
+        assert_eq!(
+            classify(&artist.join("logo.png")),
+            Some((Managed::Artist(ArtistImage::Logo), artist.to_path_buf()))
+        );
+        assert_eq!(classify(&artist.join("backdrop.mp4")), None);
+        assert_eq!(classify(&album.join("01. Song.flac")), None);
+    }
+
+    #[test]
+    fn unmarking_removes_only_that_images_marker() {
+        let dir = dir("unmark");
+        fs::write(dir.join("folder.jpg"), b"photo").unwrap();
+        assert_eq!(unmark(&dir.join("folder.jpg")).unwrap(), None);
+        mark(&dir.join("folder.jpg")).unwrap();
+        fs::write(dir.join(marker_name(&digest_bytes(b"other"))), b"").unwrap();
+        let removed = unmark(&dir.join("folder.jpg")).unwrap();
+        assert_eq!(
+            removed,
+            Some(dir.join(marker_name(&digest_bytes(b"photo"))))
+        );
+        assert!(!rejects(&dir, b"photo"));
+        assert!(rejects(&dir, b"other"));
         fs::remove_dir_all(&dir).unwrap();
     }
 

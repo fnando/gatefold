@@ -13,10 +13,13 @@
 //!   (`logo.png`) and `.gatefold-cover-keep` (embedded covers + `cover.jpg`, in an
 //!   album folder or any folder above it).
 //!
-//! Lyrics are never affected.
+//! Lyrics are never affected. `gatefold keep` writes these markers for you.
 
+use crate::skip::{self, Managed};
 use crate::writer::ArtistImage;
-use std::path::Path;
+use anyhow::{Context, Result, bail};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Keeps everything its folder governs.
 pub const ALL: &str = ".gatefold-keep";
@@ -64,6 +67,75 @@ pub fn cover(album_dir: &Path, root: &Path) -> bool {
         .ancestors()
         .take_while(|dir| dir.starts_with(root))
         .any(|dir| has(dir, ALL) || has(dir, COVER))
+}
+
+/// What writing a keep marker did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Marked {
+    Created(PathBuf),
+    AlreadyKept(PathBuf),
+}
+
+impl Marked {
+    pub fn path(&self) -> &Path {
+        match self {
+            Marked::Created(p) | Marked::AlreadyKept(p) => p,
+        }
+    }
+}
+
+fn write_marker(dir: &Path, name: &str) -> Result<Marked> {
+    let marker = dir.join(name);
+    if marker.is_file() {
+        return Ok(Marked::AlreadyKept(marker));
+    }
+    fs::write(&marker, b"").with_context(|| format!("writing {}", marker.display()))?;
+    Ok(Marked::Created(marker))
+}
+
+/// Keep artist folder `dir`'s `kind` file: write its granular marker.
+pub fn mark_artist_image(dir: &Path, kind: ArtistImage) -> Result<Marked> {
+    write_marker(dir, artist_marker(kind))
+}
+
+/// What `gatefold keep` did for one path.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub marker: Marked,
+    /// A skip marker for the kept image's contents, removed: keeping it means
+    /// you want it after all.
+    pub unskipped: Option<PathBuf>,
+}
+
+/// `gatefold keep <path>`: a folder gets `.gatefold-keep` (everything it
+/// governs); an image gets the granular marker for its kind, in the folder that
+/// governs it (`.gatefold-cover-keep` in the album folder for `cover.*`,
+/// `.gatefold-video-keep` in the artist folder for `backdrops/backdrop.mp4`, …).
+pub fn mark(path: &Path) -> Result<Kept> {
+    if path.is_dir() {
+        return Ok(Kept {
+            marker: write_marker(path, ALL)?,
+            unskipped: None,
+        });
+    }
+    if !path.is_file() {
+        bail!("{} is not a file or folder", path.display());
+    }
+    let Some((managed, dir)) = skip::classify(path) else {
+        bail!(
+            "{} is not an image gatefold writes (cover.jpg, folder.jpg, backdrop.jpg, \
+             backdrops/backdrop.mp4 or logo.png); pass a folder to keep everything in it",
+            path.display()
+        );
+    };
+    let marker = match managed {
+        Managed::Cover => write_marker(&dir, COVER)?,
+        Managed::Artist(kind) => mark_artist_image(&dir, kind)?,
+    };
+    Ok(Kept {
+        marker,
+        unskipped: skip::unmark(path)?,
+    })
 }
 
 #[cfg(test)]
@@ -128,6 +200,50 @@ mod tests {
         fs::write(artist.join(COVER), b"").unwrap();
         assert!(cover(&other, &root));
         assert!(!artist_image(&artist, ArtistImage::Avatar));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn keeping_writes_the_marker_for_the_images_kind() {
+        let (root, artist, album) = tree("mark");
+        fs::create_dir_all(artist.join("backdrops")).unwrap();
+        for file in ["folder.jpg", "backdrops/backdrop.mp4"] {
+            fs::write(artist.join(file), file.as_bytes()).unwrap();
+        }
+        fs::write(album.join("cover.jpg"), b"scan").unwrap();
+
+        let kept = mark(&artist.join("folder.jpg")).unwrap();
+        assert_eq!(
+            kept.marker,
+            Marked::Created(artist.join(".gatefold-primary-keep"))
+        );
+        assert_eq!(kept.unskipped, None);
+        assert!(artist_image(&artist, ArtistImage::Avatar));
+        assert!(!artist_image(&artist, ArtistImage::Backdrop));
+        assert_eq!(
+            mark(&artist.join("folder.jpg")).unwrap().marker,
+            Marked::AlreadyKept(artist.join(".gatefold-primary-keep"))
+        );
+
+        mark(&artist.join("backdrops/backdrop.mp4")).unwrap();
+        assert!(artist.join(".gatefold-video-keep").is_file());
+
+        // Keeping a skipped cover takes the skip back.
+        skip::mark(&album.join("cover.jpg")).unwrap();
+        let kept = mark(&album.join("cover.jpg")).unwrap();
+        assert_eq!(kept.marker, Marked::Created(album.join(COVER)));
+        assert!(kept.unskipped.is_some());
+        assert!(!skip::cover(&album));
+        assert!(cover(&album, &root));
+
+        // A folder keeps everything it governs.
+        let kept = mark(&artist).unwrap();
+        assert_eq!(kept.marker, Marked::Created(artist.join(ALL)));
+        assert!(all_artist_images(&artist));
+
+        assert!(mark(&album.join("01. Song.flac")).is_err());
+        fs::write(album.join("01. Song.flac"), b"x").unwrap();
+        assert!(mark(&album.join("01. Song.flac")).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -152,6 +152,17 @@ pub enum Command {
         #[arg(required = true, value_name = "IMAGE")]
         images: Vec<PathBuf>,
     },
+    /// Never replace an image, even with `--replace-cover` /
+    /// `--replace-artist-images`: writes the keep marker for its kind
+    /// (`.gatefold-primary-keep`, `.gatefold-cover-keep`, …). A folder gets
+    /// `.gatefold-keep`, keeping everything it governs. A skip of the image is
+    /// taken back. Delete the marker to undo.
+    Keep {
+        /// Album covers (`cover.jpg`), artist files (`folder.jpg`,
+        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`), or folders.
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
     /// Bring back an artist file from an artist folder's `.gatefold-archive/`.
     /// The file it replaces is skipped (see `skip`) and archived.
     Restore {
@@ -169,6 +180,11 @@ pub enum Command {
         /// asking.
         #[arg(long, value_name = "FILE")]
         file: Option<PathBuf>,
+
+        /// Also keep the restored file (see `keep`), so `--replace-artist-images`
+        /// never replaces it.
+        #[arg(long)]
+        keep: bool,
     },
 }
 
@@ -302,11 +318,21 @@ mod tests {
         assert!(parse(&[]).is_err());
         assert!(parse(&["Kemuri"]).is_err(), "no positional path");
         assert!(parse(&["--dir", "a", "--file", "b"]).is_err());
-        let Some(Command::Restore { dir, file }) = parse(&["--dir", "Kemuri"]).unwrap().command
+        let Some(Command::Restore { dir, file, keep }) =
+            parse(&["--dir", "Kemuri"]).unwrap().command
         else {
             panic!("expected the restore subcommand");
         };
-        assert_eq!((dir, file), (Some(PathBuf::from("Kemuri")), None));
+        assert_eq!(
+            (dir, file, keep),
+            (Some(PathBuf::from("Kemuri")), None, false)
+        );
+        let Some(Command::Restore { keep, .. }) =
+            parse(&["--dir", "Kemuri", "--keep"]).unwrap().command
+        else {
+            panic!("expected the restore subcommand");
+        };
+        assert!(keep);
         assert!(
             parse(&[
                 "--file",
@@ -314,6 +340,16 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn keep_takes_paths() {
+        let cli = Cli::try_parse_from(["gatefold", "keep", "Kemuri", "Kemuri/folder.jpg"]).unwrap();
+        let Some(Command::Keep { paths }) = cli.command else {
+            panic!("expected the keep subcommand");
+        };
+        assert_eq!(paths.len(), 2);
+        assert!(Cli::try_parse_from(["gatefold", "keep"]).is_err());
     }
 
     #[test]

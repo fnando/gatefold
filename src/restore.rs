@@ -1,11 +1,12 @@
 //! `gatefold restore`: bring back an artist file from the artist folder's
 //! `.gatefold-archive/`. The file it replaces is skipped (`gatefold skip`) and
 //! archived, so later runs neither keep it nor write it back; the restored
-//! image loses any skip marker of its own.
+//! image loses any skip marker of its own. `--keep` also writes its keep
+//! marker, so replace runs leave it alone.
 
 use crate::revision::{self, Archived, Revisions};
-use crate::skip;
 use crate::writer::{ARCHIVE_DIR, ArtistImage};
+use crate::{keep, skip};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::{BufRead, Write};
@@ -145,7 +146,8 @@ pub enum Target<'a> {
 
 /// `gatefold restore --dir <artist>` lists the folder's archive and asks which
 /// one to restore; `gatefold restore --file <archived file>` restores it directly.
-pub fn run(target: &Target) -> Result<()> {
+/// With `keep`, the restored file also gets its keep marker.
+pub fn run(target: &Target, keep: bool) -> Result<()> {
     let revisions = Revisions::new();
     let (dir, entry) = match *target {
         Target::File(path) => {
@@ -192,6 +194,12 @@ pub fn run(target: &Target) -> Result<()> {
     );
     if let Some((previous, archived)) = &restored.replaced {
         println!("  {} skipped and archived as {archived}", name(previous));
+    }
+    if keep {
+        let marker = keep::mark_artist_image(&dir, entry.kind)?;
+        println!("  kept ({})", name(marker.path()));
+    } else if !keep::artist_image(&dir, entry.kind) {
+        println!("  run with --keep to stop --replace-artist-images from replacing it");
     }
     Ok(())
 }
