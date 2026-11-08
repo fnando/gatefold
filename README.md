@@ -141,8 +141,10 @@ For each discovered track:
 
 1. **Metadata** is read from the file (artist, title, album, duration, `MusicBrainz`
    release / release-group ids, and whether lyrics or cover art are already present) and
-   cached at `<state-dir>/metadata/<sha256(path)>.json`. Cached metadata is reused on later
-   runs to avoid re-parsing.
+   cached at `<state-dir>/metadata/<sha256(path)>.json` along with the file's mtime and size.
+   Cached metadata is reused on later runs while the mtime and size still match; a file that
+   was re-tagged or re-uploaded since is re-read, so changes it needs (e.g. a cover that is no
+   longer embedded) are picked up. The snapshot is refreshed after gatefold's own writes.
 2. **Lyrics**: unless the track already has both a lyrics tag and an adjacent `.lrc`, the
    lyrics record is loaded from `<state-dir>/lrc/<sha256(path)>.json` if present, otherwise
    fetched from `GET /api/get`. Only successful (`200`) responses are cached; `404` is not.

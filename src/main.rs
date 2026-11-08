@@ -24,7 +24,7 @@ use backup::Backup;
 use clap::Parser;
 use cli::Cli;
 use lrclib::{Client, Fetched, LyricsRecord, Query, Unauthorized};
-use metadata::TrackMetadata;
+use metadata::{Fingerprint, TrackMetadata};
 use progress::Progress;
 use revision::Revisions;
 use scanner::Track;
@@ -403,22 +403,18 @@ fn process_track(
     let abs = std::fs::canonicalize(&track.path).unwrap_or_else(|_| track.path.clone());
     let digest = digest_for(&abs);
 
-    // Metadata cache: reuse a current-schema entry, otherwise (missing or from
-    // an older build) parse tags and persist. A file lofty can't read is logged
-    // and skipped rather than aborting the whole run.
-    let meta: TrackMetadata = match state.load_metadata::<TrackMetadata>(&digest)? {
-        Some(meta) if meta.is_current() => meta,
-        _ => match metadata::extract(&track.path) {
-            Ok(meta) => {
-                state.save_metadata(&digest, &meta)?;
-                meta
-            }
-            Err(err) => {
-                summary.unreadable += 1;
-                progress.info(format!("✗ {name}: {err:#}"));
-                return Ok(());
-            }
-        },
+    // Metadata cache: reuse an entry from the current schema whose mtime+size
+    // still match the file, otherwise (missing, from an older build, or the file
+    // was re-tagged/re-uploaded since) parse tags and persist. A file we can't
+    // stat or lofty can't read is logged and skipped rather than aborting the run.
+    let cached = state.load_metadata::<TrackMetadata>(&digest)?;
+    let meta: TrackMetadata = match refresh_metadata(state, track, &digest, cached) {
+        Ok(meta) => meta,
+        Err(err) => {
+            summary.unreadable += 1;
+            progress.info(format!("✗ {name}: {err:#}"));
+            return Ok(());
+        }
     };
 
     // Previous tag values are snapshotted here before `--replace` overwrites them.
@@ -475,7 +471,35 @@ fn process_track(
     }
 
     backup.finish()?;
+
+    // Embedding lyrics or a cover rewrote the file, so the snapshot we started
+    // from no longer matches it. Re-read now so the next run sees the tags as
+    // they are instead of re-extracting them (or treating our own write as an
+    // external change).
+    if let Err(err) = refresh_metadata(state, track, &digest, Some(meta)) {
+        progress.info(format!("✗ {name}: {err:#}"));
+    }
     Ok(())
+}
+
+/// `cached` if it is from the current schema and the file's mtime+size haven't
+/// changed since it was taken; otherwise re-extract the tags, persist the new
+/// snapshot, and return it.
+fn refresh_metadata(
+    state: &State,
+    track: &Track,
+    digest: &str,
+    cached: Option<TrackMetadata>,
+) -> Result<TrackMetadata> {
+    let fingerprint = Fingerprint::of(&track.path)?;
+    if let Some(meta) = cached
+        && meta.is_current(&fingerprint)
+    {
+        return Ok(meta);
+    }
+    let meta = metadata::extract(&track.path)?;
+    state.save_metadata(digest, &meta)?;
+    Ok(meta)
 }
 
 // ---- Lyrics -----------------------------------------------------------------

@@ -4,11 +4,41 @@ use lofty::prelude::*;
 use lofty::read_from_path;
 use lofty::tag::ItemKey;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 /// Bumped whenever the set of extracted fields changes, so cached entries from
 /// an older build are re-parsed instead of silently missing new data.
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
+
+/// Cheap identity of a file's contents: its modification time and size, both
+/// from a single `stat`. A cached snapshot whose fingerprint no longer matches
+/// the file (re-tagged, re-uploaded, or rewritten by us) is re-extracted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fingerprint {
+    /// Modification time as nanoseconds since the Unix epoch.
+    pub mtime: u64,
+    /// File size in bytes.
+    pub size: u64,
+}
+
+impl Fingerprint {
+    /// Stat `path` and read its fingerprint.
+    pub fn of(path: &Path) -> Result<Self> {
+        let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        let modified = meta
+            .modified()
+            .with_context(|| format!("reading mtime of {}", path.display()))?;
+        let mtime = modified
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        Ok(Self {
+            mtime,
+            size: meta.len(),
+        })
+    }
+}
 
 /// Tags extracted from a track, cached so files aren't re-parsed on later runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +46,9 @@ pub struct TrackMetadata {
     /// Schema version of this cached entry (see [`CURRENT_VERSION`]).
     #[serde(default)]
     pub version: u32,
+    /// mtime + size of the file when these tags were read (see [`Fingerprint`]).
+    #[serde(default)]
+    pub fingerprint: Option<Fingerprint>,
     pub path: String,
     pub track_name: Option<String>,
     pub artist_name: Option<String>,
@@ -52,9 +85,10 @@ impl TrackMetadata {
         non_empty(self.track_name.as_deref()) && non_empty(self.artist_name.as_deref())
     }
 
-    /// True when this cached entry matches the current extraction schema.
-    pub fn is_current(&self) -> bool {
-        self.version == CURRENT_VERSION
+    /// True when this cached entry matches the current extraction schema and
+    /// was read from a file with this exact `fingerprint`.
+    pub fn is_current(&self, fingerprint: &Fingerprint) -> bool {
+        self.version == CURRENT_VERSION && self.fingerprint.as_ref() == Some(fingerprint)
     }
 
     /// The album artist, or the track artist when no album artist is tagged.
@@ -96,8 +130,13 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Read tags and duration from the file at `path` via lofty.
+/// Read tags and duration from the file at `path` via lofty, recording the
+/// file's fingerprint so later runs can tell when it has changed.
 pub fn extract(path: &Path) -> Result<TrackMetadata> {
+    // Stat first: if the file is rewritten mid-extraction, the stale fingerprint
+    // forces a re-read next run rather than caching the new file's tags under
+    // the old one's identity.
+    let fingerprint = Fingerprint::of(path)?;
     let tagged =
         read_from_path(path).with_context(|| format!("reading tags from {}", path.display()))?;
 
@@ -123,6 +162,7 @@ pub fn extract(path: &Path) -> Result<TrackMetadata> {
 
     Ok(TrackMetadata {
         version: CURRENT_VERSION,
+        fingerprint: Some(fingerprint),
         path: path.to_string_lossy().into_owned(),
         track_name,
         artist_name,
@@ -161,9 +201,55 @@ mod tests {
     }
 
     #[test]
+    fn is_current_requires_matching_version_and_fingerprint() {
+        let fp = Fingerprint { mtime: 1, size: 2 };
+        let mut meta = TrackMetadata {
+            version: CURRENT_VERSION,
+            fingerprint: Some(fp),
+            path: String::new(),
+            track_name: None,
+            artist_name: None,
+            album_name: None,
+            album_artist_name: None,
+            duration: None,
+            has_lyrics_tag: false,
+            musicbrainz_release_id: None,
+            musicbrainz_release_group_id: None,
+            musicbrainz_album_artist_id: None,
+            has_cover_art: false,
+            barcode: None,
+        };
+        assert!(meta.is_current(&fp));
+        assert!(!meta.is_current(&Fingerprint { mtime: 1, size: 3 }));
+        assert!(!meta.is_current(&Fingerprint { mtime: 9, size: 2 }));
+        meta.fingerprint = None;
+        assert!(!meta.is_current(&fp));
+        meta.fingerprint = Some(fp);
+        meta.version = CURRENT_VERSION - 1;
+        assert!(!meta.is_current(&fp));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_file_does() {
+        let dir = std::env::temp_dir().join(format!("gatefold-fp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("track.flac");
+        fs::write(&file, b"abc").unwrap();
+        let before = Fingerprint::of(&file).unwrap();
+        assert_eq!(before.size, 3);
+        fs::write(&file, b"abcd").unwrap();
+        let after = Fingerprint::of(&file).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(after.size, 4);
+        assert!(Fingerprint::of(&dir.join("missing.flac")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn album_artist_falls_back_to_track_artist() {
         let mut meta = TrackMetadata {
             version: CURRENT_VERSION,
+            fingerprint: None,
             path: String::new(),
             track_name: None,
             artist_name: Some("Thom Yorke".into()),
