@@ -22,6 +22,20 @@ const COVER_FILENAMES: &[&str] = &[
     "folder.png",
 ];
 
+/// Hidden folder in each artist folder holding replaced artist files. Jellyfin
+/// ignores dot-prefixed paths (`**/.*` in its built-in ignore list), so archived
+/// images and videos are never indexed or played as theme videos.
+pub const ARCHIVE_DIR: &str = ".gatefold-archive";
+
+/// Where archives lived before [`ARCHIVE_DIR`] (`primary/`, `backdrops/`,
+/// `logos/` in the artist folder itself), with the stem of the files archived
+/// there and their subfolder under [`ARCHIVE_DIR`] now.
+const LEGACY_ARCHIVES: [(&str, &str); 3] = [
+    ("primary", "folder"),
+    ("backdrops", "backdrop"),
+    ("logos", "logo"),
+];
+
 /// The artist files written into an artist folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtistImage {
@@ -68,13 +82,15 @@ impl ArtistImage {
         }
     }
 
-    /// Subfolder of the artist folder that keeps replaced versions of this file.
-    fn archive_dir(self) -> &'static str {
-        match self {
+    /// Folder of the artist folder `dir` that keeps replaced versions of this
+    /// file: `.gatefold-archive/primary`, `…/backdrops` or `…/logos`.
+    pub fn archive_dir(self, dir: &Path) -> PathBuf {
+        let sub = match self {
             ArtistImage::Avatar => "primary",
             ArtistImage::Backdrop | ArtistImage::Video => "backdrops",
             ArtistImage::Logo => "logos",
-        }
+        };
+        dir.join(ARCHIVE_DIR).join(sub)
     }
 
     /// Where this file goes, relative to the artist folder (for logs).
@@ -348,6 +364,35 @@ pub fn write_cover_sidecar(
     })
 }
 
+/// Move archives left by earlier versions in `primary/`, `backdrops/` and
+/// `logos/` of artist folder `dir` (where Jellyfin indexes them, and plays old
+/// motion backdrops as theme videos) into [`ARCHIVE_DIR`]. Only dated archive
+/// files (`folder-2026-01-31.jpg`, `backdrop-2026-01-31-2.mp4`, …) and their
+/// digest sidecars move; the current `backdrops/backdrop.mp4` and anything else
+/// stay, and a legacy folder is removed once empty. Returns how many files moved.
+pub fn migrate_archives(dir: &Path) -> Result<usize> {
+    let mut moved = 0;
+    for (sub, stem) in LEGACY_ARCHIVES {
+        let legacy = dir.join(sub);
+        let Ok(entries) = fs::read_dir(&legacy) else {
+            continue;
+        };
+        let target = dir.join(ARCHIVE_DIR).join(sub);
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("reading {}", legacy.display()))?
+                .path();
+            if path.is_file() && revision::is_archived_name(&path, stem) {
+                revision::relocate(&path, &target)?;
+                moved += 1;
+            }
+        }
+        // Only succeeds when nothing else is left in it.
+        let _ = fs::remove_dir(&legacy);
+    }
+    Ok(moved)
+}
+
 /// Write an artist image into `dir` as `<stem>.<ext>`, with a `<file>.sha256`
 /// digest sidecar. An existing image is kept unless `replace` is set and its
 /// digest differs (read from its sidecar, so large files aren't reread), in which
@@ -376,8 +421,7 @@ pub fn write_artist_image(
 
     let mut kept = None;
     if let Some((previous, previous_digest)) = &existing {
-        let archived =
-            revisions.archive(&dir.join(kind.archive_dir()), previous, previous_digest)?;
+        let archived = revisions.archive(&kind.archive_dir(dir), previous, previous_digest)?;
         let relative = archived
             .path()
             .strip_prefix(dir)
@@ -414,5 +458,102 @@ fn extension_for(mime: Option<&MimeType>) -> &'static str {
         Some("image/png") => "png",
         Some("image/gif") => "gif",
         _ => "jpg",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artist(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("gatefold-writer-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn replaced_artist_files_go_to_the_hidden_archive() {
+        let dir = artist("archive");
+        let revisions = Revisions::new();
+        let date = revisions.date();
+        for (kind, ext, sub) in [
+            (ArtistImage::Avatar, "jpg", "primary"),
+            (ArtistImage::Backdrop, "jpg", "backdrops"),
+            (ArtistImage::Video, "mp4", "backdrops"),
+            (ArtistImage::Logo, "png", "logos"),
+        ] {
+            let old = format!("old {sub} {ext}");
+            write_artist_image(&dir, kind, ext, old.as_bytes(), false, &revisions).unwrap();
+            let (wrote, kept) =
+                write_artist_image(&dir, kind, ext, b"new", true, &revisions).unwrap();
+            assert_eq!(wrote, Write::Replaced);
+            let stem = kind.stem();
+            let archived = format!("{ARCHIVE_DIR}/{sub}/{stem}-{date}.{ext}");
+            assert_eq!(kept.as_deref(), Some(archived.as_str()));
+            assert_eq!(fs::read(dir.join(&archived)).unwrap(), old.as_bytes());
+        }
+        for legacy in ["primary", "logos"] {
+            assert!(!dir.join(legacy).exists(), "{legacy}/ is no longer used");
+        }
+        // Only the current motion backdrop is in Jellyfin's theme-video folder.
+        let theme: Vec<_> = fs::read_dir(dir.join("backdrops"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| !n.ends_with(".sha256"))
+            .collect();
+        assert_eq!(theme, ["backdrop.mp4"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_archives_move_into_the_hidden_archive() {
+        let dir = artist("migrate");
+        for sub in ["primary", "backdrops", "logos"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        fs::write(dir.join("primary/folder-2026-01-31.jpg"), b"a1").unwrap();
+        fs::write(dir.join("primary/folder-2026-01-31.jpg.sha256"), b"stale\n").unwrap();
+        fs::write(dir.join("primary/folder-2026-01-31-2.jpg"), b"a2").unwrap();
+        fs::write(dir.join("backdrops/backdrop.mp4"), b"current video").unwrap();
+        fs::write(dir.join("backdrops/backdrop-2026-02-01.mp4"), b"v1").unwrap();
+        fs::write(dir.join("backdrops/backdrop-2026-02-01.jpg"), b"b1").unwrap();
+        fs::write(dir.join("backdrops/clip.mp4"), b"user's own").unwrap();
+        fs::write(dir.join("logos/logo-2026-03-01.png"), b"l1").unwrap();
+        // Already archived under the new layout: the legacy duplicate is dropped.
+        let primary = dir.join(ARCHIVE_DIR).join("primary");
+        fs::create_dir_all(&primary).unwrap();
+        fs::write(primary.join("folder-2025-12-01.jpg"), b"a2").unwrap();
+
+        assert_eq!(migrate_archives(&dir).unwrap(), 5);
+        assert_eq!(
+            migrate_archives(&dir).unwrap(),
+            0,
+            "a second run is a no-op"
+        );
+
+        let archive = dir.join(ARCHIVE_DIR);
+        assert_eq!(
+            fs::read(archive.join("primary/folder-2026-01-31.jpg")).unwrap(),
+            b"a1"
+        );
+        assert_eq!(
+            fs::read_to_string(archive.join("primary/folder-2026-01-31.jpg.sha256"))
+                .unwrap()
+                .trim(),
+            crate::state::digest_bytes(b"a1"),
+            "a malformed sidecar is recomputed"
+        );
+        assert!(!archive.join("primary/folder-2026-01-31-2.jpg").exists());
+        assert!(archive.join("backdrops/backdrop-2026-02-01.mp4").is_file());
+        assert!(archive.join("backdrops/backdrop-2026-02-01.jpg").is_file());
+        assert!(archive.join("logos/logo-2026-03-01.png").is_file());
+
+        assert!(!dir.join("primary").exists());
+        assert!(!dir.join("logos").exists());
+        assert!(dir.join("backdrops/backdrop.mp4").is_file());
+        assert!(dir.join("backdrops/clip.mp4").is_file());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

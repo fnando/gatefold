@@ -82,9 +82,10 @@ pub struct Cli {
     #[arg(long)]
     pub replace_cover: bool,
 
-    /// Replace an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop
-    /// when the artist's image has changed since it was written. The previous files
-    /// are kept, dated, in `<artist>/primary/` and `<artist>/backdrops/`.
+    /// Replace an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop /
+    /// `logo.png` when the artist's image has changed since it was written. The
+    /// previous files are kept, dated, in the artist folder's hidden
+    /// `.gatefold-archive/`.
     #[arg(long, conflicts_with_all = ["skip_artist_images", "lyrics_only", "cover_only"])]
     pub replace_artist_images: bool,
 

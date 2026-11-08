@@ -22,8 +22,8 @@ pub fn lrc_path_for(path: &Path) -> PathBuf {
 
 /// True when `path` has one of the audio extensions we handle. Motion backdrops
 /// share the `.mp4` extension with audio containers, so anything inside a
-/// `backdrops/` folder (Jellyfin's theme-video folder, where gatefold writes them
-/// and keeps replaced ones) or named like one is excluded.
+/// `backdrops/` folder (Jellyfin's theme-video folder, where gatefold writes them)
+/// or named like one is excluded.
 pub fn is_audio(path: &Path) -> bool {
     let by_extension = path
         .extension()
@@ -55,8 +55,11 @@ pub fn dir_has_audio(dir: &Path) -> bool {
 
 /// Recursively collect audio files under `root`, sorted for deterministic order.
 pub fn scan(root: &Path) -> Vec<Track> {
+    // Replaced artist files live in `.gatefold-archive/`; never descend into it
+    // (archived motion backdrops are `.mp4`, like some audio).
     let mut tracks: Vec<Track> = WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| entry.file_name() != crate::writer::ARCHIVE_DIR)
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(walkdir::DirEntry::into_path)

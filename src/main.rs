@@ -277,6 +277,9 @@ fn run_artist_pass(
     for (i, job) in jobs.values().enumerate() {
         bar.status(job.name.clone());
         let start = Instant::now();
+        if !cli.cache_only {
+            migrate_archives(&bar, job);
+        }
         match process_artist(cli, state, services, revisions, &bar, job) {
             Ok(outcome) => {
                 summary.record_artist(&outcome);
@@ -293,6 +296,27 @@ fn run_artist_pass(
         }
     }
     bar.finish();
+}
+
+/// Move archives an earlier version left next to the current files into
+/// `.gatefold-archive/`, so Jellyfin stops indexing them. Failures are logged:
+/// the artist's images are still processed.
+fn migrate_archives(progress: &Progress, job: &ArtistJob) {
+    for dir in &job.folders {
+        match writer::migrate_archives(dir) {
+            Ok(0) => {}
+            Ok(moved) => progress.info(format!(
+                "· {}: moved {moved} archived file(s) into {}/",
+                job.name,
+                writer::ARCHIVE_DIR
+            )),
+            Err(err) => progress.info(format!(
+                "✗ {}: moving archives into {}/: {err:#}",
+                job.name,
+                writer::ARCHIVE_DIR
+            )),
+        }
+    }
 }
 
 /// Load `--env-file` into the process environment before the main parse, so clap's
@@ -1237,7 +1261,7 @@ struct Written {
 
 /// Write the avatar (and backdrop, video and logo, when there are any) into
 /// every folder of the job. A replace moves the previous file into its archive
-/// folder (`primary/`, `backdrops/`, `logos/`) first. A skipped file is replaced
+/// folder (`.gatefold-archive/primary/`, `…/backdrops/`, `…/logos/`) first. A skipped file is replaced
 /// whatever the mode; an image skipped in a folder is never written there.
 fn write_artist_images(
     job: &ArtistJob,

@@ -39,7 +39,7 @@ you already have.
   corresponding embedded tag is overwritten and the previous value is snapshotted under
   `backup/` so it can be restored. Sidecars (`.lrc`, `cover.jpg`) are always create-only.
   Artist images are create-only too unless `--replace-artist-images` is set, which keeps the
-  previous files, dated, in `<artist>/primary/` and `<artist>/backdrops/` before writing the
+  previous files, dated, in the artist folder's hidden `.gatefold-archive/` before writing the
   new ones.
 - **Keep your own images** with empty marker files: `.gatefold-keep` in an artist or album
   folder means its existing images are never replaced, even when replacing (missing ones are
@@ -87,7 +87,7 @@ gatefold --state-dir <DIR> [OPTIONS] [PATH]
 | `--cache-only` | Populate the caches but make no changes to music files. |
 | `--replace-lyrics` | Overwrite an existing embedded lyrics tag (backing up the previous value). |
 | `--replace-cover` | Overwrite an existing embedded cover and `cover.jpg` sidecar (backing up the previous values), e.g. to upgrade to Apple Music's larger artwork. |
-| `--replace-artist-images` | Overwrite an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop / `logo.png` when the artist's image has changed; the previous files are kept, dated, in `primary/`, `backdrops/` and `logos/`. |
+| `--replace-artist-images` | Overwrite an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop / `logo.png` when the artist's image has changed; the previous files are kept, dated, in `.gatefold-archive/` (`primary/`, `backdrops/` and `logos/`). |
 | `--artist-refresh-after <DURATION>` | With `--replace-artist-images`, don't re-check an artist's page if it was last checked within this long ago (`30d`, `12h`, `90m`, `45s`, `2w`). Missing images are still written. |
 | `--verify` | Validate each tag write with `ffprobe` on a temp copy before atomically swapping it in. |
 | `--new-only` | Only look up items with no result on record yet — fast incremental re-runs. |
@@ -220,19 +220,25 @@ touched.
 Artist images are the exception, since artists do refresh their photo to match a new album.
 With `--replace-artist-images`, each artist's page is re-resolved and, when the image URL
 differs from the one recorded at the last write, the existing files are moved aside before
-the new ones are written — into the artist folder's own archive subfolders, dated:
+the new ones are written — into the artist folder's hidden `.gatefold-archive/`, dated:
 
 ```
 <artist folder>/
-    folder.jpg                            # current avatar
-    backdrop.jpg                          # current backdrop
-    logo.png                              # current logo (artists that have one)
-    primary/folder-<YYYY-MM-DD>.jpg       # previous avatar(s)
-    backdrops/backdrop.mp4                # current motion backdrop (Jellyfin theme video)
-    backdrops/backdrop-<YYYY-MM-DD>.jpg   # previous backdrop(s)
-    backdrops/backdrop-<YYYY-MM-DD>.mp4   # previous motion backdrop(s)
-    logos/logo-<YYYY-MM-DD>.png           # previous logo(s)
+    folder.jpg                                              # current avatar
+    backdrop.jpg                                            # current backdrop
+    logo.png                                                # current logo (artists that have one)
+    backdrops/backdrop.mp4                                  # current motion backdrop (Jellyfin theme video)
+    .gatefold-archive/primary/folder-<YYYY-MM-DD>.jpg       # previous avatar(s)
+    .gatefold-archive/backdrops/backdrop-<YYYY-MM-DD>.jpg   # previous backdrop(s)
+    .gatefold-archive/backdrops/backdrop-<YYYY-MM-DD>.mp4   # previous motion backdrop(s)
+    .gatefold-archive/logos/logo-<YYYY-MM-DD>.png           # previous logo(s)
 ```
+
+Jellyfin ignores anything whose name starts with a dot (`**/.*` in its built-in ignore list),
+so archived files are never indexed, and old motion backdrops never play as theme videos.
+Earlier versions archived into `primary/`, `backdrops/` and `logos/` directly in the artist
+folder; the artist pass moves those dated files into `.gatefold-archive/` (leaving the current
+`backdrops/backdrop.mp4` and any file of yours alone) and removes the old folders once empty.
 
 Every replace run fetches each artist's page to learn the current image URLs, and that's
 usually the whole cost of the run on an up-to-date library. `--artist-refresh-after 30d`
@@ -246,9 +252,7 @@ artist file gatefold writes, current or archived, gets a `<file>.sha256` sidecar
 digest, so a replace run compares digests instead of rereading images and videos, and a
 replaced file whose contents are already in the archive (an artist switching back to an
 earlier photo) is dropped rather than archived twice. Unchanged images are left alone, so a
-replace run on an up-to-date library is a no-op apart from the page fetches. Jellyfin plays everything in `backdrops/` as the artist's theme
-videos, so a previous motion backdrop kept there rotates with the current one; delete the
-dated copies once you're happy with the new one.
+replace run on an up-to-date library is a no-op apart from the page fetches.
 
 ### Keeping your own images
 
@@ -265,7 +269,7 @@ one kind each:
 | --- | --- | --- |
 | `.gatefold-keep` | artist folder | `folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`, and the covers of every album below it |
 | `.gatefold-keep` | album folder | the album's cover (embedded in each track + `cover.jpg`) |
-| `.gatefold-primary-keep` | artist folder | `folder.jpg` (the image archived in `primary/` on replace) |
+| `.gatefold-primary-keep` | artist folder | `folder.jpg` (the image archived in `.gatefold-archive/primary/` on replace) |
 | `.gatefold-backdrop-keep` | artist folder | `backdrop.jpg` |
 | `.gatefold-video-keep` | artist folder | `backdrops/backdrop.mp4` |
 | `.gatefold-logo-keep` | artist folder | `logo.png` |
@@ -306,7 +310,7 @@ image, named after the image's contents, and leaves the image where it is. On la
 
 - An existing file with skipped contents counts as missing. The next run replaces it with a
   different image as soon as one is available, without `--replace-*` and even under a keep
-  marker. The old file is archived (`primary/`, `backdrops/`, `logos/`) or, for covers, backed
+  marker. The old file is archived (in `.gatefold-archive/`) or, for covers, backed
   up and swapped in each track as well as in `cover.jpg`.
 - A downloaded image with skipped contents is never written into that folder. Album covers
   count these as `rejected` in the summary.

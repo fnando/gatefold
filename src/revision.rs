@@ -26,9 +26,10 @@ impl Archived {
 }
 
 /// Where an artist folder's previous files go when `--replace-artist-images`
-/// overwrites them: a sibling archive folder (`primary/` for avatars, `backdrops/`
-/// for still and motion backdrops), with the run's date in the name so repeated
-/// replace runs keep a history.
+/// overwrites them: an archive folder under the artist folder's hidden
+/// `.gatefold-archive/` (`primary/` for avatars, `backdrops/` for still and
+/// motion backdrops, `logos/` for logos), with the run's date in the name so
+/// repeated replace runs keep a history.
 pub struct Revisions {
     stamp: u64,
 }
@@ -87,6 +88,60 @@ impl Revisions {
         write_digest(&target, digest)?;
         Ok(Archived::Moved(target))
     }
+}
+
+/// True when `path` is named like a file [`Revisions::archive`] wrote for `stem`:
+/// `<stem>-YYYY-MM-DD.<ext>` or `<stem>-YYYY-MM-DD-<n>.<ext>`, not a sidecar.
+pub fn is_archived_name(path: &Path, stem: &str) -> bool {
+    if path.extension().is_some_and(|e| e == DIGEST_EXT) {
+        return false;
+    }
+    let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix(stem).and_then(|r| r.strip_prefix('-')) else {
+        return false;
+    };
+    let digits = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());
+    let parts: Vec<&str> = rest.split('-').collect();
+    match parts.as_slice() {
+        [y, m, d] => digits(y, 4) && digits(m, 2) && digits(d, 2),
+        [y, m, d, n] => {
+            digits(y, 4) && digits(m, 2) && digits(d, 2) && !n.is_empty() && digits(n, n.len())
+        }
+        _ => false,
+    }
+}
+
+/// Move the archived `file` (and its digest sidecar) into `archive_dir`, keeping
+/// its name: appending `-2`, `-3`, … when another file has it, or dropping
+/// `file` when the archive already holds the same contents.
+pub fn relocate(file: &Path, archive_dir: &Path) -> Result<()> {
+    fs::create_dir_all(archive_dir)
+        .with_context(|| format!("creating {}", archive_dir.display()))?;
+    let digest = file_digest(file)?;
+    if find_archived(archive_dir, &digest)?.is_some() {
+        fs::remove_file(file).with_context(|| format!("removing {}", file.display()))?;
+        let _ = fs::remove_file(digest_path(file));
+        return Ok(());
+    }
+    let name = file.file_name().unwrap_or_default();
+    let mut target = archive_dir.join(name);
+    let stem = file
+        .file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let ext = file
+        .extension()
+        .map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
+    let mut n = 1;
+    while target.exists() {
+        n += 1;
+        target = archive_dir.join(format!("{stem}-{n}{ext}"));
+    }
+    fs::rename(file, &target)
+        .with_context(|| format!("moving {} to {}", file.display(), target.display()))?;
+    let _ = fs::remove_file(digest_path(file));
+    write_digest(&target, &digest)
 }
 
 /// An archived file with the given digest, if any. Each file's digest comes from
@@ -176,6 +231,28 @@ mod tests {
         assert_eq!(civil_from_unix(1_793_617_200), (2026, 11, 2, 11, 0, 0));
         // 2000-02-29T23:59:59Z (leap day)
         assert_eq!(civil_from_unix(951_868_799), (2000, 2, 29, 23, 59, 59));
+    }
+
+    #[test]
+    fn recognizes_archived_names() {
+        for name in [
+            "folder-2026-01-31.jpg",
+            "folder-2026-01-31-2.jpg",
+            "folder-2026-01-31-12.png",
+        ] {
+            assert!(is_archived_name(Path::new(name), "folder"), "{name}");
+        }
+        for name in [
+            "folder.jpg",
+            "folder-2026-01-31.jpg.sha256",
+            "backdrop-2026-01-31.jpg",
+            "folder-26-01-31.jpg",
+            "folder-2026-01-31-.jpg",
+            "folder-2026-01-31-x.jpg",
+            "folder-cover.jpg",
+        ] {
+            assert!(!is_archived_name(Path::new(name), "folder"), "{name}");
+        }
     }
 
     #[test]
