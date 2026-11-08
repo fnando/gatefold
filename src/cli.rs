@@ -17,8 +17,8 @@ pub struct Cli {
     pub command: Option<Command>,
 
     /// Folder to scan recursively for music files.
-    #[arg(default_value = ".")]
-    pub path: PathBuf,
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: PathBuf,
 
     /// Base directory for cached API responses (`lrc/`, `artist/`, `release/`),
     /// downloaded images (`art/`), and metadata (`metadata/`).
@@ -148,20 +148,32 @@ pub enum Command {
     /// again. Delete the marker to undo.
     Skip {
         /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
-        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`).
-        #[arg(required = true, value_name = "IMAGE")]
+        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Takes several
+        /// (`--file a b`) and can be repeated.
+        #[arg(long = "file", value_name = "IMAGE", required = true, num_args = 1..)]
         images: Vec<PathBuf>,
     },
     /// Never replace an image, even with `--replace-cover` /
     /// `--replace-artist-images`: writes the keep marker for its kind
-    /// (`.gatefold-primary-keep`, `.gatefold-cover-keep`, …). A folder gets
-    /// `.gatefold-keep`, keeping everything it governs. A skip of the image is
-    /// taken back. Delete the marker to undo.
+    /// (`.gatefold-primary-keep`, `.gatefold-cover-keep`, …), or `.gatefold-keep`
+    /// in a folder, keeping everything it governs. A skip of the image is taken
+    /// back. Delete the marker to undo.
     Keep {
-        /// Album covers (`cover.jpg`), artist files (`folder.jpg`,
-        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`), or folders.
-        #[arg(required = true, value_name = "PATH")]
-        paths: Vec<PathBuf>,
+        /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
+        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Takes several
+        /// and can be repeated.
+        #[arg(
+            long = "file",
+            value_name = "IMAGE",
+            num_args = 1..,
+            required_unless_present = "dirs"
+        )]
+        files: Vec<PathBuf>,
+
+        /// Artist or album folders, to keep everything they govern. Takes
+        /// several and can be repeated.
+        #[arg(long = "dir", value_name = "DIR", num_args = 1..)]
+        dirs: Vec<PathBuf>,
     },
     /// Bring back an artist file from an artist folder's `.gatefold-archive/`.
     /// The file it replaces is skipped (see `skip`) and archived.
@@ -296,12 +308,14 @@ mod tests {
 
     #[test]
     fn state_dir_is_required_for_a_run() {
-        assert!(Cli::try_parse_from(["gatefold", "/music"]).is_err());
+        assert!(Cli::try_parse_from(["gatefold", "--dir", "/music"]).is_err());
     }
 
     #[test]
     fn skip_needs_no_state_dir() {
-        let cli = Cli::try_parse_from(["gatefold", "skip", "a/folder.jpg", "b/cover.jpg"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["gatefold", "skip", "--file", "a/folder.jpg", "b/cover.jpg"])
+                .unwrap();
         let Some(Command::Skip { images }) = cli.command else {
             panic!("expected the skip subcommand");
         };
@@ -310,6 +324,12 @@ mod tests {
             [PathBuf::from("a/folder.jpg"), PathBuf::from("b/cover.jpg")]
         );
         assert!(Cli::try_parse_from(["gatefold", "skip"]).is_err());
+        assert!(
+            Cli::try_parse_from(["gatefold", "skip", "a/folder.jpg"]).is_err(),
+            "no positional images"
+        );
+        let cli = Cli::try_parse_from(["gatefold", "skip", "--file", "a", "--file", "b"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Skip { images }) if images.len() == 2));
     }
 
     #[test]
@@ -343,19 +363,38 @@ mod tests {
     }
 
     #[test]
-    fn keep_takes_paths() {
-        let cli = Cli::try_parse_from(["gatefold", "keep", "Kemuri", "Kemuri/folder.jpg"]).unwrap();
-        let Some(Command::Keep { paths }) = cli.command else {
+    fn keep_takes_files_and_dirs() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["gatefold", "keep"].iter().chain(args));
+        let Some(Command::Keep { files, dirs }) = parse(&[
+            "--dir",
+            "Kemuri",
+            "--file",
+            "Kemuri/folder.jpg",
+            "Kemuri/logo.png",
+        ])
+        .unwrap()
+        .command
+        else {
             panic!("expected the keep subcommand");
         };
-        assert_eq!(paths.len(), 2);
-        assert!(Cli::try_parse_from(["gatefold", "keep"]).is_err());
+        assert_eq!(files.len(), 2);
+        assert_eq!(dirs, [PathBuf::from("Kemuri")]);
+        assert!(parse(&["--dir", "Kemuri"]).is_ok());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["Kemuri"]).is_err(), "no positional paths");
     }
 
     #[test]
-    fn a_path_is_still_a_run() {
-        let cli = Cli::try_parse_from(["gatefold", "/music", "--state-dir", "/tmp/s"]).unwrap();
+    fn a_run_scans_dir() {
+        let cli =
+            Cli::try_parse_from(["gatefold", "--dir", "/music", "--state-dir", "/tmp/s"]).unwrap();
         assert!(cli.command.is_none());
-        assert_eq!(cli.path, PathBuf::from("/music"));
+        assert_eq!(cli.dir, PathBuf::from("/music"));
+        let cli = Cli::try_parse_from(["gatefold", "--state-dir", "/tmp/s"]).unwrap();
+        assert_eq!(cli.dir, PathBuf::from("."));
+        assert!(
+            Cli::try_parse_from(["gatefold", "/music", "--state-dir", "/tmp/s"]).is_err(),
+            "no positional folder"
+        );
     }
 }

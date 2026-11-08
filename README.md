@@ -43,9 +43,9 @@ you already have.
   new ones.
 - **Keep your own images** with empty marker files: `.gatefold-keep` in an artist or album
   folder means its existing images are never replaced, even when replacing (missing ones are
-  still written), and granular markers keep one kind each; `gatefold keep <image|folder>`
+  still written), and granular markers keep one kind each; `gatefold keep --file <image>` / `--dir <folder>`
   writes them for you. See [Keeping your own images](#keeping-your-own-images).
-- **Skip an image you don't want** with `gatefold skip <image>`. A different one replaces it
+- **Skip an image you don't want** with `gatefold skip --file <image>`. A different one replaces it
   as soon as one is available, and those exact contents are never written again. See
   [Skipping an image](#skipping-an-image).
 - Optional `--verify`: each tag write is applied to a temp copy, validated with `ffprobe`,
@@ -70,13 +70,12 @@ cargo build --release
 ## Usage
 
 ```sh
-gatefold --state-dir <DIR> [OPTIONS] [PATH]
+gatefold --state-dir <DIR> [--dir <DIR>] [OPTIONS]
 ```
-
-`PATH` is the folder to scan recursively (defaults to the current directory).
 
 | Option | Description |
 | --- | --- |
+| `--dir <DIR>` | Folder to scan recursively (default: the current directory). |
 | `--state-dir <DIR>` | **Required.** Directory for the cached lyrics (`lrc/`), images (`art/`), artist lookups (`artist/`), and metadata (`metadata/`). |
 | `--api-key <KEY>` | Secret `Lrclib-Api-Key` header (server-side model). Pair with `--app-id`. Prefer `--env-file` on shared hosts — a flag value shows up in `ps`. (env: `GATEFOLD_LRCLIB_API_KEY`) |
 | `--app-id <ID>` | `Lrclib-App-Id` header. Required alongside `--api-key` to unlock the higher rate-limit tier. (env: `GATEFOLD_LRCLIB_APP_ID`) |
@@ -104,13 +103,13 @@ gatefold --state-dir <DIR> [OPTIONS] [PATH]
 Preview what would happen and warm the cache, without modifying any files:
 
 ```sh
-gatefold --state-dir /tmp/gatefold --cache-only ~/Music
+gatefold --state-dir /tmp/gatefold --cache-only --dir ~/Music
 ```
 
 Apply lyrics, reusing any cached responses from a previous `--cache-only` run:
 
 ```sh
-gatefold --state-dir /tmp/gatefold ~/Music
+gatefold --state-dir /tmp/gatefold --dir ~/Music
 ```
 
 With a registered server-side application for the higher rate-limit tier:
@@ -118,7 +117,7 @@ With a registered server-side application for the higher rate-limit tier:
 ```sh
 gatefold --state-dir /tmp/gatefold \
        --app-id my-app-id --api-key my-secret-key \
-       ~/Music
+       --dir ~/Music
 ```
 
 On a server, keep the secret out of `ps` by putting the credentials in an env file
@@ -132,7 +131,7 @@ GATEFOLD_LRCLIB_API_KEY=my-secret-key
 EOF
 chmod 600 ~/.local/config/gatefold/env
 
-gatefold --state-dir ~/.local/share/gatefold --env-file ~/.local/config/gatefold/env ~/Music
+gatefold --state-dir ~/.local/share/gatefold --env-file ~/.local/config/gatefold/env --dir ~/Music
 ```
 
 ## How it works
@@ -262,15 +261,15 @@ gatefold then never replaces (or archives) those images, even with `--replace-ar
 / `--replace-cover`. A kept image that's missing is still written, as on any run, so a marker
 only matters to replace runs. Lyrics are never affected.
 
-`gatefold keep` writes the markers for you: give it an image and it writes the marker for that
-kind of image, in the folder that governs it; give it a folder and it writes `.gatefold-keep`.
+`gatefold keep` writes the markers for you: `--file <image>` writes the marker for that kind of
+image, in the folder that governs it; `--dir <folder>` writes `.gatefold-keep`.
 Keeping an image you had [skipped](#skipping-an-image) takes the skip back. Like `skip`, it
 needs no `--state-dir`.
 
 ```sh
-gatefold keep "Music/Kemuri/folder.jpg"                        # .gatefold-primary-keep
-gatefold keep "Music/Kemuri/1997 - Little Playmate/cover.jpg"  # .gatefold-cover-keep in the album
-gatefold keep "Music/Bad Cop Bad Cop"                          # .gatefold-keep
+gatefold keep --file "Music/Kemuri/folder.jpg"                        # .gatefold-primary-keep
+gatefold keep --file "Music/Kemuri/1997 - Little Playmate/cover.jpg"  # .gatefold-cover-keep in the album
+gatefold keep --dir "Music/Bad Cop Bad Cop"                           # .gatefold-keep
 ```
 
 `.gatefold-keep` keeps everything its folder governs. Without it, the granular markers keep
@@ -313,7 +312,7 @@ image (a wrong photo, a bad crop, a low-res scan), but a better one would be wel
 Skip it:
 
 ```sh
-gatefold skip "Music/Kemuri/folder.jpg" "Music/Kemuri/1997 - Little Playmate/cover.jpg"
+gatefold skip --file "Music/Kemuri/folder.jpg" "Music/Kemuri/1997 - Little Playmate/cover.jpg"
 ```
 
 This needs no `--state-dir`. It writes an empty `.gatefold-<sha256>-skip` marker next to each
@@ -330,8 +329,7 @@ image, named after the image's contents, and leaves the image where it is. On la
   `--replace-artist-images` runs, as usual.
 
 You can skip `cover.jpg` / `cover.jpeg` / `cover.png` and the artist files (`folder.jpg`,
-`backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Delete the marker to undo. A folder
-named `skip` can still be scanned as `gatefold ./skip ...`.
+`backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Delete the marker to undo.
 
 ### Restoring an archived image
 

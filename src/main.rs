@@ -66,7 +66,7 @@ fn main() -> Result<()> {
 
     // Canonical so artist-folder matching can walk up to (and include) the root
     // even when it was given as `.`.
-    let root = std::fs::canonicalize(&cli.path).unwrap_or_else(|_| cli.path.clone());
+    let root = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
     let tracks = scanner::scan(&root);
     let progress = Progress::new(tracks.len(), seed_secs);
 
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
 fn run_command(command: &cli::Command) -> Result<()> {
     match command {
         cli::Command::Skip { images } => skip_images(images),
-        cli::Command::Keep { paths } => keep_paths(paths),
+        cli::Command::Keep { files, dirs } => keep_paths(files, dirs),
         cli::Command::Restore { dir, file, keep } => {
             let target = match (dir, file) {
                 (Some(dir), _) => restore::Target::Dir(dir),
@@ -190,12 +190,17 @@ fn skip_images(images: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// `gatefold keep`: write the keep marker for each image or folder. Every path is
-/// attempted; the command fails if any of them couldn't be kept.
-fn keep_paths(paths: &[PathBuf]) -> Result<()> {
+/// `gatefold keep`: write the keep marker for each image (`--file`) and folder
+/// (`--dir`). Every path is attempted; the command fails if any of them
+/// couldn't be kept.
+fn keep_paths(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
     let mut failed = 0;
-    for path in paths {
-        match keep::mark(path) {
+    let marks = files
+        .iter()
+        .map(|path| (path, keep::mark_file(path)))
+        .chain(dirs.iter().map(|path| (path, keep::mark_dir(path))));
+    for (path, result) in marks {
+        match result {
             Ok(kept) => {
                 let marker = kept.marker.path().display();
                 match kept.marker {
