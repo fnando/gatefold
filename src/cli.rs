@@ -1,20 +1,29 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Scan a folder of music files and backfill lyrics, cover art, and artist images.
 #[derive(Debug, Parser)]
-#[command(name = "gatefold", version, about)]
+#[command(
+    name = "gatefold",
+    version,
+    about,
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
 #[allow(clippy::struct_excessive_bools)] // CLI flags are naturally independent bools
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Folder to scan recursively for music files.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
     /// Base directory for cached API responses (`lrc/`, `artist/`, `release/`),
     /// downloaded images (`art/`), and metadata (`metadata/`).
-    #[arg(long, value_name = "DIR")]
-    pub state_dir: PathBuf,
+    #[arg(long, value_name = "DIR", required = true)]
+    pub state_dir: Option<PathBuf>,
 
     /// Secret `Lrclib-Api-Key` header (server-side model). Pair with --app-id.
     /// Prefer --env-file on shared hosts: a flag value is visible in `ps`.
@@ -130,6 +139,20 @@ pub struct Cli {
     pub skip_artist_videos: bool,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Reject an image you don't want, but stay open to a different one: writes a
+    /// `.gatefold-<sha256>-skip` marker next to it. Later runs replace the image as
+    /// soon as another one is available and never write these exact contents
+    /// again. Delete the marker to undo.
+    Skip {
+        /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
+        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`).
+        #[arg(required = true, value_name = "IMAGE")]
+        images: Vec<PathBuf>,
+    },
+}
+
 /// `30d`, `12h`, `90m`, `45s`, `2w`: a whole number plus a unit.
 fn parse_duration(text: &str) -> Result<Duration, String> {
     let text = text.trim();
@@ -234,5 +257,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cli.artist_refresh_after, Some(Duration::from_hours(720)));
+    }
+
+    #[test]
+    fn state_dir_is_required_for_a_run() {
+        assert!(Cli::try_parse_from(["gatefold", "/music"]).is_err());
+    }
+
+    #[test]
+    fn skip_needs_no_state_dir() {
+        let cli = Cli::try_parse_from(["gatefold", "skip", "a/folder.jpg", "b/cover.jpg"]).unwrap();
+        let Some(Command::Skip { images }) = cli.command else {
+            panic!("expected the skip subcommand");
+        };
+        assert_eq!(
+            images,
+            [PathBuf::from("a/folder.jpg"), PathBuf::from("b/cover.jpg")]
+        );
+        assert!(Cli::try_parse_from(["gatefold", "skip"]).is_err());
+    }
+
+    #[test]
+    fn a_path_is_still_a_run() {
+        let cli = Cli::try_parse_from(["gatefold", "/music", "--state-dir", "/tmp/s"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.path, PathBuf::from("/music"));
     }
 }

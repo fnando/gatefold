@@ -11,6 +11,7 @@ mod net;
 mod progress;
 mod revision;
 mod scanner;
+mod skip;
 mod state;
 mod verify;
 mod video;
@@ -37,12 +38,20 @@ fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
 
+    if let Some(cli::Command::Skip { images }) = &cli.command {
+        return skip_images(images);
+    }
+    let state_dir = cli
+        .state_dir
+        .as_deref()
+        .context("--state-dir is required")?;
+
     if cli.verify {
         verify::ensure_available()?;
     }
 
-    let state = State::new(&cli.state_dir)
-        .with_context(|| format!("preparing state dir {}", cli.state_dir.display()))?;
+    let state = State::new(state_dir)
+        .with_context(|| format!("preparing state dir {}", state_dir.display()))?;
 
     let delay = Duration::from_millis(cli.delay_ms);
     // Seed per-track estimate: one request per enabled step plus rough RTT. With
@@ -138,6 +147,32 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `gatefold skip`: mark each image as unwanted. Every image is attempted; the
+/// command fails if any of them couldn't be marked.
+fn skip_images(images: &[PathBuf]) -> Result<()> {
+    let mut failed = 0;
+    for image in images {
+        match skip::mark(image) {
+            Ok(skip::Marked::Created(marker)) => println!(
+                "✓ {}: skipped ({}); replaced once a different image is available",
+                image.display(),
+                marker.display()
+            ),
+            Ok(skip::Marked::AlreadySkipped(_)) => {
+                println!("· {}: already skipped", image.display());
+            }
+            Err(err) => {
+                failed += 1;
+                eprintln!("✗ {err:#}");
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} image(s) could not be skipped");
+    }
+    Ok(())
+}
+
 /// Every remote service a run talks to, built once.
 struct Services {
     lyrics: Client,
@@ -165,7 +200,7 @@ fn run_track_pass(
     tracks: &[Track],
     summary: &mut Summary,
 ) -> Result<BTreeMap<String, ArtistJob>> {
-    let mut cover_misses: HashSet<String> = HashSet::new();
+    let mut cover_misses = CoverMemo::default();
     let mut artist_jobs: BTreeMap<String, ArtistJob> = BTreeMap::new();
     for (i, track) in tracks.iter().enumerate() {
         let name = track.path.file_name().map_or_else(
@@ -362,7 +397,7 @@ fn process_track(
     track: &Track,
     name: &str,
     summary: &mut Summary,
-    cover_misses: &mut HashSet<String>,
+    cover_misses: &mut CoverMemo,
     artist_jobs: &mut BTreeMap<String, ArtistJob>,
 ) -> Result<()> {
     let abs = std::fs::canonicalize(&track.path).unwrap_or_else(|_| track.path.clone());
@@ -580,12 +615,25 @@ fn fetch_lyrics(
 
 // ---- Cover art --------------------------------------------------------------
 
+/// Per-run cover lookups, shared across an album's tracks.
+#[derive(Default)]
+struct CoverMemo {
+    /// Releases found to have no art this run, so they aren't re-queried per track.
+    misses: HashSet<String>,
+    /// Releases whose cached art was skipped and has been looked up again this
+    /// run, for a different image.
+    rechecked: HashSet<String>,
+}
+
 /// What happened to a track's cover art.
 enum CoverOutcome {
     SkippedNoMbid,
     /// `--replace-cover`, but a `.gatefold-keep` / `.gatefold-cover-keep` marker
     /// covers the album and its cover is already there.
     Kept,
+    /// The only cover available is one skipped in the album folder
+    /// (`gatefold skip`).
+    Rejected,
     SkippedNothingToDo,
     SkippedByFilter,
     NotFound,
@@ -610,7 +658,7 @@ fn process_cover(
     progress: &Progress,
     track: &Track,
     meta: &TrackMetadata,
-    cover_misses: &mut HashSet<String>,
+    cover_misses: &mut CoverMemo,
     backup: &Backup,
 ) -> Result<CoverOutcome> {
     let path = &track.path;
@@ -629,9 +677,11 @@ fn process_cover(
     let folder = path.parent();
     // With --replace-cover we (re)write even when a cover is already present —
     // unless a keep marker covers the album: then a missing cover is still
-    // written, but an existing one is never replaced.
+    // written, but an existing one is never replaced. A skipped `cover.*` is up
+    // for replacement on any run, keep marker or not.
     let kept = folder.is_some_and(|dir| keep::cover(dir, root));
-    let replace = cli.replace_cover && !kept;
+    let skipped = folder.is_some_and(skip::cover);
+    let replace = (cli.replace_cover && !kept) || skipped;
     let need_embed = !meta.has_cover_art || replace;
     let need_sidecar = folder.is_some_and(|dir| !writer::folder_has_cover(dir) || replace);
     if !need_embed && !need_sidecar {
@@ -662,17 +712,33 @@ fn process_cover(
     // re-queried for every track); else look it up. The persisted `.miss` marker is
     // deliberately ignored here (--new-only and --retry-missed-after consult it
     // above), so a normal run rechecks it.
-    let (art, reused) = if state.has_art(&key) {
+    let (mut art, mut reused) = if state.has_art(&key) {
         (state.load_art(&key)?, true)
-    } else if cover_misses.contains(&key) {
+    } else if cover_misses.misses.contains(&key) {
         (None, true)
     } else {
-        let fetched = fetch_cover(services, state, progress, &key, meta, release, group)?;
+        let fetched = fetch_cover(services, state, progress, &key, meta, release, group, false)?;
         if fetched.is_none() {
-            cover_misses.insert(key.clone());
+            cover_misses.misses.insert(key.clone());
         }
         (fetched, false)
     };
+
+    // The cached cover was skipped here: look it up again (once per run), in case
+    // a different one is available now. A miss keeps the cached image.
+    let rejected = |art: &Option<state::CachedArt>| matches!((folder, art), (Some(dir), Some(art)) if skip::rejects(dir, &art.data));
+    if reused
+        && rejected(&art)
+        && cover_misses.rechecked.insert(key.clone())
+        && let Some(fresh) =
+            fetch_cover(services, state, progress, &key, meta, release, group, true)?
+    {
+        art = Some(fresh);
+        reused = false;
+    }
+    if rejected(&art) {
+        return Ok(CoverOutcome::Rejected);
+    }
 
     let Some(art) = art else {
         return Ok(CoverOutcome::NotFound);
@@ -721,7 +787,9 @@ fn process_cover(
 /// Download the front cover for a release: Apple Music's artwork when the album
 /// can be found there (larger than anything the archive has), else the Cover Art
 /// Archive's front image for the release, falling back to its release group.
-/// Caches and returns a success, `None` when nothing was found.
+/// Caches and returns a success, `None` when nothing was found. `recheck`
+/// bypasses the cached Apple Music lookups (a recorded miss always does).
+/// A recheck that finds nothing records no miss: the cached art stays.
 #[allow(clippy::too_many_arguments)]
 fn fetch_cover(
     services: &Services,
@@ -731,8 +799,10 @@ fn fetch_cover(
     meta: &TrackMetadata,
     release: &str,
     group: Option<&str>,
+    recheck: bool,
 ) -> Result<Option<state::CachedArt>> {
-    let recheck = state.has_cover_miss(key);
+    let forced = recheck;
+    let recheck = recheck || state.has_cover_miss(key);
     let apple = apple::resolve_release_art(
         state,
         &services.musicbrainz,
@@ -774,7 +844,9 @@ fn fetch_cover(
             source: Some(source.to_string()),
         }))
     } else {
-        state.save_cover_miss(key)?;
+        if !forced {
+            state.save_cover_miss(key)?;
+        }
         Ok(None)
     }
 }
@@ -1041,12 +1113,15 @@ fn fully_kept(job: &ArtistJob) -> bool {
     !job.folders.is_empty() && job.folders.iter().all(|dir| keep::all_artist_images(dir))
 }
 
-/// True when some artist folder lacks a file the resolution can provide (or a
-/// replace is due for a file no keep marker protects).
+/// True when some artist folder lacks a file the resolution can provide (a
+/// skipped file counts as lacking), or a replace is due for a file no keep
+/// marker protects.
 fn missing_files(job: &ArtistJob, resolved: &Resolved, replace: bool, want_video: bool) -> bool {
     job.folders.iter().any(|dir| {
         let needs = |kind: ArtistImage, wanted: bool| {
-            wanted && (kind.existing(dir).is_none() || (replace && !keep::artist_image(dir, kind)))
+            wanted
+                && (skip::present(dir, kind).is_none()
+                    || (replace && !keep::artist_image(dir, kind)))
         };
         needs(ArtistImage::Avatar, true)
             || needs(ArtistImage::Backdrop, resolved.backdrop_url.is_some())
@@ -1058,16 +1133,17 @@ fn missing_files(job: &ArtistJob, resolved: &Resolved, replace: bool, want_video
 /// True when every artist folder already has the files the source can provide
 /// (a Spotify-sourced artist has no backdrop to wait for; a video only counts
 /// when the artist is known to have one and ffmpeg is available; a logo only
-/// when the artist is known to have one).
+/// when the artist is known to have one). A skipped file doesn't count.
 fn folders_complete(job: &ArtistJob, record: Option<&ArtistRecord>, videos: bool) -> bool {
     let has_backdrop_source = record.is_none_or(|r| r.backdrop_url.is_some());
     let has_video_source = videos && record.is_none_or(|r| r.video_url.is_some());
     let has_logo_source = record.is_none_or(|r| r.logo_url.is_some());
     job.folders.iter().all(|dir| {
-        ArtistImage::Avatar.existing(dir).is_some()
-            && (!has_backdrop_source || ArtistImage::Backdrop.existing(dir).is_some())
-            && (!has_video_source || ArtistImage::Video.existing(dir).is_some())
-            && (!has_logo_source || ArtistImage::Logo.existing(dir).is_some())
+        let has = |kind| skip::present(dir, kind).is_some();
+        has(ArtistImage::Avatar)
+            && (!has_backdrop_source || has(ArtistImage::Backdrop))
+            && (!has_video_source || has(ArtistImage::Video))
+            && (!has_logo_source || has(ArtistImage::Logo))
     })
 }
 
@@ -1137,7 +1213,8 @@ struct Written {
 
 /// Write the avatar (and backdrop, video and logo, when there are any) into
 /// every folder of the job. A replace moves the previous file into its archive
-/// folder (`primary/`, `backdrops/`, `logos/`) first.
+/// folder (`primary/`, `backdrops/`, `logos/`) first. A skipped file is replaced
+/// whatever the mode; an image skipped in a folder is never written there.
 fn write_artist_images(
     job: &ArtistJob,
     images: &ArtistImages,
@@ -1161,8 +1238,12 @@ fn write_artist_images(
     for dir in &job.folders {
         for (kind, art) in &files {
             let Some(art) = art else { continue };
+            if skip::rejects(&kind.target_dir(dir), &art.data) {
+                continue;
+            }
             // Hand-curated in this folder: written if missing, never replaced.
-            let replace = replace && !keep::artist_image(dir, *kind);
+            let replace =
+                (replace && !keep::artist_image(dir, *kind)) || skip::artist_image(dir, *kind);
             let (wrote, kept) =
                 writer::write_artist_image(dir, *kind, &art.ext, &art.data, replace, revisions)?;
             let slot = match kind {
@@ -1364,7 +1445,8 @@ fn log_cover(progress: &Progress, name: &str, outcome: &CoverOutcome) {
         CoverOutcome::SkippedNoMbid
         | CoverOutcome::SkippedNothingToDo
         | CoverOutcome::SkippedByFilter
-        | CoverOutcome::Kept => {}
+        | CoverOutcome::Kept
+        | CoverOutcome::Rejected => {}
         CoverOutcome::NotFound => {
             progress.info(format!("· {name}: cover art not found"));
         }
@@ -1480,6 +1562,7 @@ struct Summary {
     replaced_cover_sidecar: u64,
     cover_skipped: u64,
     cover_kept: u64,
+    cover_rejected: u64,
     cover_not_found: u64,
     cover_cache_only: u64,
     cover_errors: u64,
@@ -1530,6 +1613,7 @@ impl Summary {
             }
             CoverOutcome::NotFound => self.cover_not_found += 1,
             CoverOutcome::Kept => self.cover_kept += 1,
+            CoverOutcome::Rejected => self.cover_rejected += 1,
             CoverOutcome::CacheOnly { .. } => self.cover_cache_only += 1,
             CoverOutcome::Applied {
                 embedded, sidecar, ..
@@ -1650,8 +1734,12 @@ impl Summary {
             ));
         }
         progress.info(format!(
-            "  skipped {}, kept {}, not found {}, errors {}",
-            self.cover_skipped, self.cover_kept, self.cover_not_found, self.cover_errors
+            "  skipped {}, kept {}, rejected {}, not found {}, errors {}",
+            self.cover_skipped,
+            self.cover_kept,
+            self.cover_rejected,
+            self.cover_not_found,
+            self.cover_errors
         ));
     }
 }

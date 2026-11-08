@@ -86,7 +86,7 @@ impl ArtistImage {
     }
 
     /// The folder this file is written into, under the artist folder `dir`.
-    fn target_dir(self, dir: &Path) -> PathBuf {
+    pub fn target_dir(self, dir: &Path) -> PathBuf {
         self.subdir()
             .map_or_else(|| dir.to_path_buf(), |sub| dir.join(sub))
     }

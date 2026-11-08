@@ -45,6 +45,9 @@ you already have.
   folder means its existing images are never replaced, even when replacing (missing ones are
   still written), and granular markers keep one kind each. See
   [Keeping your own images](#keeping-your-own-images).
+- **Skip an image you don't want** with `gatefold skip <image>`. A different one replaces it
+  as soon as one is available, and those exact contents are never written again. See
+  [Skipping an image](#skipping-an-image).
 - Optional `--verify`: each tag write is applied to a temp copy, validated with `ffprobe`,
   and only then atomically swapped over the original — a failed check never leaves a
   corrupted file.
@@ -285,6 +288,33 @@ For covers, gatefold checks the album folder and every folder above it up to the
 root, so markers above the root don't count. An artist split across two roots follows each
 folder's own markers. On a replace run where every image an artist or album has is kept,
 gatefold skips the lookups and the summary counts it as `kept`.
+
+### Skipping an image
+
+A keep marker freezes a folder. Sometimes you want the opposite: you don't want the current
+image (a wrong photo, a bad crop, a low-res scan), but a better one would be welcome later.
+Skip it:
+
+```sh
+gatefold skip "Music/Kemuri/folder.jpg" "Music/Kemuri/1997 - Little Playmate/cover.jpg"
+```
+
+This needs no `--state-dir`. It writes an empty `.gatefold-<sha256>-skip` marker next to each
+image, named after the image's contents, and leaves the image where it is. On later runs:
+
+- An existing file with skipped contents counts as missing. The next run replaces it with a
+  different image as soon as one is available, without `--replace-*` and even under a keep
+  marker. The old file is archived (`primary/`, `backdrops/`, `logos/`) or, for covers, backed
+  up and swapped in each track as well as in `cover.jpg`.
+- A downloaded image with skipped contents is never written into that folder. Album covers
+  count these as `rejected` in the summary.
+- When the cached cover is the skipped one, it's looked up again once per run, so a new Apple
+  Music or Cover Art Archive image is picked up. Artist photos are re-checked on
+  `--replace-artist-images` runs, as usual.
+
+You can skip `cover.jpg` / `cover.jpeg` / `cover.png` and the artist files (`folder.jpg`,
+`backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Delete the marker to undo. A folder
+named `skip` can still be scanned as `gatefold ./skip ...`.
 
 ### Incremental runs (`--new-only`)
 
