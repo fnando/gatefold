@@ -4,7 +4,8 @@
 //! image loses any skip marker of its own. `--keep` also writes its keep
 //! marker, so replace runs leave it alone.
 
-use crate::revision::{self, Archived, Revisions};
+use crate::archive;
+use crate::revision::{self, Revisions};
 use crate::writer::{ARCHIVE_DIR, ArtistImage};
 use crate::{keep, skip};
 use anyhow::{Context, Result, bail};
@@ -105,18 +106,7 @@ pub fn restore(dir: &Path, entry: &Entry, revisions: &Revisions) -> Result<Resto
                 current.display()
             );
         }
-        skip::mark(&current)?;
-        let archived = revisions.archive(&kind.archive_dir(dir), &current, &current_digest)?;
-        let relative = archived
-            .path()
-            .strip_prefix(dir)
-            .unwrap_or(archived.path())
-            .to_string_lossy()
-            .into_owned();
-        let relative = match archived {
-            Archived::Moved(_) => relative,
-            Archived::Duplicate(_) => format!("{relative} (already kept)"),
-        };
+        let relative = archive::skip_and_archive(dir, kind, &current, revisions)?;
         replaced = Some((current, relative));
     }
 

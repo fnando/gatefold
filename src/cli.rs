@@ -148,9 +148,9 @@ pub enum Command {
     /// again. Delete the marker to undo.
     Skip {
         /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
-        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Takes several
-        /// (`--file a b`) and can be repeated.
-        #[arg(long = "file", value_name = "IMAGE", required = true, num_args = 1..)]
+        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Repeat for
+        /// several (`--file a --file b`).
+        #[arg(long = "file", value_name = "IMAGE", required = true)]
         images: Vec<PathBuf>,
     },
     /// Never replace an image, even with `--replace-cover` /
@@ -160,20 +160,25 @@ pub enum Command {
     /// back. Delete the marker to undo.
     Keep {
         /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
-        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Takes several
-        /// and can be repeated.
-        #[arg(
-            long = "file",
-            value_name = "IMAGE",
-            num_args = 1..,
-            required_unless_present = "dirs"
-        )]
+        /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Repeat for
+        /// several.
+        #[arg(long = "file", value_name = "IMAGE", required_unless_present = "dirs")]
         files: Vec<PathBuf>,
 
-        /// Artist or album folders, to keep everything they govern. Takes
-        /// several and can be repeated.
-        #[arg(long = "dir", value_name = "DIR", num_args = 1..)]
+        /// Artist or album folders, to keep everything they govern. Repeat
+        /// for several.
+        #[arg(long = "dir", value_name = "DIR")]
         dirs: Vec<PathBuf>,
+    },
+    /// Move an artist file into its artist folder's `.gatefold-archive/`,
+    /// dated, as `--replace-artist-images` would. The file is skipped first
+    /// (see `skip`), so later runs write a different image once one is
+    /// available, never this one. `restore` brings it back.
+    Archive {
+        /// Artist files (`folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4`,
+        /// `logo.png`). Repeat for several.
+        #[arg(long = "file", value_name = "FILE", required = true)]
+        files: Vec<PathBuf>,
     },
     /// Bring back an artist file from an artist folder's `.gatefold-archive/`.
     /// The file it replaces is skipped (see `skip`) and archived.
@@ -313,9 +318,15 @@ mod tests {
 
     #[test]
     fn skip_needs_no_state_dir() {
-        let cli =
-            Cli::try_parse_from(["gatefold", "skip", "--file", "a/folder.jpg", "b/cover.jpg"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "gatefold",
+            "skip",
+            "--file",
+            "a/folder.jpg",
+            "--file",
+            "b/cover.jpg",
+        ])
+        .unwrap();
         let Some(Command::Skip { images }) = cli.command else {
             panic!("expected the skip subcommand");
         };
@@ -328,8 +339,10 @@ mod tests {
             Cli::try_parse_from(["gatefold", "skip", "a/folder.jpg"]).is_err(),
             "no positional images"
         );
-        let cli = Cli::try_parse_from(["gatefold", "skip", "--file", "a", "--file", "b"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Skip { images }) if images.len() == 2));
+        assert!(
+            Cli::try_parse_from(["gatefold", "skip", "--file", "a", "b"]).is_err(),
+            "one image per --file"
+        );
     }
 
     #[test]
@@ -370,6 +383,7 @@ mod tests {
             "Kemuri",
             "--file",
             "Kemuri/folder.jpg",
+            "--file",
             "Kemuri/logo.png",
         ])
         .unwrap()
@@ -382,6 +396,22 @@ mod tests {
         assert!(parse(&["--dir", "Kemuri"]).is_ok());
         assert!(parse(&[]).is_err());
         assert!(parse(&["Kemuri"]).is_err(), "no positional paths");
+        assert!(parse(&["--dir", "a", "b"]).is_err(), "one folder per --dir");
+    }
+
+    #[test]
+    fn archive_takes_one_file_per_flag() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["gatefold", "archive"].iter().chain(args));
+        let Some(Command::Archive { files }) =
+            parse(&["--file", "Kemuri/backdrop.jpg", "--file", "Kemuri/logo.png"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected the archive subcommand");
+        };
+        assert_eq!(files.len(), 2);
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--file", "a", "b"]).is_err(), "one file per --file");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod apple;
+mod archive;
 mod artist;
 mod backup;
 mod cli;
@@ -153,6 +154,7 @@ fn run_command(command: &cli::Command) -> Result<()> {
     match command {
         cli::Command::Skip { images } => skip_images(images),
         cli::Command::Keep { files, dirs } => keep_paths(files, dirs),
+        cli::Command::Archive { files } => archive::run(files),
         cli::Command::Restore { dir, file, keep } => {
             let target = match (dir, file) {
                 (Some(dir), _) => restore::Target::Dir(dir),

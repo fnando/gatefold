@@ -312,7 +312,7 @@ image (a wrong photo, a bad crop, a low-res scan), but a better one would be wel
 Skip it:
 
 ```sh
-gatefold skip --file "Music/Kemuri/folder.jpg" "Music/Kemuri/1997 - Little Playmate/cover.jpg"
+gatefold skip --file "Music/Kemuri/folder.jpg" --file "Music/Kemuri/1997 - Little Playmate/cover.jpg"
 ```
 
 This needs no `--state-dir`. It writes an empty `.gatefold-<sha256>-skip` marker next to each
@@ -330,6 +330,21 @@ image, named after the image's contents, and leaves the image where it is. On la
 
 You can skip `cover.jpg` / `cover.jpeg` / `cover.png` and the artist files (`folder.jpg`,
 `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Delete the marker to undo.
+
+### Archiving an image
+
+To move an artist file out of Jellyfin's sight right away, rather than waiting for a run to
+replace it, archive it:
+
+```sh
+gatefold archive --file "Music/Kemuri/backdrop.jpg" --file "Music/Kemuri/backdrops/backdrop.mp4"
+```
+
+This takes `folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4` and `logo.png`, and needs no
+`--state-dir`. Each file is [skipped](#skipping-an-image), then moved, dated, into the artist
+folder's `.gatefold-archive/`, as `--replace-artist-images` would. The next run writes a
+different image as soon as one is available, but never these contents again. To bring the
+file back, use [`gatefold restore`](#restoring-an-archived-image).
 
 ### Restoring an archived image
 
