@@ -70,13 +70,13 @@ cargo build --release
 ## Usage
 
 ```sh
-gatefold --state-dir <DIR> [--dir <DIR>] [OPTIONS]
+gatefold [--dir <DIR>] [OPTIONS]
 ```
 
 | Option | Description |
 | --- | --- |
 | `--dir <DIR>` | Folder to scan recursively (default: the current directory). |
-| `--state-dir <DIR>` | **Required.** Directory for the cached lyrics (`lrc/`), images (`art/`), artist lookups (`artist/`), and metadata (`metadata/`). |
+| `--state-dir <DIR>` | Use a different directory for the cached lyrics (`lrc/`), images (`art/`), artist lookups (`artist/`), metadata (`metadata/`), and tag backups (`backup/`). Defaults to `$XDG_DATA_HOME/gatefold`, or `~/.local/share/gatefold` when `$XDG_DATA_HOME` is unset. |
 | `--api-key <KEY>` | Secret `Lrclib-Api-Key` header (server-side model). Pair with `--app-id`. Prefer `--env-file` on shared hosts — a flag value shows up in `ps`. (env: `GATEFOLD_LRCLIB_API_KEY`) |
 | `--app-id <ID>` | `Lrclib-App-Id` header. Required alongside `--api-key` to unlock the higher rate-limit tier. (env: `GATEFOLD_LRCLIB_APP_ID`) |
 | `--env-file <FILE>` | Load `GATEFOLD_LRCLIB_API_KEY` / `GATEFOLD_LRCLIB_APP_ID` / `GATEFOLD_USER_AGENT` / `GATEFOLD_MUSICBRAINZ_URL` from a `KEY=VALUE` env file instead of passing them as flags. Flags and real environment variables override the file; a read failure exits with an error. |
@@ -88,13 +88,14 @@ gatefold --state-dir <DIR> [--dir <DIR>] [OPTIONS]
 | `--replace-cover` | Overwrite an existing embedded cover and `cover.jpg` sidecar (backing up the previous values), e.g. to upgrade to Apple Music's larger artwork. |
 | `--replace-artist-images` | Overwrite an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop / `logo.png` when the artist's image has changed; the previous files are kept, dated, in `.gatefold-archive/` (`primary/`, `backdrops/` and `logos/`). |
 | `--artist-refresh-after <DURATION>` | With `--replace-artist-images`, don't re-check an artist's page if it was last checked within this long ago (`30d`, `12h`, `90m`, `45s`, `2w`). Missing images are still written. |
+| `--apple-url <URL>` | Use this Apple Music artist page (e.g. `https://music.apple.com/ca/artist/dead-fish/95758598`) for the one album artist under `--dir`, when `MusicBrainz` and Wikidata have no Apple Music link (or the wrong one). It's remembered in the state directory, so later runs keep using it, and this run replaces the artist's images as `--replace-artist-images` would. |
 | `--verify` | Validate each tag write with `ffprobe` on a temp copy before atomically swapping it in. |
 | `--new-only` | Only look up items with no result on record yet — fast incremental re-runs. |
 | `--miss-only` | Only re-check items previously recorded as "not found" (conflicts with `--new-only`). |
 | `--retry-missed-after <DURATION>` | Don't retry an item recorded as "not found" within this long ago (`7d`, `12h`, …). Applies to normal runs, `--miss-only`, and artist replace runs. |
 | `--lyrics-only` | Process lyrics only; skip cover art (conflicts with `--cover-only`). |
 | `--cover-only` | Process cover art only; skip lyrics (conflicts with `--lyrics-only`). |
-| `--artist-images-only` | Process artist images only; skip lyrics and cover art. |
+| `--artist-images-only` | Process artist images only; skip lyrics and cover art. Only needs each album folder's album artist, so it reads the tags of up to 3 tracks per folder (first, middle, last) and goes with the `MusicBrainz` album artist most of them carry. |
 | `--skip-artist-images` | Skip the artist-images pass. `--lyrics-only` / `--cover-only` imply it. |
 | `--skip-artist-videos` | Don't download motion backdrops (`backdrops/backdrop.mp4`); still images only. |
 
@@ -103,21 +104,19 @@ gatefold --state-dir <DIR> [--dir <DIR>] [OPTIONS]
 Preview what would happen and warm the cache, without modifying any files:
 
 ```sh
-gatefold --state-dir /tmp/gatefold --cache-only --dir ~/Music
+gatefold --cache-only --dir ~/Music
 ```
 
 Apply lyrics, reusing any cached responses from a previous `--cache-only` run:
 
 ```sh
-gatefold --state-dir /tmp/gatefold --dir ~/Music
+gatefold --dir ~/Music
 ```
 
 With a registered server-side application for the higher rate-limit tier:
 
 ```sh
-gatefold --state-dir /tmp/gatefold \
-       --app-id my-app-id --api-key my-secret-key \
-       --dir ~/Music
+gatefold --app-id my-app-id --api-key my-secret-key --dir ~/Music
 ```
 
 On a server, keep the secret out of `ps` by putting the credentials in an env file
@@ -131,7 +130,7 @@ GATEFOLD_LRCLIB_API_KEY=my-secret-key
 EOF
 chmod 600 ~/.local/config/gatefold/env
 
-gatefold --state-dir ~/.local/share/gatefold --env-file ~/.local/config/gatefold/env --dir ~/Music
+gatefold --env-file ~/.local/config/gatefold/env --dir ~/Music
 ```
 
 ## How it works
@@ -263,8 +262,7 @@ only matters to replace runs. Lyrics are never affected.
 
 `gatefold keep` writes the markers for you: `--file <image>` writes the marker for that kind of
 image, in the folder that governs it; `--dir <folder>` writes `.gatefold-keep`.
-Keeping an image you had [skipped](#skipping-an-image) takes the skip back. Like `skip`, it
-needs no `--state-dir`.
+Keeping an image you had [skipped](#skipping-an-image) takes the skip back.
 
 ```sh
 gatefold keep --file "Music/Kemuri/folder.jpg"                        # .gatefold-primary-keep
@@ -315,8 +313,8 @@ Skip it:
 gatefold skip --file "Music/Kemuri/folder.jpg" --file "Music/Kemuri/1997 - Little Playmate/cover.jpg"
 ```
 
-This needs no `--state-dir`. It writes an empty `.gatefold-<sha256>-skip` marker next to each
-image, named after the image's contents, and leaves the image where it is. On later runs:
+It writes an empty `.gatefold-<sha256>-skip` marker next to each image, named after the
+image's contents, and leaves the image where it is. On later runs:
 
 - An existing file with skipped contents counts as missing. The next run replaces it with a
   different image as soon as one is available, without `--replace-*` and even under a keep
@@ -340,11 +338,10 @@ replace it, archive it:
 gatefold archive --file "Music/Kemuri/backdrop.jpg" --file "Music/Kemuri/backdrops/backdrop.mp4"
 ```
 
-This takes `folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4` and `logo.png`, and needs no
-`--state-dir`. Each file is [skipped](#skipping-an-image), then moved, dated, into the artist
-folder's `.gatefold-archive/`, as `--replace-artist-images` would. The next run writes a
-different image as soon as one is available, but never these contents again. To bring the
-file back, use [`gatefold restore`](#restoring-an-archived-image).
+This takes `folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4` and `logo.png`. Each file
+is [skipped](#skipping-an-image), then moved, dated, into the artist folder's
+`.gatefold-archive/`, as `--replace-artist-images` would. The next run writes a different
+image as soon as one is available, but never these contents again. To bring the file back, use [`gatefold restore`](#restoring-an-archived-image).
 
 ### Restoring an archived image
 
@@ -369,7 +366,7 @@ Restore which? [1-3, empty to cancel]: 2
 ```
 
 Use `--file` with an archived file to restore it without the menu:
-`gatefold restore --file "Music/Kemuri/.gatefold-archive/primary/folder-2026-01-31.jpg"`. Like `skip`, this needs no `--state-dir`.
+`gatefold restore --file "Music/Kemuri/.gatefold-archive/primary/folder-2026-01-31.jpg"`.
 
 The file being replaced is [skipped](#skipping-an-image) and then archived, so later runs don't
 write it back. If the restored image had been skipped, its marker is removed. A

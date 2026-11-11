@@ -2,9 +2,22 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// The default state directory: `$XDG_DATA_HOME/gatefold`, falling back to
+/// `$HOME/.local/share/gatefold` per the XDG Base Directory spec (which also
+/// says to ignore a relative `$XDG_DATA_HOME`). Data rather than state home,
+/// because `backup/` holds the only copy of overwritten tags.
+pub fn default_dir(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let absolute =
+        |value: Option<OsString>| value.map(PathBuf::from).filter(|path| path.is_absolute());
+    absolute(xdg_data_home)
+        .or_else(|| absolute(home).map(|home| home.join(".local/share")))
+        .map(|base| base.join("gatefold"))
+}
 
 /// An image restored from the cache.
 pub struct CachedArt {
@@ -24,11 +37,17 @@ struct ArtMeta {
     source: Option<String>,
 }
 
-/// On-disk cache rooted at `--state-dir`, holding parallel trees:
+/// `artist/<mbid>.apple.json`: an Apple Music artist id set by hand.
+#[derive(Serialize, Deserialize)]
+struct ApplePin {
+    apple_id: String,
+}
+
+/// On-disk cache rooted at `--state-dir` (see [`default_dir`]), holding parallel trees:
 /// `metadata/<digest>.json` (extracted tags), `lrc/<digest>.json` (lyrics
 /// responses), `art/<digest>.{json,<ext>}` (downloaded images, cover and artist
-/// alike), `artist/<mbid>.{mb.json,wikidata.json,json,miss}` (per-artist link
-/// lookups, resolved image URLs, and misses), and `release/<mbid>.{mb.json,json,miss}` (the same for
+/// alike), `artist/<mbid>.{mb.json,wikidata.json,apple.json,json,miss}` (per-artist
+/// link lookups, a hand-set Apple Music id, resolved image URLs, and misses), and `release/<mbid>.{mb.json,json,miss}` (the same for
 /// a release's Apple Music artwork, plus `release/group-<mbid>.mb.json` browses).
 #[allow(clippy::struct_field_names)] // the `_dir` suffix is meaningful here
 pub struct State {
@@ -104,6 +123,10 @@ impl State {
 
     fn artist_record_path(&self, mbid: &str) -> PathBuf {
         self.artist_dir.join(format!("{mbid}.json"))
+    }
+
+    fn apple_pin_path(&self, mbid: &str) -> PathBuf {
+        self.artist_dir.join(format!("{mbid}.apple.json"))
     }
 
     fn artist_miss_path(&self, mbid: &str) -> PathBuf {
@@ -213,6 +236,20 @@ impl State {
 
     pub fn save_wikidata_artist(&self, mbid: &str, value: &serde_json::Value) -> Result<()> {
         write_json(&self.wikidata_artist_path(mbid), value)
+    }
+
+    /// The Apple Music artist id set with `--apple-url`, which wins over any
+    /// link on `MusicBrainz` or Wikidata.
+    pub fn load_apple_pin(&self, mbid: &str) -> Result<Option<String>> {
+        let pin: Option<ApplePin> = read_json(&self.apple_pin_path(mbid))?;
+        Ok(pin.map(|pin| pin.apple_id))
+    }
+
+    pub fn save_apple_pin(&self, mbid: &str, apple_id: &str) -> Result<()> {
+        let pin = ApplePin {
+            apple_id: apple_id.to_string(),
+        };
+        write_json(&self.apple_pin_path(mbid), &pin)
     }
 
     /// The resolved image URLs (and what was last written) for an artist.
@@ -381,6 +418,34 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_dir_prefers_xdg_data_home() {
+        assert_eq!(
+            default_dir(Some("/xdg/data".into()), Some("/home/me".into())),
+            Some(PathBuf::from("/xdg/data/gatefold"))
+        );
+    }
+
+    #[test]
+    fn default_dir_falls_back_to_home() {
+        let expected = Some(PathBuf::from("/home/me/.local/share/gatefold"));
+        assert_eq!(default_dir(None, Some("/home/me".into())), expected);
+        // A relative (or empty) $XDG_DATA_HOME is ignored, per the spec.
+        assert_eq!(
+            default_dir(Some("rel".into()), Some("/home/me".into())),
+            expected
+        );
+        assert_eq!(
+            default_dir(Some("".into()), Some("/home/me".into())),
+            expected
+        );
+    }
+
+    #[test]
+    fn default_dir_needs_some_base() {
+        assert_eq!(default_dir(None, None), None);
+    }
 
     #[test]
     fn age_is_time_since_the_marker_was_written() {

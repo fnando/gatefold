@@ -21,8 +21,9 @@ pub struct Cli {
     pub dir: PathBuf,
 
     /// Base directory for cached API responses (`lrc/`, `artist/`, `release/`),
-    /// downloaded images (`art/`), and metadata (`metadata/`).
-    #[arg(long, value_name = "DIR", required = true)]
+    /// downloaded images (`art/`), and metadata (`metadata/`). Defaults to
+    /// `$XDG_DATA_HOME/gatefold` (or `~/.local/share/gatefold`).
+    #[arg(long, value_name = "DIR")]
     pub state_dir: Option<PathBuf>,
 
     /// Secret `Lrclib-Api-Key` header (server-side model). Pair with --app-id.
@@ -88,6 +89,19 @@ pub struct Cli {
     /// `.gatefold-archive/`.
     #[arg(long, conflicts_with_all = ["skip_artist_images", "lyrics_only", "cover_only"])]
     pub replace_artist_images: bool,
+
+    /// Use this Apple Music artist page (e.g.
+    /// `https://music.apple.com/us/artist/dead-fish/123456`) for the one album
+    /// artist under --dir, when `MusicBrainz` and Wikidata have no (or the wrong)
+    /// link. Remembered for later runs; this run replaces the artist's images as
+    /// --replace-artist-images would.
+    #[arg(
+        long,
+        value_name = "URL",
+        value_parser = parse_apple_url,
+        conflicts_with_all = ["skip_artist_images", "lyrics_only", "cover_only"]
+    )]
+    pub apple_url: Option<String>,
 
     /// On a --replace-artist-images run, don't re-check an artist's page if it was
     /// last checked within this long ago (e.g. `30d`, `12h`; units: s, m, h, d, w).
@@ -206,6 +220,14 @@ pub enum Command {
 }
 
 /// `30d`, `12h`, `90m`, `45s`, `2w`: a whole number plus a unit.
+/// An Apple Music artist URL → its numeric artist id.
+fn parse_apple_url(text: &str) -> Result<String, String> {
+    crate::musicbrainz::apple_artist_id(text).ok_or_else(|| {
+        "expected an Apple Music artist URL, like https://music.apple.com/us/artist/name/123456"
+            .to_string()
+    })
+}
+
 fn parse_duration(text: &str) -> Result<Duration, String> {
     let text = text.trim();
     let digits = text.trim_end_matches(|c: char| c.is_ascii_alphabetic());
@@ -312,8 +334,35 @@ mod tests {
     }
 
     #[test]
-    fn state_dir_is_required_for_a_run() {
-        assert!(Cli::try_parse_from(["gatefold", "--dir", "/music"]).is_err());
+    fn apple_url_takes_an_apple_music_artist_url() {
+        let cli = Cli::try_parse_from([
+            "gatefold",
+            "--apple-url",
+            "https://music.apple.com/br/artist/dead-fish/1234567",
+        ])
+        .unwrap();
+        assert_eq!(cli.apple_url.as_deref(), Some("1234567"));
+        for bad in [
+            "https://open.spotify.com/artist/7Lvg39k5XgXevGR767ikYI",
+            "https://music.apple.com/br/album/afasia/1234567",
+        ] {
+            assert!(Cli::try_parse_from(["gatefold", "--apple-url", bad]).is_err());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "gatefold",
+                "--lyrics-only",
+                "--apple-url",
+                "https://music.apple.com/us/artist/x/1"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn state_dir_is_optional_for_a_run() {
+        let cli = Cli::try_parse_from(["gatefold", "--dir", "/music"]).unwrap();
+        assert!(cli.state_dir.is_none());
     }
 
     #[test]

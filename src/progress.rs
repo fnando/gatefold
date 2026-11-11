@@ -48,7 +48,8 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn new(total: usize, seed_secs: f64) -> Self {
+    /// `prefix` labels the bar (e.g. `processing`).
+    pub fn new(prefix: &str, total: usize, seed_secs: f64) -> Self {
         // Off a TTY (e.g. cron), indicatif can't reposition the cursor to redraw the
         // bar, which garbles and duplicates the explicit log lines. Hide the live
         // rendering there so each line is emitted once; interactive runs are unchanged.
@@ -57,7 +58,7 @@ impl Progress {
         } else {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
-        Self::on(multi, "processing", "track", total, seed_secs)
+        Self::on(multi, prefix, "track", total, seed_secs)
     }
 
     /// A follow-up phase sharing this reporter's terminal: a fresh bar (the previous

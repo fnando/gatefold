@@ -12,6 +12,7 @@ mod net;
 mod progress;
 mod restore;
 mod revision;
+mod sample;
 mod scanner;
 mod skip;
 mod state;
@@ -43,10 +44,12 @@ fn main() -> Result<()> {
     if let Some(command) = &cli.command {
         return run_command(command);
     }
-    let state_dir = cli
-        .state_dir
-        .as_deref()
-        .context("--state-dir is required")?;
+    let state_dir = match &cli.state_dir {
+        Some(dir) => dir.clone(),
+        None => state::default_dir(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+            .context("no --state-dir given and neither $XDG_DATA_HOME nor $HOME is set")?,
+    };
+    let state_dir = state_dir.as_path();
 
     if cli.verify {
         verify::ensure_available()?;
@@ -69,67 +72,63 @@ fn main() -> Result<()> {
     // even when it was given as `.`.
     let root = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
     let tracks = scanner::scan(&root);
-    let progress = Progress::new(tracks.len(), seed_secs);
+    // Artist images alone only need each album folder's album artist: read a
+    // few tracks per folder rather than every one.
+    let artist_only = !cli.lyrics_enabled() && !cli.cover_enabled();
+    let folders = artist_only.then(|| sample::by_folder(&tracks));
+    let to_read = folders
+        .as_ref()
+        .map_or(tracks.len(), |folders| folders.iter().map(Vec::len).sum());
+    let bar = if artist_only {
+        "reading tags"
+    } else {
+        "processing"
+    };
+    let progress = Progress::new(bar, to_read, seed_secs);
 
     let mb_client = musicbrainz::Client::new(&cli.musicbrainz_url, cli.user_agent(), delay);
     let mb_host = (!mb_client.is_public()).then(|| mb_client.host());
     progress.headline(&run_summary(&cli, mb_host.as_deref()));
 
-    progress.section("Scanning");
-    progress.info(format!(
-        "found {} music file(s) under {}",
-        tracks.len(),
-        root.display()
-    ));
-    let with_lrc = tracks.iter().filter(|t| t.has_lrc).count();
-    progress.info(format!(
-        "{with_lrc} already have an adjacent .lrc, {} do not",
-        tracks.len() - with_lrc
-    ));
+    log_scan(&progress, &root, &tracks, folders.as_deref(), to_read);
 
-    progress.section("Estimating");
-    progress.log_initial_estimate();
-
-    let videos = cli.artist_images_enabled() && !cli.skip_artist_videos;
-    let ffmpeg = videos && video::ffmpeg_available();
-    if videos && !ffmpeg {
-        progress.info(
-            "ffmpeg not found on PATH: motion backdrops (backdrops/backdrop.mp4) will be skipped",
-        );
+    // Reading a few tags per folder is quick, and "Scanning" already says what
+    // is read, so an artist-only run has no estimate or section of its own here.
+    if !artist_only {
+        progress.section("Estimating");
+        progress.log_initial_estimate();
     }
-    let services = Services {
-        lyrics: Client::new(
-            cli.user_agent(),
-            cli.app_id.clone(),
-            cli.api_key.clone(),
-            delay,
-        ),
-        cover: coverart::Client::new(cli.user_agent(), delay),
-        musicbrainz: mb_client,
-        lookup: apple::Lookup::new(cli.user_agent(), delay),
-        resolver: artist::Resolver::new(cli.user_agent(), delay),
-        wikidata: wikidata::Client::new(cli.user_agent(), delay),
-        videos: ffmpeg,
-    };
+
+    let services = Services::new(&cli, mb_client, delay, &progress);
     let revisions = Revisions::new();
 
-    progress.section(if cli.cache_only {
-        "Processing (cache-only)"
-    } else {
-        "Processing"
-    });
+    if !artist_only {
+        progress.section(if cli.cache_only {
+            "Processing (cache-only)"
+        } else {
+            "Processing"
+        });
+    }
 
     let mut summary = Summary::default();
-    let artist_jobs = run_track_pass(
-        &cli,
-        &root,
-        &state,
-        &services,
-        &progress,
-        &tracks,
-        &mut summary,
-    )?;
+    let artist_jobs = if let Some(folders) = &folders {
+        run_artist_scan(&root, &state, &progress, folders, &mut summary)?
+    } else {
+        run_track_pass(
+            &cli,
+            &root,
+            &state,
+            &services,
+            &progress,
+            &tracks,
+            &mut summary,
+        )?
+    };
     progress.finish();
+
+    if let Some(apple_id) = &cli.apple_url {
+        pin_apple_id(&state, &progress, &artist_jobs, apple_id)?;
+    }
 
     if cli.artist_images_enabled() {
         run_artist_pass(
@@ -239,6 +238,39 @@ struct Services {
     videos: bool,
 }
 
+impl Services {
+    /// The API clients for this run. Motion backdrops need ffmpeg; without it
+    /// they're turned off, with a note.
+    fn new(
+        cli: &Cli,
+        musicbrainz: musicbrainz::Client,
+        delay: Duration,
+        progress: &Progress,
+    ) -> Self {
+        let videos = cli.artist_images_enabled() && !cli.skip_artist_videos;
+        let ffmpeg = videos && video::ffmpeg_available();
+        if videos && !ffmpeg {
+            progress.info(
+                "ffmpeg not found on PATH: motion backdrops (backdrops/backdrop.mp4) will be skipped",
+            );
+        }
+        Self {
+            lyrics: Client::new(
+                cli.user_agent(),
+                cli.app_id.clone(),
+                cli.api_key.clone(),
+                delay,
+            ),
+            cover: coverart::Client::new(cli.user_agent(), delay),
+            musicbrainz,
+            lookup: apple::Lookup::new(cli.user_agent(), delay),
+            resolver: artist::Resolver::new(cli.user_agent(), delay),
+            wikidata: wikidata::Client::new(cli.user_agent(), delay),
+            videos: ffmpeg,
+        }
+    }
+}
+
 /// The cover cache key variant: bumped when the sources or sizes change so that
 /// earlier caches are re-fetched rather than reused.
 const COVER_CACHE_VARIANT: &str = "apple-4000|front-1200";
@@ -257,10 +289,7 @@ fn run_track_pass(
     let mut cover_misses = CoverMemo::default();
     let mut artist_jobs: BTreeMap<String, ArtistJob> = BTreeMap::new();
     for (i, track) in tracks.iter().enumerate() {
-        let name = track.path.file_name().map_or_else(
-            || track.path.to_string_lossy().into_owned(),
-            |n| pad_track_number(&n.to_string_lossy()),
-        );
+        let name = track_name(track);
         progress.status(name.clone());
 
         let start = Instant::now();
@@ -297,6 +326,115 @@ fn run_track_pass(
         }
     }
     Ok(artist_jobs)
+}
+
+/// The "Scanning" section: what was found, and what this run reads of it.
+fn log_scan(
+    progress: &Progress,
+    root: &Path,
+    tracks: &[Track],
+    folders: Option<&[Vec<&Track>]>,
+    to_read: usize,
+) {
+    progress.section("Scanning");
+    progress.info(format!(
+        "found {} music file(s) under {}",
+        tracks.len(),
+        root.display()
+    ));
+    if let Some(folders) = folders {
+        progress.info(format!(
+            "reading tags from {to_read} of them (up to {} per album folder, {} folder(s))",
+            sample::PER_FOLDER,
+            folders.len()
+        ));
+    } else {
+        let with_lrc = tracks.iter().filter(|t| t.has_lrc).count();
+        progress.info(format!(
+            "{with_lrc} already have an adjacent .lrc, {} do not",
+            tracks.len() - with_lrc
+        ));
+    }
+}
+
+/// `--apple-url`: remember the Apple Music artist id for the one album artist
+/// found, so this and later runs use it over `MusicBrainz` and Wikidata.
+fn pin_apple_id(
+    state: &State,
+    progress: &Progress,
+    jobs: &BTreeMap<String, ArtistJob>,
+    apple_id: &str,
+) -> Result<()> {
+    let mut artists = jobs.values();
+    let (Some(job), None) = (artists.next(), artists.next()) else {
+        let names: Vec<&str> = jobs.values().map(|job| job.name.as_str()).collect();
+        anyhow::bail!(
+            "--apple-url needs exactly one album artist under --dir, found {}{}",
+            names.len(),
+            if names.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", names.join(", "))
+            }
+        );
+    };
+    state.save_apple_pin(&job.mbid, apple_id)?;
+    progress.info(format!(
+        "· {}: using Apple Music artist {apple_id}",
+        job.name
+    ));
+    Ok(())
+}
+
+/// The track's `MusicBrainz` album artist id, the vote in [`run_artist_scan`].
+fn id_of(meta: &TrackMetadata) -> Option<&str> {
+    meta.musicbrainz_album_artist_id.as_deref()
+}
+
+/// The track's file name, as shown in progress and log lines.
+fn track_name(track: &Track) -> String {
+    track.path.file_name().map_or_else(
+        || track.path.to_string_lossy().into_owned(),
+        |n| pad_track_number(&n.to_string_lossy()),
+    )
+}
+
+/// The artist-images-only stand-in for the track pass: read the sampled tracks
+/// of each album folder (see [`sample`]) and note the album artist most of them
+/// carry. No network here.
+fn run_artist_scan(
+    root: &Path,
+    state: &State,
+    progress: &Progress,
+    folders: &[Vec<&Track>],
+    summary: &mut Summary,
+) -> Result<BTreeMap<String, ArtistJob>> {
+    let mut jobs = BTreeMap::new();
+    for folder in folders {
+        let mut read = Vec::new();
+        for &track in folder {
+            let name = track_name(track);
+            progress.status(name.clone());
+            let start = Instant::now();
+            let abs = std::fs::canonicalize(&track.path).unwrap_or_else(|_| track.path.clone());
+            let digest = digest_for(&abs);
+            let cached = state.load_metadata::<TrackMetadata>(&digest)?;
+            match refresh_metadata(state, track, &digest, cached) {
+                Ok(meta) => read.push((track, meta)),
+                Err(err) => {
+                    summary.unreadable += 1;
+                    progress.info(format!("✗ {name}: {err:#}"));
+                }
+            }
+            progress.record_track(start.elapsed());
+        }
+        let winner = sample::most_common(read.iter().filter_map(|(_, meta)| id_of(meta)));
+        let pick = winner.and_then(|id| read.iter().find(|(_, meta)| id_of(meta) == Some(id)));
+        if let Some((track, meta)) = pick {
+            collect_artist(root, track, meta, &mut jobs);
+        }
+    }
+    Ok(jobs)
 }
 
 /// Fetch and write artist images for every distinct album artist seen during the
@@ -1003,6 +1141,10 @@ enum ArtistOutcome {
     Fresh,
     SkippedNothingToDo,
     SkippedByFilter,
+    /// Nothing to write, and only because the artist has no Apple Music link
+    /// (on `MusicBrainz` or Wikidata): Spotify provides just an avatar, which is
+    /// already present (or never overwrites one).
+    SpotifyOnly,
     NoLinks,
     NoImage,
     /// `--replace-artist-images`, but the images are the ones already written.
@@ -1048,11 +1190,7 @@ fn process_artist(
     // Every folder already complete and not replacing: nothing to do, and no
     // reason to touch the network.
     if !replacing && !cli.cache_only && folders_complete(job, record.as_ref(), services.videos) {
-        return Ok(match mode {
-            ReplaceMode::Kept => ArtistOutcome::Kept,
-            ReplaceMode::Fresh => ArtistOutcome::Fresh,
-            ReplaceMode::Plain | ReplaceMode::Replace => ArtistOutcome::SkippedNothingToDo,
-        });
+        return Ok(complete_outcome(mode, record.as_ref()));
     }
 
     if artist_filtered_out(cli, state, mbid) {
@@ -1084,10 +1222,17 @@ fn process_artist(
 
     // Churn guard: only overwrite when the images differ from what was written.
     // Spotify only ever provides an avatar, and a lower-quality one than Apple's —
-    // so never let a Spotify fall-through overwrite an existing file.
+    // so never let a Spotify fall-through overwrite an existing file. A record
+    // that was never written (e.g. from --cache-only) says nothing about what's
+    // on disk, so it can't vouch that the images are already there. Nor can any
+    // record under --apple-url, which may be swapping in a different artist's
+    // page; the writer still compares each file's digest before replacing it.
     let replace = replacing
         && resolved.source != Source::Spotify
-        && record.as_ref().is_none_or(|r| !r.same_images(&resolved));
+        && (cli.apple_url.is_some()
+            || record
+                .as_ref()
+                .is_none_or(|r| r.written_at.is_none() || !r.same_images(&resolved)));
     // A fresh page check is worth remembering even when nothing changed, so
     // --artist-refresh-after can count from it.
     let mut new_record = match record.clone().filter(|r| r.same_images(&resolved)) {
@@ -1096,7 +1241,9 @@ fn process_artist(
         None => ArtistRecord::new(mbid, &job.name, &resolved, now),
     };
     let record_changed = record.is_none() || !reused;
-    let nothing_to_do = if replacing {
+    let nothing_to_do = if resolved.source == Source::Spotify {
+        ArtistOutcome::SpotifyOnly
+    } else if replacing {
         ArtistOutcome::Unchanged
     } else {
         ArtistOutcome::SkippedNothingToDo
@@ -1158,6 +1305,21 @@ fn process_artist(
     }
 }
 
+/// What an artist whose folders already have every image amounts to.
+fn complete_outcome(mode: ReplaceMode, record: Option<&ArtistRecord>) -> ArtistOutcome {
+    match mode {
+        ReplaceMode::Kept => ArtistOutcome::Kept,
+        ReplaceMode::Fresh => ArtistOutcome::Fresh,
+        ReplaceMode::Plain | ReplaceMode::Replace => {
+            if record.is_some_and(|r| r.source == Source::Spotify) {
+                ArtistOutcome::SpotifyOnly
+            } else {
+                ArtistOutcome::SkippedNothingToDo
+            }
+        }
+    }
+}
+
 /// `--new-only`: only artists never looked up. `--miss-only`: only recorded misses.
 /// `--retry-missed-after`: not a miss recorded within the window.
 fn artist_filtered_out(cli: &Cli, state: &State, mbid: &str) -> bool {
@@ -1192,6 +1354,14 @@ fn replace_mode(
     record: Option<&ArtistRecord>,
     now: u64,
 ) -> ReplaceMode {
+    // --apple-url names the artist's page by hand: always use it, this run.
+    if cli.apple_url.is_some() {
+        return if fully_kept(job) {
+            ReplaceMode::Kept
+        } else {
+            ReplaceMode::Replace
+        };
+    }
     if !cli.replace_artist_images {
         return ReplaceMode::Plain;
     }
@@ -1276,6 +1446,9 @@ fn artist_links(
         value
     };
     let mut links = musicbrainz::links_from(&lookup);
+    if let Some(apple_id) = state.load_apple_pin(mbid)? {
+        links.apple_id = Some(apple_id);
+    }
     if links.apple_id.is_none() {
         let cached = if rechecking {
             None
@@ -1596,6 +1769,10 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
         )),
         ArtistOutcome::Kept => progress.info(format!("· {name}: artist images kept")),
         ArtistOutcome::Fresh => progress.info(format!("· {name}: artist page checked recently")),
+        ArtistOutcome::SpotifyOnly => progress.info(format!(
+            "· {name}: {NO_APPLE_LINK}; Spotify only has an avatar, and {} is already there (set one with --apple-url)",
+            ArtistImage::Avatar.label("jpg")
+        )),
         ArtistOutcome::NoLinks => {
             progress.info(format!(
                 "· {name}: no Apple Music/Spotify link on MusicBrainz or Wikidata"
@@ -1638,10 +1815,18 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             } else {
                 format!(", previous in {}", kept.join(", "))
             };
-            progress.info(format!("✓ {name}: {} ({src}{kept})", parts.join(", ")));
+            let why = if *source == Source::Spotify {
+                format!("; {NO_APPLE_LINK}, so no backdrop or logo")
+            } else {
+                String::new()
+            };
+            progress.info(format!("✓ {name}: {} ({src}{kept}){why}", parts.join(", ")));
         }
     }
 }
+
+/// Why a Spotify-sourced artist gets an avatar and nothing else.
+const NO_APPLE_LINK: &str = "no Apple Music link on MusicBrainz or Wikidata";
 
 /// Aggregate counts printed at the end of the run.
 #[derive(Default)]
@@ -1676,6 +1861,7 @@ struct Summary {
     artist_kept: u64,
     artist_fresh: u64,
     artist_no_folder: u64,
+    artist_spotify_only: u64,
     artist_no_links: u64,
     artist_no_image: u64,
     artist_cache_only: u64,
@@ -1742,6 +1928,7 @@ impl Summary {
             ArtistOutcome::NoFolder => self.artist_no_folder += 1,
             ArtistOutcome::Kept => self.artist_kept += 1,
             ArtistOutcome::Fresh => self.artist_fresh += 1,
+            ArtistOutcome::SpotifyOnly => self.artist_spotify_only += 1,
             ArtistOutcome::NoLinks => self.artist_no_links += 1,
             ArtistOutcome::NoImage => self.artist_no_image += 1,
             ArtistOutcome::Unchanged => self.artist_unchanged += 1,
@@ -1792,12 +1979,13 @@ impl Summary {
             ));
         }
         progress.info(format!(
-            "  unchanged {}, skipped {}, kept {}, fresh {}, no folder {}, no links {}, no image {}, errors {}",
+            "  unchanged {}, skipped {}, kept {}, fresh {}, no folder {}, no apple music link {}, no links {}, no image {}, errors {}",
             self.artist_unchanged,
             self.artist_skipped,
             self.artist_kept,
             self.artist_fresh,
             self.artist_no_folder,
+            self.artist_spotify_only,
             self.artist_no_links,
             self.artist_no_image,
             self.artist_errors
