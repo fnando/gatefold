@@ -12,7 +12,7 @@
 //! Unlike a keep marker, a skip marker doesn't freeze the folder: any other image
 //! is welcome. Delete the marker to take the image back.
 
-use crate::state::digest_bytes;
+use crate::state::{CachedArt, digest_bytes};
 use crate::writer::ArtistImage;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -49,6 +49,18 @@ pub fn rejects(dir: &Path, data: &[u8]) -> bool {
     has_markers(dir) && dir.join(marker_name(&digest_bytes(data))).is_file()
 }
 
+/// True when `dir` rejects this image, as cached (optimized) or as downloaded
+/// (what files written before images were optimized hold, and what markers
+/// made from them name).
+pub fn rejects_art(dir: &Path, art: &CachedArt) -> bool {
+    has_markers(dir)
+        && (rejects(dir, &art.data)
+            || art
+                .original
+                .as_deref()
+                .is_some_and(|digest| dir.join(marker_name(digest)).is_file()))
+}
+
 /// True when the existing `file` is rejected by a marker next to it.
 pub fn rejected(file: &Path) -> bool {
     let Some(dir) = file.parent() else {
@@ -74,6 +86,19 @@ pub fn present(dir: &Path, kind: ArtistImage) -> Option<PathBuf> {
 /// True when the `kind` file in artist folder `dir` exists but was skipped.
 pub fn artist_image(dir: &Path, kind: ArtistImage) -> bool {
     kind.existing(dir).is_some_and(|path| rejected(&path))
+}
+
+/// Carry a skip over to new contents of the same image: the marker in `dir`
+/// naming `old` (a digest) now names `new`. True when there was one.
+pub fn rename(dir: &Path, old: &str, new: &str) -> Result<bool> {
+    let from = dir.join(marker_name(old));
+    if !from.is_file() {
+        return Ok(false);
+    }
+    let to = dir.join(marker_name(new));
+    fs::rename(&from, &to)
+        .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+    Ok(true)
 }
 
 /// What `mark` did.

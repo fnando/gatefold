@@ -19,13 +19,36 @@ pub fn default_dir(xdg_data_home: Option<OsString>, home: Option<OsString>) -> O
         .map(|base| base.join("gatefold"))
 }
 
-/// An image restored from the cache.
+/// An image (or video) from the cache, losslessly optimized.
 pub struct CachedArt {
     pub mime: String,
     pub ext: String,
     pub data: Vec<u8>,
     /// Where it came from (e.g. `apple music`), when recorded.
     pub source: Option<String>,
+    /// SHA-256 of the image as downloaded, when optimizing changed it: files
+    /// written (and skip markers made) before images were optimized hold those
+    /// bytes, and still count as this image.
+    pub original: Option<String>,
+}
+
+impl CachedArt {
+    /// True when `digest` is this image, as cached or as downloaded.
+    pub fn is(&self, digest: &str) -> bool {
+        digest == digest_bytes(&self.data) || self.original.as_deref() == Some(digest)
+    }
+
+    /// An uncached image, for tests.
+    #[cfg(test)]
+    pub fn new(ext: &str, data: &[u8]) -> Self {
+        CachedArt {
+            mime: format!("image/{ext}"),
+            ext: ext.to_string(),
+            data: data.to_vec(),
+            source: None,
+            original: None,
+        }
+    }
 }
 
 /// Sidecar describing the bytes stored next to it at `art/<digest>.<ext>`.
@@ -35,6 +58,13 @@ struct ArtMeta {
     mime: String,
     #[serde(default)]
     source: Option<String>,
+    /// The bytes have been through `lossless::image` (entries cached before
+    /// that are optimized on first load).
+    #[serde(default)]
+    optimized: bool,
+    /// SHA-256 of the bytes as downloaded, when optimizing changed them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original: Option<String>,
 }
 
 /// `artist/<mbid>.apple.json`: an Apple Music artist id set by hand.
@@ -318,43 +348,71 @@ impl State {
         touch(&self.release_miss_path(mbid))
     }
 
-    /// Persist a fetched image: metadata sidecar plus the raw bytes.
+    /// Persist a fetched image, losslessly optimized: metadata sidecar plus the
+    /// bytes. Returns what was stored, as `load_art` would.
     pub fn save_art(
         &self,
         digest: &str,
         ext: &str,
         mime: &str,
         source: Option<&str>,
-        data: &[u8],
-    ) -> Result<()> {
-        let bytes_path = self.art_dir.join(format!("{digest}.{ext}"));
-        fs::write(&bytes_path, data)
-            .with_context(|| format!("writing {}", bytes_path.display()))?;
-        write_json(
-            &self.art_meta_path(digest),
-            &ArtMeta {
-                ext: ext.to_string(),
-                mime: mime.to_string(),
-                source: source.map(str::to_string),
-            },
-        )?;
-        self.clear_cover_miss(digest)
+        data: Vec<u8>,
+    ) -> Result<CachedArt> {
+        let mut meta = ArtMeta {
+            ext: ext.to_string(),
+            mime: mime.to_string(),
+            source: source.map(str::to_string),
+            optimized: false,
+            original: None,
+        };
+        let data = self.store_art(digest, &mut meta, data)?;
+        self.clear_cover_miss(digest)?;
+        Ok(art_from(meta, data))
     }
 
-    /// Load a previously cached cover image, if present.
+    /// Optimize `data` (when it's an image that can be made smaller), write it
+    /// and `meta`, and return the stored bytes.
+    fn store_art(&self, digest: &str, meta: &mut ArtMeta, data: Vec<u8>) -> Result<Vec<u8>> {
+        let data = match crate::lossless::image(&data) {
+            Some(optimized) => {
+                meta.original = Some(digest_bytes(&data));
+                optimized
+            }
+            None => data,
+        };
+        meta.optimized = true;
+        let bytes_path = self.art_dir.join(format!("{digest}.{}", meta.ext));
+        let work = self.art_dir.join(format!(".{digest}.{}.part", meta.ext));
+        fs::write(&work, &data).with_context(|| format!("writing {}", work.display()))?;
+        fs::rename(&work, &bytes_path)
+            .with_context(|| format!("replacing {}", bytes_path.display()))?;
+        write_json(&self.art_meta_path(digest), meta)?;
+        Ok(data)
+    }
+
+    /// Load a previously cached image, if present. One cached before images
+    /// were optimized is optimized (and stored so) first.
     pub fn load_art(&self, digest: &str) -> Result<Option<CachedArt>> {
-        let Some(meta): Option<ArtMeta> = read_json(&self.art_meta_path(digest))? else {
+        let Some(mut meta): Option<ArtMeta> = read_json(&self.art_meta_path(digest))? else {
             return Ok(None);
         };
         let bytes_path = self.art_dir.join(format!("{digest}.{}", meta.ext));
-        let data =
+        let mut data =
             fs::read(&bytes_path).with_context(|| format!("reading {}", bytes_path.display()))?;
-        Ok(Some(CachedArt {
-            mime: meta.mime,
-            ext: meta.ext,
-            data,
-            source: meta.source,
-        }))
+        if !meta.optimized {
+            data = self.store_art(digest, &mut meta, data)?;
+        }
+        Ok(Some(art_from(meta, data)))
+    }
+}
+
+fn art_from(meta: ArtMeta, data: Vec<u8>) -> CachedArt {
+    CachedArt {
+        mime: meta.mime,
+        ext: meta.ext,
+        data,
+        source: meta.source,
+        original: meta.original,
     }
 }
 
@@ -455,6 +513,58 @@ mod tests {
         assert_eq!(age(&marker), None);
         touch(&marker).unwrap();
         assert!(age(&marker).unwrap() < Duration::from_mins(1));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn art_is_optimized_on_save_and_upgraded_on_load() {
+        let dir = std::env::temp_dir().join(format!("gatefold-state-art-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let state = State::new(&dir).unwrap();
+        let jpeg = fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sample.jpg"
+        ))
+        .unwrap();
+
+        let saved = state
+            .save_art(
+                "new",
+                "jpg",
+                "image/jpeg",
+                Some("apple music"),
+                jpeg.clone(),
+            )
+            .unwrap();
+        assert!(saved.data.len() < jpeg.len());
+        assert_eq!(saved.original, Some(digest_bytes(&jpeg)));
+        assert!(saved.is(&digest_bytes(&jpeg)) && saved.is(&digest_bytes(&saved.data)));
+
+        // Cached before images were optimized: no flag, raw bytes.
+        fs::write(dir.join("art/old.jpg"), &jpeg).unwrap();
+        fs::write(
+            dir.join("art/old.json"),
+            r#"{"ext":"jpg","mime":"image/jpeg","source":"apple music"}"#,
+        )
+        .unwrap();
+        let loaded = state.load_art("old").unwrap().unwrap();
+        assert_eq!(loaded.data, saved.data);
+        assert_eq!(loaded.original, Some(digest_bytes(&jpeg)));
+        assert_eq!(
+            fs::read(dir.join("art/old.jpg")).unwrap(),
+            saved.data,
+            "stored so"
+        );
+        let meta = fs::read_to_string(dir.join("art/old.json")).unwrap();
+        assert!(meta.contains(r#""optimized": true"#), "{meta}");
+
+        // Not an image (a motion backdrop): stored as is.
+        let video = state
+            .save_art("video", "mp4", "video/mp4", None, b"mp4 bytes".to_vec())
+            .unwrap();
+        assert_eq!(
+            (video.data.as_slice(), video.original),
+            (&b"mp4 bytes"[..], None)
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

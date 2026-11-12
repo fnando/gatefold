@@ -232,6 +232,33 @@ pub fn file_digest(file: &Path) -> Result<String> {
     Ok(digest)
 }
 
+/// The SHA-256 of `file`'s contents, streamed (for videos too large to read
+/// whole), ignoring any sidecar.
+pub fn digest_of(file: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let context = || format!("reading {}", file.display());
+    let mut reader = fs::File::open(file).with_context(context)?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 1 << 20];
+    loop {
+        let read = reader.read(&mut buffer).with_context(context)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+/// Refresh the digest sidecar next to `file`, when it has one.
+pub fn update_digest(file: &Path, digest: &str) -> Result<()> {
+    if digest_path(file).is_file() {
+        write_digest(file, digest)?;
+    }
+    Ok(())
+}
+
 /// Write (or refresh) the digest sidecar next to `file`.
 pub fn write_digest(file: &Path, digest: &str) -> Result<()> {
     let sidecar = digest_path(file);

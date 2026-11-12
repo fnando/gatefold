@@ -2,8 +2,13 @@
 //! master playlist and written as a plain MP4 with ffmpeg. Apple's renditions
 //! are encoded at a generous bitrate, so SDR ones are re-encoded with x264
 //! (about half the size, visually the same); otherwise the stream is copied.
+//! `gatefold optimize` gives backdrops already on disk the same re-encode
+//! ([`shrink`]).
 
 use anyhow::{Context, Result, bail};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -142,36 +147,124 @@ fn libx264_available() -> bool {
 const FIT_1080P: &str =
     "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
 
-/// The ffmpeg output codec arguments for `variant`: SDR renditions are
-/// re-encoded with x264, fitted into 1080p and lose any audio (backdrops play
-/// muted); HDR ones are
-/// stream-copied, since squeezing them into 8-bit SDR without tone mapping
-/// would wash out the colours.
-fn codec_args(variant: &Variant, reencode: bool) -> &'static [&'static str] {
-    if reencode && variant.sdr {
-        &[
-            "-an", "-vf", FIT_1080P, "-c:v", "libx264", "-preset", "medium", "-crf", CRF,
-            "-pix_fmt", "yuv420p",
-        ]
+/// The re-encode every SDR motion backdrop gets: x264, fitted into 1080p,
+/// without audio (backdrops play muted).
+const SHRINK_ARGS: &[&str] = &[
+    "-an", "-vf", FIT_1080P, "-c:v", "libx264", "-preset", "medium", "-crf", CRF, "-pix_fmt",
+    "yuv420p",
+];
+
+/// Whether `variant` gets [`shrink`]: SDR renditions do when x264 is there;
+/// HDR ones are stream-copied, since squeezing them into 8-bit SDR without
+/// tone mapping would wash out the colours.
+fn reencodes(variant: &Variant, x264: bool) -> bool {
+    x264 && variant.sdr
+}
+
+/// Write one variant playlist into `out` as MP4 (`faststart`): [`shrink`]ed
+/// when it can be (see [`reencodes`]), else stream-copied.
+pub fn remux(variant: &Variant, user_agent: &str, out: &Path) -> Result<()> {
+    let input = OsStr::new(&variant.url);
+    if reencodes(variant, libx264_available()) {
+        shrink(input, Some(user_agent), out)
     } else {
-        &["-c", "copy"]
+        ffmpeg(input, Some(user_agent), &["-c", "copy"], out)
     }
 }
 
-/// Write one variant playlist into `out` as MP4 (`faststart`), re-encoding it
-/// when possible (see [`codec_args`]).
-pub fn remux(variant: &Variant, user_agent: &str, out: &Path) -> Result<()> {
-    let output = Command::new("ffmpeg")
+/// Re-encode the SDR motion backdrop `input` (a playlist URL, or a file
+/// already on disk) into `out` as MP4: [`SHRINK_ARGS`], never a copy. Every
+/// downloaded backdrop gets this, and `gatefold optimize` gives it to older
+/// ones. Fails when this ffmpeg has no `libx264`.
+pub fn shrink(input: &OsStr, user_agent: Option<&str>, out: &Path) -> Result<()> {
+    if !libx264_available() {
+        bail!("this ffmpeg has no libx264 encoder");
+    }
+    ffmpeg(input, user_agent, SHRINK_ARGS, out)
+}
+
+/// True when this ffmpeg can [`shrink`].
+pub fn can_shrink() -> bool {
+    libx264_available()
+}
+
+/// A motion backdrop already on disk, as `gatefold optimize` sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existing {
+    /// Apple's rendition as downloaded: worth [`shrink`]ing.
+    Original,
+    /// Already re-encoded with x264 (by gatefold): another pass would only
+    /// lose quality.
+    Shrunk,
+    /// HDR, which downloads keep as they are too.
+    Hdr,
+}
+
+/// x264 writes its version and settings into every stream it encodes ("x264 -
+/// core 164 …"), near the start; Apple's encoder doesn't.
+const X264_SIGNATURE: &[u8] = b"x264 - core ";
+/// With `faststart` the index comes first; the first frame follows within this.
+const SIGNATURE_WINDOW: u64 = 16 * 1024 * 1024;
+
+pub fn inspect(path: &Path) -> Result<Existing> {
+    let mut head = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(SIGNATURE_WINDOW).read_to_end(&mut head))
+        .with_context(|| format!("reading {}", path.display()))?;
+    if head
+        .windows(X264_SIGNATURE.len())
+        .any(|w| w == X264_SIGNATURE)
+    {
+        return Ok(Existing::Shrunk);
+    }
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
         .args([
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-user_agent",
-            user_agent,
-            "-i",
+            "-show_entries",
+            "stream=pix_fmt,color_transfer",
+            "-of",
+            "default=nw=1",
         ])
-        .arg(&variant.url)
-        .args(codec_args(variant, libx264_available()))
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("running ffprobe")?;
+    if !output.status.success() {
+        bail!("ffprobe couldn't read {}", path.display());
+    }
+    Ok(if is_hdr(&String::from_utf8_lossy(&output.stdout)) {
+        Existing::Hdr
+    } else {
+        Existing::Original
+    })
+}
+
+/// From ffprobe's `pix_fmt=…` / `color_transfer=…` lines: a PQ (HDR10, Dolby
+/// Vision) or HLG transfer, or, when the file doesn't say, more than 8 bits
+/// per sample (10-bit video is HDR in practice, and squeezing it into 8-bit
+/// SDR would band and wash out). Downloads keep these as they are.
+fn is_hdr(probe: &str) -> bool {
+    probe.lines().any(|line| match line.trim().split_once('=') {
+        Some(("color_transfer", transfer)) => matches!(transfer, "smpte2084" | "arib-std-b67"),
+        Some(("pix_fmt", format)) => ["p10", "p12", "p16", "p010", "p016"]
+            .iter()
+            .any(|deep| format.contains(deep)),
+        _ => false,
+    })
+}
+
+/// Run ffmpeg from `input` into `out` as MP4 (`faststart`) with `codec` args.
+fn ffmpeg(input: &OsStr, user_agent: Option<&str>, codec: &[&str], out: &Path) -> Result<()> {
+    let mut command = Command::new("ffmpeg");
+    command.args(["-loglevel", "error", "-nostdin"]);
+    if let Some(user_agent) = user_agent {
+        command.args(["-user_agent", user_agent]);
+    }
+    let output = command
+        .arg("-i")
+        .arg(input)
+        .args(codec)
         .args(["-movflags", "+faststart", "-f", "mp4", "-y"])
         .arg(out)
         .stdin(Stdio::null())
@@ -230,11 +323,24 @@ rel/720.m3u8
     fn reencodes_only_sdr_variants_when_x264_is_there() {
         let found = variants(MASTER, "https://host/master.m3u8");
         let (sdr, hdr) = (&found[0], &found[1]);
-        assert!(codec_args(sdr, true).contains(&"libx264"));
-        assert!(codec_args(sdr, true).contains(&"-an"));
-        assert!(codec_args(sdr, true).contains(&FIT_1080P));
-        assert_eq!(codec_args(sdr, false), ["-c", "copy"]);
-        assert_eq!(codec_args(hdr, true), ["-c", "copy"]);
+        assert!(reencodes(sdr, true));
+        assert!(!reencodes(sdr, false));
+        assert!(!reencodes(hdr, true));
+        for arg in ["libx264", "-an", FIT_1080P] {
+            assert!(SHRINK_ARGS.contains(&arg), "{arg}");
+        }
+    }
+
+    #[test]
+    fn tells_hdr_apart() {
+        assert!(is_hdr("pix_fmt=yuv420p10le\ncolor_transfer=smpte2084\n"));
+        assert!(is_hdr("pix_fmt=yuv420p\ncolor_transfer=arib-std-b67\n"));
+        // Untagged, but 10-bit.
+        assert!(is_hdr("pix_fmt=yuv420p10le\ncolor_transfer=unknown\n"));
+        assert!(is_hdr("pix_fmt=p010le\n"));
+        assert!(!is_hdr("pix_fmt=yuv420p\ncolor_transfer=bt709\n"));
+        assert!(!is_hdr("pix_fmt=yuv420p\ncolor_transfer=unknown\n"));
+        assert!(!is_hdr(""));
     }
 
     #[test]

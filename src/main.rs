@@ -5,10 +5,12 @@ mod backup;
 mod cli;
 mod coverart;
 mod keep;
+mod lossless;
 mod lrclib;
 mod metadata;
 mod musicbrainz;
 mod net;
+mod optimize;
 mod progress;
 mod restore;
 mod revision;
@@ -154,6 +156,17 @@ fn run_command(command: &cli::Command) -> Result<()> {
         cli::Command::Skip { images } => skip_images(images),
         cli::Command::Keep { files, dirs } => keep_paths(files, dirs),
         cli::Command::Archive { files } => archive::run(files),
+        cli::Command::Optimize {
+            dirs,
+            dry_run,
+            verify,
+        } => optimize::run(
+            dirs,
+            &optimize::Options {
+                dry_run: *dry_run,
+                verify: *verify,
+            },
+        ),
         cli::Command::Restore { dir, file, keep } => {
             let target = match (dir, file) {
                 (Some(dir), _) => restore::Target::Dir(dir),
@@ -966,7 +979,7 @@ fn process_cover(
 
     // The cached cover was skipped here: look it up again (once per run), in case
     // a different one is available now. A miss keeps the cached image.
-    let rejected = |art: &Option<state::CachedArt>| matches!((folder, art), (Some(dir), Some(art)) if skip::rejects(dir, &art.data));
+    let rejected = |art: &Option<state::CachedArt>| matches!((folder, art), (Some(dir), Some(art)) if skip::rejects_art(dir, art));
     if reused
         && rejected(&art)
         && cover_misses.rechecked.insert(key.clone())
@@ -993,21 +1006,12 @@ fn process_cover(
     }
 
     let embedded = if need_embed {
-        writer::embed_cover(
-            path,
-            &art.mime,
-            &art.data,
-            replace,
-            cli.verify,
-            Some(backup),
-        )?
+        writer::embed_cover(path, &art, replace, cli.verify, Some(backup))?
     } else {
         writer::Write::Skipped
     };
     let sidecar = match folder {
-        Some(dir) if need_sidecar => {
-            writer::write_cover_sidecar(dir, &art.ext, &art.data, replace, Some(backup))?
-        }
+        Some(dir) if need_sidecar => writer::write_cover_sidecar(dir, &art, replace, Some(backup))?,
         _ => writer::Write::Skipped,
     };
 
@@ -1076,13 +1080,8 @@ fn fetch_cover(
     }
 
     if let Some((image, source)) = found {
-        state.save_art(key, &image.ext, &image.mime, Some(source), &image.data)?;
-        Ok(Some(state::CachedArt {
-            mime: image.mime,
-            ext: image.ext,
-            data: image.data,
-            source: Some(source.to_string()),
-        }))
+        let art = state.save_art(key, &image.ext, &image.mime, Some(source), image.data)?;
+        Ok(Some(art))
     } else {
         if !forced {
             state.save_cover_miss(key)?;
@@ -1599,18 +1598,16 @@ fn write_artist_images(
         for (kind, art) in &files {
             let Some(art) = art else { continue };
             let kept = keep::artist_image(dir, *kind);
-            let turned_away = skip::rejects(&kind.target_dir(dir), &art.data)
+            let turned_away = skip::rejects_art(&kind.target_dir(dir), art)
                 || (alternatives && kept && skip::present(dir, *kind).is_some());
             if turned_away {
-                let saved =
-                    writer::archive_alternative(dir, *kind, &art.ext, &art.data, revisions)?;
+                let saved = writer::archive_alternative(dir, *kind, art, revisions)?;
                 written.alternatives.extend(saved);
                 continue;
             }
             // Hand-curated in this folder: written if missing, never replaced.
             let replace = (replace && !kept) || skip::artist_image(dir, *kind);
-            let (wrote, kept) =
-                writer::write_artist_image(dir, *kind, &art.ext, &art.data, replace, revisions)?;
+            let (wrote, kept) = writer::write_artist_image(dir, *kind, art, replace, revisions)?;
             let slot = match kind {
                 ArtistImage::Avatar => &mut written.avatar,
                 ArtistImage::Backdrop => &mut written.backdrop,
@@ -1691,13 +1688,8 @@ fn artist_video(
     })();
     match remuxed {
         Ok(Some(data)) => {
-            state.save_art(&key, "mp4", "video/mp4", Some("apple music"), &data)?;
-            Ok(Some(state::CachedArt {
-                mime: "video/mp4".to_string(),
-                ext: "mp4".to_string(),
-                data,
-                source: Some("apple music".to_string()),
-            }))
+            let art = state.save_art(&key, "mp4", "video/mp4", Some("apple music"), data)?;
+            Ok(Some(art))
         }
         Ok(None) => {
             progress.info(format!("· {}: motion backdrop unavailable", job.name));
@@ -1723,19 +1715,9 @@ fn artist_image(
     }
     match resolver.fetch_image(url, progress)? {
         Some(image) => {
-            state.save_art(
-                &key,
-                &image.ext,
-                &image.mime,
-                Some("apple music"),
-                &image.data,
-            )?;
-            Ok(Some(state::CachedArt {
-                mime: image.mime,
-                ext: image.ext,
-                data: image.data,
-                source: Some("apple music".to_string()),
-            }))
+            let source = Some("apple music");
+            let art = state.save_art(&key, &image.ext, &image.mime, source, image.data)?;
+            Ok(Some(art))
         }
         None => Ok(None),
     }
@@ -2145,12 +2127,7 @@ mod tests {
     use std::fs;
 
     fn art(data: &[u8]) -> state::CachedArt {
-        state::CachedArt {
-            mime: "image/jpeg".to_string(),
-            ext: "jpg".to_string(),
-            data: data.to_vec(),
-            source: Some("apple music".to_string()),
-        }
+        state::CachedArt::new("jpg", data)
     }
 
     fn job(dir: &Path) -> ArtistJob {

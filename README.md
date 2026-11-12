@@ -34,7 +34,11 @@ you already have.
 - Writes artist images once per album artist, into the folder named after the artist that
   sits above the album folders (`Artist/Album/track`). Apple's image host renders the
   renditions server-side, so the avatar comes at native resolution and the backdrop as a
-  3840×2160 crop — no image processing happens locally.
+  3840×2160 crop — nothing is resized or re-encoded locally.
+- **Optimizes every image losslessly** before writing it: JPEGs are repacked (progressive,
+  optimized Huffman tables) and PNGs recompressed, typically 10–35% smaller with exactly the
+  same pixels. `gatefold optimize --dir <folder>` does the same for the images already in a
+  library. See [Optimizing images](#optimizing-images).
 - **Never overwrites** by default. With `--replace-lyrics` / `--replace-cover`, the
   corresponding embedded tag is overwritten and the previous value is snapshotted under
   `backup/` so it can be restored. Sidecars (`.lrc`, `cover.jpg`) are always create-only.
@@ -384,6 +388,54 @@ write it back. If the restored image had been skipped, its marker is removed. A
 `--replace-artist-images` run still replaces the restored image if the artist's photo changes
 upstream; pass `--keep` to also write its [keep marker](#keeping-your-own-images)
 (`.gatefold-primary-keep` for an avatar, and so on), so it stays.
+
+### Optimizing images
+
+Every image gatefold downloads (covers, artist images, logos) is optimized losslessly before
+it's cached and written, so the same bytes go into `cover.jpg`, every track's tag and the
+artist folder:
+
+- **JPEG**: the compressed image data is repacked as it is, without decoding it to pixels
+  and re-encoding: optimized Huffman tables and a progressive scan order searched for the
+  smallest result, via [mozjpeg](https://github.com/mozilla/mozjpeg) (like
+  `jpegtran -optimize -progressive`). The Exif block (orientation) and the colour profile are
+  kept; comments, XMP and Photoshop blocks are dropped. Each result is read back and checked
+  against the original, and kept only if it holds the same image data.
+- **PNG**: recompressed with [oxipng](https://github.com/oxipng/oxipng), keeping the
+  colour-related chunks.
+
+A result that isn't smaller is discarded, and unreadable files are written as downloaded.
+Motion backdrops aren't images: they get the [1080p x264 re-encode](#how-it-works) instead,
+which is visually the same but not lossless. Apple Music artwork typically comes out 9–16% smaller as
+JPEG and around a third smaller as PNG.
+
+For the images and motion backdrops already in a library, run `gatefold optimize`:
+
+```sh
+gatefold optimize --dir Music --dry-run   # what would be saved
+gatefold optimize --dir Music             # do it
+```
+
+It goes through artist files (`folder.jpg`, `backdrop.jpg`, `logo.png`) and their
+`.gatefold-archive/`, album covers (`cover.jpg`) and the front covers embedded in tracks; the
+same cover embedded in every track of an album is optimized once.
+
+Motion backdrops (`backdrops/backdrop.mp4` and the archived ones) still as Apple served them,
+from before gatefold re-encoded them on download, get that same re-encode now. Ones already
+re-encoded are recognised by the x264 signature in the file and left alone, so a backdrop is
+never re-encoded twice; HDR ones (PQ or HLG, or deeper than 8 bits) are kept as they are,
+like on download. This needs `ffmpeg` with `libx264`; without it, backdrops are skipped and
+the summary says so. A dry run lists the backdrops it would re-encode without encoding them,
+so their savings only show on the real run.
+
+Files you [keep](#keeping-your-own-images) are left byte for byte as they are. A
+[skipped](#skipping-an-image) image stays skipped: its marker is renamed after the new
+contents. Pass `--verify` to check each track with `ffprobe` before its new tag replaces the
+original. Running it again finds nothing more to do.
+
+Cached images from before this existed are optimized the next time they're used. Files that
+gatefold wrote before then still count as the same image, so `--replace-*` runs don't
+rewrite them just because they weren't optimized.
 
 ### Incremental runs (`--new-only`)
 

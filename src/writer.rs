@@ -1,6 +1,6 @@
 use crate::backup::Backup;
 use crate::revision::{self, Archived, Revisions};
-use crate::state::digest_bytes;
+use crate::state::{CachedArt, digest_bytes};
 use crate::{scanner, verify};
 use anyhow::{Context, Result, bail};
 use lofty::config::WriteOptions;
@@ -217,13 +217,12 @@ pub fn write_lyrics_tag(
     })
 }
 
-/// Embed `data` as the front-cover picture. An existing front cover is kept unless
-/// `replace` is set and the image differs, in which case the previous image is
-/// backed up. Returns what happened.
+/// Embed `art` as the front-cover picture. An existing front cover is kept unless
+/// `replace` is set and the image differs (as cached or as downloaded), in which
+/// case the previous image is backed up. Returns what happened.
 pub fn embed_cover(
     path: &Path,
-    mime: &str,
-    data: &[u8],
+    art: &CachedArt,
     replace: bool,
     verify: bool,
     backup: Option<&Backup>,
@@ -248,7 +247,7 @@ pub fn embed_cover(
     {
         None => None,
         Some(_) if !replace => return Ok(Write::Skipped),
-        Some(old) if old.data() == data => return Ok(Write::Skipped),
+        Some(old) if art.is(&digest_bytes(old.data())) => return Ok(Write::Skipped),
         Some(old) => Some((
             format!("cover.{}", extension_for(old.mime_type())),
             old.data().to_vec(),
@@ -259,9 +258,9 @@ pub fn embed_cover(
     if replaced {
         tag.remove_picture_type(PictureType::CoverFront);
     }
-    let picture = Picture::unchecked(data.to_vec())
+    let picture = Picture::unchecked(art.data.clone())
         .pic_type(PictureType::CoverFront)
-        .mime_type(MimeType::from_str(mime))
+        .mime_type(MimeType::from_str(&art.mime))
         .build();
     tag.push_picture(picture);
     save_tag(tag, path, verify)?;
@@ -274,6 +273,49 @@ pub fn embed_cover(
     } else {
         Write::Created
     })
+}
+
+/// Pass the front cover embedded in the track at `path` through `optimize`;
+/// when that returns smaller bytes, put them in its place (same type, MIME and
+/// description) and save the tag (verified with ffprobe under `verify`).
+/// Returns the cover's size before and after, or `None` when it has no front
+/// cover or `optimize` had nothing smaller. Under `dry_run` nothing is saved.
+pub fn optimize_embedded_cover(
+    path: &Path,
+    verify: bool,
+    dry_run: bool,
+    optimize: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
+) -> Result<Option<(usize, usize)>> {
+    let mut tagged =
+        read_from_path(path).with_context(|| format!("reading tags from {}", path.display()))?;
+    let Some(tag) = tagged.primary_tag_mut() else {
+        return Ok(None);
+    };
+    let Some(index) = tag
+        .pictures()
+        .iter()
+        .position(|p| p.pic_type() == PictureType::CoverFront)
+    else {
+        return Ok(None);
+    };
+    let old = &tag.pictures()[index];
+    let Some(data) = optimize(old.data()) else {
+        return Ok(None);
+    };
+    let sizes = (old.data().len(), data.len());
+    if dry_run {
+        return Ok(Some(sizes));
+    }
+    let mut picture = Picture::unchecked(data).pic_type(PictureType::CoverFront);
+    if let Some(mime) = old.mime_type() {
+        picture = picture.mime_type(mime.clone());
+    }
+    if let Some(description) = old.description() {
+        picture = picture.description(description.to_string());
+    }
+    tag.set_picture(index, picture.build());
+    save_tag(tag, path, verify)?;
+    Ok(Some(sizes))
 }
 
 /// Persist `tag` into the file at `path`. With `verify`, the change is applied to a
@@ -327,8 +369,7 @@ fn existing_cover_sidecar(dir: &Path) -> Option<PathBuf> {
 /// folder whose cover is some other file (`folder.jpg`) is left alone.
 pub fn write_cover_sidecar(
     dir: &Path,
-    ext: &str,
-    data: &[u8],
+    art: &CachedArt,
     replace: bool,
     backup: Option<&Backup>,
 ) -> Result<Write> {
@@ -338,7 +379,7 @@ pub fn write_cover_sidecar(
         Some(_) if !replace => return Ok(Write::Skipped),
         Some(path) => {
             let current = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            if current == data {
+            if art.is(&digest_bytes(&current)) {
                 return Ok(Write::Skipped);
             }
             Some((path, current))
@@ -353,9 +394,9 @@ pub fn write_cover_sidecar(
         fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
     }
 
-    let path = dir.join(format!("cover.{ext}"));
+    let path = dir.join(format!("cover.{}", art.ext));
     let work = temp_sibling(&path);
-    fs::write(&work, data).with_context(|| format!("writing {}", work.display()))?;
+    fs::write(&work, &art.data).with_context(|| format!("writing {}", work.display()))?;
     fs::rename(&work, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(if previous.is_some() {
         Write::Replaced
@@ -395,24 +436,24 @@ pub fn migrate_archives(dir: &Path) -> Result<usize> {
 
 /// Write an artist image into `dir` as `<stem>.<ext>`, with a `<file>.sha256`
 /// digest sidecar. An existing image is kept unless `replace` is set and its
-/// digest differs (read from its sidecar, so large files aren't reread), in which
+/// digest (read from its sidecar, so large files aren't reread) is neither the
+/// image's as cached nor as downloaded, in which
 /// case the previous file is moved into its dated archive folder first. Returns
 /// what happened and, when a file was moved aside, where it went (relative to `dir`).
 pub fn write_artist_image(
     dir: &Path,
     kind: ArtistImage,
-    ext: &str,
-    data: &[u8],
+    art: &CachedArt,
     replace: bool,
     revisions: &Revisions,
 ) -> Result<(Write, Option<String>)> {
-    let digest = digest_bytes(data);
+    let digest = digest_bytes(&art.data);
     let existing = match kind.existing(dir) {
         None => None,
         Some(_) if !replace => return Ok((Write::Skipped, None)),
         Some(path) => {
             let current = revision::file_digest(&path)?;
-            if current == digest {
+            if art.is(&current) {
                 return Ok((Write::Skipped, None));
             }
             Some((path, current))
@@ -438,9 +479,9 @@ pub fn write_artist_image(
     if kind.subdir().is_some() {
         fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
     }
-    let path = target.join(format!("{}.{ext}", kind.stem()));
+    let path = target.join(format!("{}.{}", kind.stem(), art.ext));
     let work = temp_sibling(&path);
-    fs::write(&work, data).with_context(|| format!("writing {}", work.display()))?;
+    fs::write(&work, &art.data).with_context(|| format!("writing {}", work.display()))?;
     fs::rename(&work, &path).with_context(|| format!("replacing {}", path.display()))?;
     revision::write_digest(&path, &digest)?;
 
@@ -459,16 +500,16 @@ pub fn write_artist_image(
 pub fn archive_alternative(
     dir: &Path,
     kind: ArtistImage,
-    ext: &str,
-    data: &[u8],
+    art: &CachedArt,
     revisions: &Revisions,
 ) -> Result<Option<String>> {
     if let Some(current) = kind.existing(dir)
-        && revision::file_digest(&current)? == digest_bytes(data)
+        && art.is(&revision::file_digest(&current)?)
     {
         return Ok(None);
     }
-    let saved = revisions.archive_bytes(&kind.archive_dir(dir), kind.stem(), ext, data)?;
+    let archive = kind.archive_dir(dir);
+    let saved = revisions.archive_bytes(&archive, kind.stem(), &art.ext, &art.data)?;
     Ok(saved.map(|path| {
         path.strip_prefix(dir)
             .unwrap_or(&path)
@@ -510,9 +551,10 @@ mod tests {
             (ArtistImage::Logo, "png", "logos"),
         ] {
             let old = format!("old {sub} {ext}");
-            write_artist_image(&dir, kind, ext, old.as_bytes(), false, &revisions).unwrap();
-            let (wrote, kept) =
-                write_artist_image(&dir, kind, ext, b"new", true, &revisions).unwrap();
+            let old_art = CachedArt::new(ext, old.as_bytes());
+            write_artist_image(&dir, kind, &old_art, false, &revisions).unwrap();
+            let new_art = CachedArt::new(ext, b"new");
+            let (wrote, kept) = write_artist_image(&dir, kind, &new_art, true, &revisions).unwrap();
             assert_eq!(wrote, Write::Replaced);
             let stem = kind.stem();
             let archived = format!("{ARCHIVE_DIR}/{sub}/{stem}-{date}.{ext}");
@@ -529,6 +571,27 @@ mod tests {
             .filter(|n| !n.ends_with(".sha256"))
             .collect();
         assert_eq!(theme, ["backdrop.mp4"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_the_downloaded_bytes_is_the_optimized_image() {
+        let dir = artist("original");
+        let revisions = Revisions::new();
+        write_artist_image(
+            &dir,
+            ArtistImage::Avatar,
+            &CachedArt::new("jpg", b"as downloaded"),
+            false,
+            &revisions,
+        )
+        .unwrap();
+        let mut optimized = CachedArt::new("jpg", b"optimized");
+        optimized.original = Some(digest_bytes(b"as downloaded"));
+        let (wrote, kept) =
+            write_artist_image(&dir, ArtistImage::Avatar, &optimized, true, &revisions).unwrap();
+        assert_eq!((wrote, kept), (Write::Skipped, None));
+        assert_eq!(fs::read(dir.join("folder.jpg")).unwrap(), b"as downloaded");
         fs::remove_dir_all(&dir).unwrap();
     }
 

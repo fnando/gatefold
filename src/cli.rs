@@ -195,6 +195,29 @@ pub enum Command {
         #[arg(long = "file", value_name = "FILE", required = true)]
         files: Vec<PathBuf>,
     },
+    /// Shrink the images and motion backdrops already in a library, as gatefold
+    /// does with everything it downloads: artist files and their
+    /// `.gatefold-archive/`, album covers (`cover.*`) and the front covers
+    /// embedded in tracks. Images are optimized losslessly (pixels never change;
+    /// JPEGs keep their Exif and colour profile); motion backdrops still as Apple
+    /// served them get the 1080p x264 re-encode (needs ffmpeg with libx264; HDR
+    /// and already re-encoded ones are left alone). Kept files (see `keep`) are
+    /// left as they are; skipped ones stay skipped.
+    Optimize {
+        /// Folders to walk (a whole library, an artist, an album). Repeat for
+        /// several.
+        #[arg(long = "dir", value_name = "DIR", required = true)]
+        dirs: Vec<PathBuf>,
+
+        /// Report what would be saved without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Validate each track's new tag with ffprobe before it replaces the
+        /// original (see the run's `--verify`). Requires ffprobe (ffmpeg).
+        #[arg(long)]
+        verify: bool,
+    },
     /// Bring back an artist file from an artist folder's `.gatefold-archive/`.
     /// The file it replaces is skipped (see `skip`) and archived.
     Restore {
