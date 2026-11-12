@@ -107,17 +107,29 @@ pub struct Kept {
     /// A skip marker for the kept image's contents, removed: keeping it means
     /// you want it after all.
     pub unskipped: Option<PathBuf>,
+    /// Granular keep markers `.gatefold-keep` made redundant, removed.
+    pub replaced: Vec<PathBuf>,
 }
 
 /// `gatefold keep --dir <dir>`: write `.gatefold-keep`, keeping everything the
-/// folder governs.
+/// folder governs, and remove the folder's granular markers it replaces.
 pub fn mark_dir(dir: &Path) -> Result<Kept> {
     if !dir.is_dir() {
         bail!("{} is not a folder", dir.display());
     }
+    let marker = write_marker(dir, ALL)?;
+    let mut replaced = Vec::new();
+    for name in ARTIST_IMAGES.map(artist_marker).into_iter().chain([COVER]) {
+        let path = dir.join(name);
+        if path.is_file() {
+            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            replaced.push(path);
+        }
+    }
     Ok(Kept {
-        marker: write_marker(dir, ALL)?,
+        marker,
         unskipped: None,
+        replaced,
     })
 }
 
@@ -143,6 +155,7 @@ pub fn mark_file(path: &Path) -> Result<Kept> {
     Ok(Kept {
         marker,
         unskipped: skip::unmark(path)?,
+        replaced: Vec::new(),
     })
 }
 
@@ -244,10 +257,19 @@ mod tests {
         assert!(!skip::cover(&album));
         assert!(cover(&album, &root));
 
-        // A folder keeps everything it governs.
+        // A folder keeps everything it governs, replacing its granular markers.
         let kept = mark_dir(&artist).unwrap();
         assert_eq!(kept.marker, Marked::Created(artist.join(ALL)));
+        assert_eq!(
+            kept.replaced,
+            [
+                artist.join(".gatefold-primary-keep"),
+                artist.join(".gatefold-video-keep")
+            ]
+        );
+        assert!(!artist.join(".gatefold-primary-keep").exists());
         assert!(all_artist_images(&artist));
+        assert!(cover(&album, &root), "the album's own marker stays");
 
         assert!(mark_file(&album.join("01. Song.flac")).is_err());
         assert!(mark_file(&artist).is_err(), "a folder needs --dir");

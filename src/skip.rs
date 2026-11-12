@@ -170,6 +170,31 @@ pub fn classify(image: &Path) -> Option<(Managed, PathBuf)> {
     .map(|kind| (Managed::Artist(kind), parent.to_path_buf()))
 }
 
+/// The images a run manages in `dir` itself: an album folder's `cover.*`, an
+/// artist folder's `folder.*`, `backdrop.*`, `logo.*` and
+/// `backdrops/backdrop.*`. Album folders below are left alone.
+pub fn managed_in(dir: &Path) -> Vec<PathBuf> {
+    let backdrops = dir.join("backdrops");
+    let top = COVER_NAMES.iter().copied().chain(
+        [
+            ArtistImage::Avatar,
+            ArtistImage::Backdrop,
+            ArtistImage::Logo,
+        ]
+        .into_iter()
+        .flat_map(|kind| kind.names().iter().copied()),
+    );
+    top.map(|name| dir.join(name))
+        .chain(
+            ArtistImage::Video
+                .names()
+                .iter()
+                .map(|name| backdrops.join(name)),
+        )
+        .filter(|path| path.is_file())
+        .collect()
+}
+
 /// Take back a skip of `image`'s contents: remove the marker next to it, if
 /// any. Returns the removed marker.
 pub fn unmark(image: &Path) -> Result<Option<PathBuf>> {
@@ -290,6 +315,42 @@ mod tests {
         assert!(mark(&backdrops.join("backdrop.mp4")).is_ok());
         assert!(artist_image(&dir, ArtistImage::Video));
         assert!(mark(&dir).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn managed_in_lists_the_folders_own_images() {
+        let dir = dir("managed-in");
+        let album = dir.join("1997 - Little Playmate");
+        fs::create_dir_all(dir.join("backdrops")).unwrap();
+        fs::create_dir_all(&album).unwrap();
+        for name in [
+            "folder.jpg",
+            "logo.png",
+            "backdrop.jpg",
+            "track.flac",
+            "folder-old.jpg",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        fs::write(dir.join("backdrops/backdrop.mp4"), b"video").unwrap();
+        fs::write(album.join("cover.jpg"), b"cover").unwrap();
+        let names = |dir: &Path| {
+            managed_in(dir)
+                .iter()
+                .map(|path| path.strip_prefix(dir).unwrap().display().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&dir),
+            [
+                "folder.jpg",
+                "backdrop.jpg",
+                "logo.png",
+                "backdrops/backdrop.mp4"
+            ]
+        );
+        assert_eq!(names(&album), ["cover.jpg"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

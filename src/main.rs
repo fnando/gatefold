@@ -220,59 +220,92 @@ fn jellyfin_options<'a>(
 }
 
 /// After a restore: have Jellyfin rescan the artist, so it shows the restored
-/// file even under the same name, then push its images. Trouble is reported;
-/// the restore itself already succeeded.
-fn rescan_in_jellyfin(dir: &Path, (url, api_key): (&str, &str), state_dir: Option<&PathBuf>) {
-    let label = dir.file_name().map_or_else(
-        || dir.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let result = (|| {
-        let state_dir = resolve_state_dir(state_dir)?;
-        let state = State::new(&state_dir)
-            .with_context(|| format!("preparing state dir {}", state_dir.display()))?;
-        let session = jellyfin::Session::connect(url, api_key, cli::default_user_agent())
-            .with_context(|| format!("connecting to Jellyfin at {url}"))?;
-        let backups = state.backup_root().join("jellyfin");
-        let revisions = Revisions::new();
-        let opts = jellyfin_options(&backups, &revisions, false);
-        Ok::<_, anyhow::Error>(session.rescan_folder(dir, &opts))
-    })();
-    let lines = match result {
-        Ok(result) => jellyfin::Tally::default().record(&label, result, false),
-        Err(err) => vec![format!("✗ {label}: Jellyfin: {err:#}")],
-    };
-    for line in lines {
-        println!("  {line}");
+/// file even under the same name, then push its images (`gatefold jellyfin
+/// refresh` on that folder). Trouble is reported; the restore itself already
+/// succeeded.
+fn rescan_in_jellyfin(dir: &Path, server: (&str, &str), state_dir: Option<&PathBuf>) {
+    let print = |line: String| println!("  {line}");
+    let dirs = [dir.to_path_buf()];
+    if let Err(err) = sync_jellyfin(
+        JellyfinAction::Refresh,
+        &dirs,
+        false,
+        server,
+        state_dir,
+        print,
+    ) {
+        print(format!("✗ {}: Jellyfin: {err:#}", folder_label(dir)));
     }
 }
 
-/// `gatefold jellyfin push` / `pull`, for each artist folder under the
-/// target's dirs (a folder that isn't an artist in Jellyfin is read as a
-/// library of artist folders).
-fn jellyfin_command(action: &cli::JellyfinCommand) -> Result<()> {
-    let (cli::JellyfinCommand::Push(target) | cli::JellyfinCommand::Pull(target)) = action;
-    let pulling = matches!(action, cli::JellyfinCommand::Pull(_));
-    let (url, api_key) = target.jellyfin.server().context(
+/// `gatefold jellyfin push` / `pull` / `refresh`.
+fn jellyfin_command(command: &cli::JellyfinCommand) -> Result<()> {
+    let (action, target) = match command {
+        cli::JellyfinCommand::Push(target) => (JellyfinAction::Push, target),
+        cli::JellyfinCommand::Pull(target) => (JellyfinAction::Pull, target),
+        cli::JellyfinCommand::Refresh(target) => (JellyfinAction::Refresh, target),
+    };
+    let server = target.jellyfin.server().context(
         "set the Jellyfin server with --jellyfin-url and --jellyfin-api-key (or GATEFOLD_JELLYFIN_URL / GATEFOLD_JELLYFIN_API_KEY)",
     )?;
-    let state_dir = resolve_state_dir(target.state_dir.as_ref())?;
+    let (summary, errors) = sync_jellyfin(
+        action,
+        &target.dirs,
+        target.dry_run,
+        server,
+        target.state_dir.as_ref(),
+        |line| println!("{line}"),
+    )?;
+    println!("{summary}");
+    if errors > 0 {
+        anyhow::bail!("{errors} artist folder(s) could not be synced");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JellyfinAction {
+    Push,
+    Pull,
+    /// Rescan in Jellyfin, then push.
+    Refresh,
+}
+
+fn folder_label(folder: &Path) -> String {
+    folder.file_name().map_or_else(
+        || folder.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// Run `action` on each artist folder under `dirs` (a folder that isn't an
+/// artist in Jellyfin is read as a library of artist folders), handing each
+/// result line to `out`. Returns the summary line and the error count.
+fn sync_jellyfin(
+    action: JellyfinAction,
+    dirs: &[PathBuf],
+    dry_run: bool,
+    (url, api_key): (&str, &str),
+    state_dir: Option<&PathBuf>,
+    mut out: impl FnMut(String),
+) -> Result<(String, u64)> {
+    let state_dir = resolve_state_dir(state_dir)?;
     let state = State::new(&state_dir)
         .with_context(|| format!("preparing state dir {}", state_dir.display()))?;
     let backups = state.backup_root().join("jellyfin");
     let revisions = Revisions::new();
-    let opts = jellyfin_options(&backups, &revisions, target.dry_run);
+    let opts = jellyfin_options(&backups, &revisions, dry_run);
     let session = jellyfin::Session::connect(url, api_key, cli::default_user_agent())
         .with_context(|| format!("connecting to Jellyfin at {url}"))?;
 
     let mut push = jellyfin::Tally::default();
     let mut pull = jellyfin::PullTally::default();
-    for dir in &target.dirs {
+    for dir in dirs {
         let dir =
             std::fs::canonicalize(dir).with_context(|| format!("reading {}", dir.display()))?;
         let folders = if session.find(&dir, None).is_some() {
             vec![dir]
-        } else if pulling {
+        } else if action == JellyfinAction::Pull {
             // A folder with no images yet is just where a pull helps.
             jellyfin::subfolders(&dir)?
                 .into_iter()
@@ -282,40 +315,39 @@ fn jellyfin_command(action: &cli::JellyfinCommand) -> Result<()> {
             jellyfin::artist_folders(&dir)?
         };
         for folder in folders {
-            let label = folder.file_name().map_or_else(
-                || folder.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            if pulling {
-                if let Some(result) = session.pull_folder(&folder, None, &revisions, &opts)
-                    && let Some(line) = pull.record(&label, result, target.dry_run)
-                {
-                    println!("{line}");
+            let label = folder_label(&folder);
+            match action {
+                JellyfinAction::Pull => {
+                    if let Some(result) = session.pull_folder(&folder, None, &revisions, &opts)
+                        && let Some(line) = pull.record(&label, result, dry_run)
+                    {
+                        out(line);
+                    }
                 }
-            } else {
-                let result = session.sync_folder(&folder, None, &opts);
-                for line in push.record(&label, result, target.dry_run) {
-                    println!("{line}");
+                JellyfinAction::Push | JellyfinAction::Refresh => {
+                    let result = if action == JellyfinAction::Refresh {
+                        session.rescan_folder(&folder, &opts)
+                    } else {
+                        session.sync_folder(&folder, None, &opts)
+                    };
+                    push.record(&label, result, dry_run)
+                        .into_iter()
+                        .for_each(&mut out);
                 }
             }
         }
     }
-    let (summary, errors) = if pulling {
-        (pull.summary(target.dry_run), pull.errors)
+    Ok(if action == JellyfinAction::Pull {
+        (pull.summary(dry_run), pull.errors)
     } else {
-        (push.summary(target.dry_run), push.errors)
-    };
-    println!("{summary}");
-    if errors > 0 {
-        anyhow::bail!("{errors} artist folder(s) could not be synced");
-    }
-    Ok(())
+        (push.summary(dry_run), push.errors)
+    })
 }
 
 /// The subcommands, which work on the music folder directly (no state dir).
 fn run_command(command: &cli::Command) -> Result<()> {
     match command {
-        cli::Command::Skip { images } => skip_images(images),
+        cli::Command::Skip { images, dirs } => skip_images(images, dirs),
         cli::Command::Keep { files, dirs } => keep_paths(files, dirs),
         cli::Command::Archive { files } => archive::run(files),
         cli::Command::Optimize {
@@ -355,11 +387,25 @@ fn run_command(command: &cli::Command) -> Result<()> {
     }
 }
 
-/// `gatefold skip`: mark each image as unwanted. Every image is attempted; the
+/// `gatefold skip`: mark each image (`--file`), and every image in each folder
+/// (`--dir`), as unwanted. Every image is attempted; the
 /// command fails if any of them couldn't be marked.
-fn skip_images(images: &[PathBuf]) -> Result<()> {
+fn skip_images(images: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
     let mut failed = 0;
-    for image in images {
+    let mut all = images.to_vec();
+    for dir in dirs {
+        if !dir.is_dir() {
+            failed += 1;
+            eprintln!("✗ {} is not a folder", dir.display());
+            continue;
+        }
+        let found = skip::managed_in(dir);
+        if found.is_empty() {
+            println!("· {}: no images to skip", dir.display());
+        }
+        all.extend(found);
+    }
+    for image in &all {
         match skip::mark(image) {
             Ok(skip::Marked::Created(marker)) => println!(
                 "✓ {}: skipped ({}); replaced once a different image is available",
@@ -376,7 +422,7 @@ fn skip_images(images: &[PathBuf]) -> Result<()> {
         }
     }
     if failed > 0 {
-        anyhow::bail!("{failed} image(s) could not be skipped");
+        anyhow::bail!("{failed} path(s) could not be skipped");
     }
     Ok(())
 }
@@ -402,6 +448,9 @@ fn keep_paths(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
                 }
                 if let Some(unskipped) = kept.unskipped {
                     println!("  skip taken back (removed {})", unskipped.display());
+                }
+                for marker in kept.replaced {
+                    println!("  replaces {}", marker.display());
                 }
             }
             Err(err) => {

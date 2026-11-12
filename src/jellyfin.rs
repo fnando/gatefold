@@ -826,13 +826,19 @@ impl Session {
 
     /// Have Jellyfin rescan an artist folder (a file may have changed under
     /// the same name), then sync it; `None` when Jellyfin has no artist for it.
+    /// A dry run only reports what the sync would do.
     pub fn rescan_folder(&self, folder: &Path, opts: &Options<'_>) -> Option<Result<Synced>> {
         let artist = self.find(folder, None)?;
         let opts = Options {
             saves_locally: self.saves_locally,
             ..*opts
         };
-        Some(self.client.refresh(&artist.id).and_then(|()| {
+        let refresh = if opts.dry_run {
+            Ok(())
+        } else {
+            self.client.refresh(&artist.id)
+        };
+        Some(refresh.and_then(|()| {
             let mut synced = sync(&self.client, artist, folder, &opts)?;
             synced.rescanned = true;
             Ok(synced)

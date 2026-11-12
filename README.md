@@ -51,7 +51,7 @@ you already have.
   folder means its existing images are never replaced, even when replacing (missing ones are
   still written), and granular markers keep one kind each; `gatefold keep --file <image>` / `--dir <folder>`
   writes them for you. See [Keeping your own images](#keeping-your-own-images).
-- **Skip an image you don't want** with `gatefold skip --file <image>`. A different one replaces it
+- **Skip an image you don't want** with `gatefold skip --file <image>` (or `--dir <folder>` for all of them). A different one replaces it
   as soon as one is available, and those exact contents are never written again. See
   [Skipping an image](#skipping-an-image).
 - Optional `--verify`: each tag write is applied to a temp copy, validated with `ffprobe`,
@@ -276,7 +276,8 @@ gatefold then never replaces (or archives) those images, even with `--replace-ar
 only matters to replace runs. Lyrics are never affected.
 
 `gatefold keep` writes the markers for you: `--file <image>` writes the marker for that kind of
-image, in the folder that governs it; `--dir <folder>` writes `.gatefold-keep`.
+image, in the folder that governs it; `--dir <folder>` writes `.gatefold-keep` and removes the
+folder's granular markers, which it makes redundant.
 Keeping an image you had [skipped](#skipping-an-image) takes the skip back.
 
 ```sh
@@ -333,7 +334,12 @@ Skip it:
 
 ```sh
 gatefold skip --file "Music/Kemuri/folder.jpg" --file "Music/Kemuri/1997 - Little Playmate/cover.jpg"
+gatefold skip --dir "Music/Kemuri"   # every image in the folder
 ```
+
+`--dir` skips every image gatefold manages in that folder: `folder.*`, `backdrop.*`, `logo.*` and
+`backdrops/backdrop.*` in an artist folder, `cover.*` in an album folder. The album folders below
+an artist folder are left alone; pass them with their own `--dir`.
 
 It writes an empty `.gatefold-<sha256>-skip` marker next to each image, named after the
 image's contents, and leaves the image where it is. On later runs:
@@ -472,6 +478,9 @@ gatefold jellyfin pull --dir ~/Music
 
 # Make Jellyfin show the folders' images, with backdrop.jpg first.
 gatefold jellyfin push --dir ~/Music
+
+# Have Jellyfin rescan the folders first (a file replaced under the same name), then push.
+gatefold jellyfin refresh --dir ~/Music/Kemuri
 ```
 
 `--dir` takes an artist folder or a library of them (repeat it for several). Artists are
@@ -492,6 +501,10 @@ matched by their `MusicBrainz` id, else by folder name.
   can bring it in. Existing files are never replaced, skip markers are honoured, images are
   optimized like any download, and a second pull adds nothing. JPEG and PNG only: WebP and
   AVIF stay in Jellyfin. Jellyfin itself isn't changed; run `push` next.
+- **`refresh`** asks Jellyfin to rescan each artist folder, with no check first, then
+  pushes. `push` only rescans when one of the folder's images is missing from Jellyfin, so
+  it misses a file replaced under the same name; `refresh` doesn't. `restore` does the same
+  for the artist it restored into. With `--dry-run`, nothing is rescanned.
 
 ### Incremental runs (`--new-only`)
 

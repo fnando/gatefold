@@ -204,14 +204,20 @@ pub enum Command {
         /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
         /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Repeat for
         /// several (`--file a --file b`).
-        #[arg(long = "file", value_name = "IMAGE", required = true)]
+        #[arg(long = "file", value_name = "IMAGE", required_unless_present = "dirs")]
         images: Vec<PathBuf>,
+
+        /// Artist or album folders, to skip every image gatefold wrote in them
+        /// (album folders below an artist folder are left alone). Repeat for
+        /// several.
+        #[arg(long = "dir", value_name = "DIR")]
+        dirs: Vec<PathBuf>,
     },
     /// Never replace an image, even with `--replace-cover` /
     /// `--replace-artist-images`: writes the keep marker for its kind
     /// (`.gatefold-primary-keep`, `.gatefold-cover-keep`, …), or `.gatefold-keep`
-    /// in a folder, keeping everything it governs. A skip of the image is taken
-    /// back. Delete the marker to undo.
+    /// in a folder, keeping everything it governs (its per-image markers are
+    /// removed). A skip of the image is taken back. Delete the marker to undo.
     Keep {
         /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
         /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Repeat for
@@ -329,9 +335,14 @@ pub enum JellyfinCommand {
     /// isn't changed: run `push` next so it shows the folders' files. JPEG and
     /// PNG only; other formats stay in Jellyfin.
     Pull(JellyfinTarget),
+    /// Have Jellyfin rescan each artist folder, then `push`. The rescan is
+    /// always asked for, with no check first, so Jellyfin notices files
+    /// replaced under the same name (as after `restore`). A dry run doesn't
+    /// rescan.
+    Refresh(JellyfinTarget),
 }
 
-/// What `gatefold jellyfin push` / `pull` work on.
+/// What `gatefold jellyfin push` / `pull` / `refresh` work on.
 #[derive(Debug, Clone, clap::Args)]
 pub struct JellyfinTarget {
     /// Artist folders, or a library whose subfolders are artist folders.
@@ -484,7 +495,7 @@ mod tests {
         let run = Cli::try_parse_from(["gatefold"].iter().chain(server.iter())).unwrap();
         assert_eq!(run.jellyfin.server(), Some(("http://jf:8096", "k")));
 
-        for action in ["push", "pull"] {
+        for action in ["push", "pull", "refresh"] {
             let args = [
                 "gatefold",
                 "jellyfin",
@@ -497,8 +508,14 @@ mod tests {
             let Some(Command::Jellyfin { action: parsed }) = sub.command else {
                 panic!("expected the jellyfin subcommand");
             };
-            let (JellyfinCommand::Push(target) | JellyfinCommand::Pull(target)) = &parsed;
+            let (JellyfinCommand::Push(target)
+            | JellyfinCommand::Pull(target)
+            | JellyfinCommand::Refresh(target)) = &parsed;
             assert_eq!(matches!(parsed, JellyfinCommand::Pull(_)), action == "pull");
+            assert_eq!(
+                matches!(parsed, JellyfinCommand::Refresh(_)),
+                action == "refresh"
+            );
             assert!(target.dry_run);
             assert_eq!(target.jellyfin.server(), Some(("http://jf:8096", "k")));
         }
@@ -548,14 +565,24 @@ mod tests {
             "b/cover.jpg",
         ])
         .unwrap();
-        let Some(Command::Skip { images }) = cli.command else {
+        let Some(Command::Skip { images, dirs }) = cli.command else {
             panic!("expected the skip subcommand");
         };
         assert_eq!(
             images,
             [PathBuf::from("a/folder.jpg"), PathBuf::from("b/cover.jpg")]
         );
+        assert_eq!(dirs, Vec::<PathBuf>::new());
         assert!(Cli::try_parse_from(["gatefold", "skip"]).is_err());
+        let Some(Command::Skip { images, dirs }) =
+            Cli::try_parse_from(["gatefold", "skip", "--dir", "Kemuri", "--dir", "AFI"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected the skip subcommand");
+        };
+        assert_eq!(images, Vec::<PathBuf>::new());
+        assert_eq!(dirs, [PathBuf::from("Kemuri"), PathBuf::from("AFI")]);
         assert!(
             Cli::try_parse_from(["gatefold", "skip", "a/folder.jpg"]).is_err(),
             "no positional images"
