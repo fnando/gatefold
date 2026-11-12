@@ -4,6 +4,7 @@ mod artist;
 mod backup;
 mod cli;
 mod coverart;
+mod jellyfin;
 mod keep;
 mod lossless;
 mod lrclib;
@@ -46,11 +47,7 @@ fn main() -> Result<()> {
     if let Some(command) = &cli.command {
         return run_command(command);
     }
-    let state_dir = match &cli.state_dir {
-        Some(dir) => dir.clone(),
-        None => state::default_dir(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
-            .context("no --state-dir given and neither $XDG_DATA_HOME nor $HOME is set")?,
-    };
+    let state_dir = resolve_state_dir(cli.state_dir.as_ref())?;
     let state_dir = state_dir.as_path();
 
     if cli.verify {
@@ -145,8 +142,144 @@ fn main() -> Result<()> {
         );
     }
 
+    if !cli.cache_only
+        && cli.artist_images_enabled()
+        && let Some(server) = cli.jellyfin.server()
+    {
+        summary.jellyfin = Some(run_jellyfin_pass(
+            &cli,
+            server,
+            &state,
+            &revisions,
+            &progress,
+            &artist_jobs,
+        ));
+    }
+
     progress.section("Summary");
     summary.print(&progress, &cli);
+    Ok(())
+}
+
+/// `--state-dir`, else `$XDG_DATA_HOME/gatefold` or `~/.local/share/gatefold`.
+fn resolve_state_dir(given: Option<&PathBuf>) -> Result<PathBuf> {
+    match given {
+        Some(dir) => Ok(dir.clone()),
+        None => state::default_dir(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+            .context("no --state-dir given and neither $XDG_DATA_HOME nor $HOME is set"),
+    }
+}
+
+/// Make Jellyfin show the artist folders' images, after the artist pass wrote
+/// them. Jellyfin trouble is logged; it never fails the run.
+fn run_jellyfin_pass(
+    cli: &Cli,
+    (url, api_key): (&str, &str),
+    state: &State,
+    revisions: &Revisions,
+    progress: &Progress,
+    jobs: &BTreeMap<String, ArtistJob>,
+) -> jellyfin::Tally {
+    progress.section("Jellyfin");
+    let mut tally = jellyfin::Tally::default();
+    let session = match jellyfin::Session::connect(url, api_key, cli.user_agent()) {
+        Ok(session) => session,
+        Err(err) => {
+            tally.errors += 1;
+            progress.info(format!("✗ Jellyfin at {url}: {err:#}"));
+            return tally;
+        }
+    };
+    let backups = state.backup_root().join("jellyfin");
+    let opts = jellyfin_options(&backups, revisions, false);
+    for job in jobs.values() {
+        for folder in &job.folders {
+            let result = session.sync_folder(folder, Some(&job.mbid), &opts);
+            for line in tally.record(&job.name, result, false) {
+                progress.info(line);
+            }
+        }
+    }
+    tally
+}
+
+fn jellyfin_options<'a>(
+    backups: &'a Path,
+    revisions: &Revisions,
+    dry_run: bool,
+) -> jellyfin::Options<'a> {
+    jellyfin::Options {
+        dry_run,
+        backups,
+        stamp: revisions.stamp(),
+        saves_locally: false,
+        poll: Duration::from_secs(1),
+        polls: 15,
+    }
+}
+
+/// `gatefold jellyfin push` / `pull`, for each artist folder under the
+/// target's dirs (a folder that isn't an artist in Jellyfin is read as a
+/// library of artist folders).
+fn jellyfin_command(action: &cli::JellyfinCommand) -> Result<()> {
+    let (cli::JellyfinCommand::Push(target) | cli::JellyfinCommand::Pull(target)) = action;
+    let pulling = matches!(action, cli::JellyfinCommand::Pull(_));
+    let (url, api_key) = target.jellyfin.server().context(
+        "set the Jellyfin server with --jellyfin-url and --jellyfin-api-key (or GATEFOLD_JELLYFIN_URL / GATEFOLD_JELLYFIN_API_KEY)",
+    )?;
+    let state_dir = resolve_state_dir(target.state_dir.as_ref())?;
+    let state = State::new(&state_dir)
+        .with_context(|| format!("preparing state dir {}", state_dir.display()))?;
+    let backups = state.backup_root().join("jellyfin");
+    let revisions = Revisions::new();
+    let opts = jellyfin_options(&backups, &revisions, target.dry_run);
+    let session = jellyfin::Session::connect(url, api_key, cli::default_user_agent())
+        .with_context(|| format!("connecting to Jellyfin at {url}"))?;
+
+    let mut push = jellyfin::Tally::default();
+    let mut pull = jellyfin::PullTally::default();
+    for dir in &target.dirs {
+        let dir =
+            std::fs::canonicalize(dir).with_context(|| format!("reading {}", dir.display()))?;
+        let folders = if session.find(&dir, None).is_some() {
+            vec![dir]
+        } else if pulling {
+            // A folder with no images yet is just where a pull helps.
+            jellyfin::subfolders(&dir)?
+                .into_iter()
+                .filter(|folder| session.find(folder, None).is_some())
+                .collect()
+        } else {
+            jellyfin::artist_folders(&dir)?
+        };
+        for folder in folders {
+            let label = folder.file_name().map_or_else(
+                || folder.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            if pulling {
+                if let Some(result) = session.pull_folder(&folder, None, &revisions, &opts)
+                    && let Some(line) = pull.record(&label, result, target.dry_run)
+                {
+                    println!("{line}");
+                }
+            } else {
+                let result = session.sync_folder(&folder, None, &opts);
+                for line in push.record(&label, result, target.dry_run) {
+                    println!("{line}");
+                }
+            }
+        }
+    }
+    let (summary, errors) = if pulling {
+        (pull.summary(target.dry_run), pull.errors)
+    } else {
+        (push.summary(target.dry_run), push.errors)
+    };
+    println!("{summary}");
+    if errors > 0 {
+        anyhow::bail!("{errors} artist folder(s) could not be synced");
+    }
     Ok(())
 }
 
@@ -167,6 +300,7 @@ fn run_command(command: &cli::Command) -> Result<()> {
                 verify: *verify,
             },
         ),
+        cli::Command::Jellyfin { action } => jellyfin_command(action),
         cli::Command::Restore { dir, file, keep } => {
             let target = match (dir, file) {
                 (Some(dir), _) => restore::Target::Dir(dir),
@@ -1953,6 +2087,8 @@ struct Summary {
     artist_no_image: u64,
     artist_cache_only: u64,
     artist_errors: u64,
+    // jellyfin
+    jellyfin: Option<jellyfin::Tally>,
 }
 
 impl Summary {
@@ -2052,6 +2188,10 @@ impl Summary {
         }
         if cli.artist_images_enabled() {
             self.print_artist(progress, cache_only);
+        }
+        if let Some(tally) = &self.jellyfin {
+            progress.info("jellyfin:");
+            progress.info(format!("  {}", tally.summary(false)));
         }
     }
 

@@ -41,7 +41,8 @@ pub struct Cli {
     pub app_id: Option<String>,
 
     /// Load `GATEFOLD_LRCLIB_API_KEY` / `GATEFOLD_LRCLIB_APP_ID` / `GATEFOLD_USER_AGENT` /
-    /// `GATEFOLD_MUSICBRAINZ_URL` from a `KEY=VALUE` env file, keeping secrets out of
+    /// `GATEFOLD_MUSICBRAINZ_URL` / `GATEFOLD_JELLYFIN_URL` / `GATEFOLD_JELLYFIN_API_KEY`
+    /// from a `KEY=VALUE` env file, keeping secrets out of
     /// the process args (and `ps`). Flags and real environment variables override the
     /// file. Exits with an error if the file can't be read.
     #[arg(long, value_name = "FILE")]
@@ -153,6 +154,40 @@ pub struct Cli {
     /// with ffmpeg); still images only.
     #[arg(long)]
     pub skip_artist_videos: bool,
+
+    #[command(flatten)]
+    pub jellyfin: JellyfinArgs,
+}
+
+/// The Jellyfin server whose artist images are kept in line with the artist
+/// folders. Both are needed; without them nothing talks to Jellyfin.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct JellyfinArgs {
+    /// Jellyfin server URL (e.g. `http://192.168.1.10:8096`). After the artist
+    /// pass, Jellyfin is made to show each artist folder's `folder.jpg`,
+    /// `logo.png` and `backdrop.jpg`, with that backdrop first.
+    #[arg(long, value_name = "URL", env = "GATEFOLD_JELLYFIN_URL")]
+    pub jellyfin_url: Option<String>,
+
+    /// Jellyfin API key (Dashboard → API Keys). Prefer --env-file: a flag value
+    /// is visible in `ps`.
+    #[arg(
+        long,
+        value_name = "KEY",
+        env = "GATEFOLD_JELLYFIN_API_KEY",
+        hide_env_values = true
+    )]
+    pub jellyfin_api_key: Option<String>,
+}
+
+impl JellyfinArgs {
+    /// The URL and key, when both are set.
+    pub fn server(&self) -> Option<(&str, &str)> {
+        Some((
+            self.jellyfin_url.as_deref().filter(|u| !u.is_empty())?,
+            self.jellyfin_api_key.as_deref().filter(|k| !k.is_empty())?,
+        ))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -218,6 +253,13 @@ pub enum Command {
         #[arg(long)]
         verify: bool,
     },
+    /// Keep Jellyfin's artist images and the artist folders in line: `push`
+    /// makes Jellyfin show the folders' images, `pull` brings the images only
+    /// Jellyfin has into the folders.
+    Jellyfin {
+        #[command(subcommand)]
+        action: JellyfinCommand,
+    },
     /// Bring back an artist file from an artist folder's `.gatefold-archive/`.
     /// The file it replaces is skipped (see `skip`) and archived.
     Restore {
@@ -241,6 +283,52 @@ pub enum Command {
         #[arg(long)]
         keep: bool,
     },
+}
+
+/// `gatefold jellyfin` actions.
+#[derive(Debug, Subcommand)]
+pub enum JellyfinCommand {
+    /// Make Jellyfin show each artist folder's own images: `folder.*` as its
+    /// photo, `logo.*` as its logo, and `backdrop.*` as its first backdrop.
+    /// Older backdrops Jellyfin stored itself are kept, after ours (they're
+    /// deleted and uploaded again, as Jellyfin has no safe way to reorder).
+    /// Photos and logos Jellyfin stored itself are replaced by the folder's.
+    /// Anything deleted is saved first under the state dir's
+    /// `backup/jellyfin/`. Nothing in the artist folders is changed. A run
+    /// with the Jellyfin server set does this after its artist pass.
+    Push(JellyfinTarget),
+    /// Copy the artist images only Jellyfin has (from its metadata providers
+    /// or uploads) into the artist folders: written when the folder has none
+    /// of that kind, otherwise archived, dated, in `.gatefold-archive/` for
+    /// `gatefold restore`. Existing files are never replaced, and Jellyfin
+    /// isn't changed: run `push` next so it shows the folders' files. JPEG and
+    /// PNG only; other formats stay in Jellyfin.
+    Pull(JellyfinTarget),
+}
+
+/// What `gatefold jellyfin push` / `pull` work on.
+#[derive(Debug, Clone, clap::Args)]
+pub struct JellyfinTarget {
+    /// Artist folders, or a library whose subfolders are artist folders.
+    /// Repeat for several.
+    #[arg(long = "dir", value_name = "DIR", required = true)]
+    pub dirs: Vec<PathBuf>,
+
+    /// Report what would change without changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Base directory for gatefold's state (see the main command).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+
+    /// Load `GATEFOLD_JELLYFIN_URL` / `GATEFOLD_JELLYFIN_API_KEY` from a
+    /// `KEY=VALUE` env file (see the main command).
+    #[arg(long, value_name = "FILE")]
+    pub env_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub jellyfin: JellyfinArgs,
 }
 
 /// `30d`, `12h`, `90m`, `45s`, `2w`: a whole number plus a unit.
@@ -287,15 +375,18 @@ pub fn format_duration(duration: Duration) -> String {
     format!("{secs}s")
 }
 
+/// The `User-Agent` gatefold sends unless told otherwise.
+pub fn default_user_agent() -> String {
+    format!(
+        "gatefold/{} (https://github.com/fnando/gatefold)",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 impl Cli {
     /// Resolve the `User-Agent`, falling back to a descriptive default.
     pub fn user_agent(&self) -> String {
-        self.user_agent.clone().unwrap_or_else(|| {
-            format!(
-                "gatefold/{} (https://github.com/fnando/gatefold)",
-                env!("CARGO_PKG_VERSION")
-            )
-        })
+        self.user_agent.clone().unwrap_or_else(default_user_agent)
     }
 
     pub fn lyrics_enabled(&self) -> bool {
@@ -355,6 +446,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cli.artist_refresh_after, Some(Duration::from_hours(720)));
+    }
+
+    #[test]
+    fn jellyfin_server_is_set_on_the_run_and_the_subcommands() {
+        let server = [
+            "--jellyfin-url",
+            "http://jf:8096",
+            "--jellyfin-api-key",
+            "k",
+        ];
+        let run = Cli::try_parse_from(["gatefold"].iter().chain(server.iter())).unwrap();
+        assert_eq!(run.jellyfin.server(), Some(("http://jf:8096", "k")));
+
+        for action in ["push", "pull"] {
+            let args = [
+                "gatefold",
+                "jellyfin",
+                action,
+                "--dir",
+                "/music",
+                "--dry-run",
+            ];
+            let sub = Cli::try_parse_from(args.iter().chain(server.iter())).unwrap();
+            let Some(Command::Jellyfin { action: parsed }) = sub.command else {
+                panic!("expected the jellyfin subcommand");
+            };
+            let (JellyfinCommand::Push(target) | JellyfinCommand::Pull(target)) = &parsed;
+            assert_eq!(matches!(parsed, JellyfinCommand::Pull(_)), action == "pull");
+            assert!(target.dry_run);
+            assert_eq!(target.jellyfin.server(), Some(("http://jf:8096", "k")));
+        }
+        assert_eq!(JellyfinArgs::default().server(), None);
     }
 
     #[test]

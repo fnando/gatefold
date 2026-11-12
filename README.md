@@ -60,6 +60,9 @@ you already have.
 - On-disk cache of API responses, downloaded art, and extracted tags, so re-runs avoid the
   network and re-parsing. "Not found" results are also recorded, and `--new-only` uses them to
   skip anything already looked up — so an incremental pass only touches brand-new files.
+- **Jellyfin, both ways**: `gatefold jellyfin push` makes Jellyfin show the artist folders'
+  images (with `backdrop.jpg` first), and `gatefold jellyfin pull` brings the images only
+  Jellyfin has into the folders. See [Jellyfin](#jellyfin).
 - `--cache-only` mode that populates the cache without touching any music file.
 - Respects service rate limits: sequential requests with a configurable delay, and
   automatic `Retry-After` back-off (with jitter) on `429`/`503`, shown with a live
@@ -85,7 +88,7 @@ gatefold [--dir <DIR>] [OPTIONS]
 | `--state-dir <DIR>` | Use a different directory for the cached lyrics (`lrc/`), images (`art/`), artist lookups (`artist/`), metadata (`metadata/`), and tag backups (`backup/`). Defaults to `$XDG_DATA_HOME/gatefold`, or `~/.local/share/gatefold` when `$XDG_DATA_HOME` is unset. |
 | `--api-key <KEY>` | Secret `Lrclib-Api-Key` header (server-side model). Pair with `--app-id`. Prefer `--env-file` on shared hosts — a flag value shows up in `ps`. (env: `GATEFOLD_LRCLIB_API_KEY`) |
 | `--app-id <ID>` | `Lrclib-App-Id` header. Required alongside `--api-key` to unlock the higher rate-limit tier. (env: `GATEFOLD_LRCLIB_APP_ID`) |
-| `--env-file <FILE>` | Load `GATEFOLD_LRCLIB_API_KEY` / `GATEFOLD_LRCLIB_APP_ID` / `GATEFOLD_USER_AGENT` / `GATEFOLD_MUSICBRAINZ_URL` from a `KEY=VALUE` env file instead of passing them as flags. Flags and real environment variables override the file; a read failure exits with an error. |
+| `--env-file <FILE>` | Load `GATEFOLD_LRCLIB_API_KEY` / `GATEFOLD_LRCLIB_APP_ID` / `GATEFOLD_USER_AGENT` / `GATEFOLD_MUSICBRAINZ_URL` / `GATEFOLD_JELLYFIN_URL` / `GATEFOLD_JELLYFIN_API_KEY` from a `KEY=VALUE` env file instead of passing them as flags. Flags and real environment variables override the file; a read failure exits with an error. |
 | `--user-agent <UA>` | Override the `User-Agent` sent to lrclib.net, the Cover Art Archive, `MusicBrainz`, and Wikidata. (env: `GATEFOLD_USER_AGENT`) |
 | `--musicbrainz-url <URL>` | Base URL of the `MusicBrainz` web service (default `https://musicbrainz.org`). Point it at a local mirror to skip the public server's 1 request/second floor, which gatefold applies only to `musicbrainz.org`. (env: `GATEFOLD_MUSICBRAINZ_URL`) |
 | `--delay-ms <MS>` | Delay between API requests in milliseconds (default `300`; docs recommend 200–500). |
@@ -104,6 +107,8 @@ gatefold [--dir <DIR>] [OPTIONS]
 | `--artist-images-only` | Process artist images only; skip lyrics and cover art. Only needs each album folder's album artist, so it reads the tags of up to 3 tracks per folder (first, middle, last) and goes with the `MusicBrainz` album artist most of them carry. |
 | `--skip-artist-images` | Skip the artist-images pass. `--lyrics-only` / `--cover-only` imply it. |
 | `--skip-artist-videos` | Don't download motion backdrops (`backdrops/backdrop.mp4`); still images only. |
+| `--jellyfin-url <URL>` | Jellyfin server to keep in line with the artist folders after the artist pass (see [Jellyfin](#jellyfin)). (env: `GATEFOLD_JELLYFIN_URL`) |
+| `--jellyfin-api-key <KEY>` | Jellyfin API key (Dashboard → API Keys). Prefer `--env-file`. (env: `GATEFOLD_JELLYFIN_API_KEY`) |
 
 ### Examples
 
@@ -444,6 +449,42 @@ the previous files are archived (artist images) or backed up (covers) as on any 
 Cached images from before this existed are optimized the next time they're used. Files that
 gatefold wrote before then still count as the same image, so `--replace-*` runs don't
 rewrite them just because they weren't optimized.
+
+### Jellyfin
+
+Jellyfin picks up `folder.jpg`, `logo.png` and `backdrop.jpg` from the artist folders, but
+it keeps the images it already had first: a backdrop it got from a metadata provider (or an
+upload) stays ahead of the folder's `backdrop.jpg`. With the server set
+(`GATEFOLD_JELLYFIN_URL` and `GATEFOLD_JELLYFIN_API_KEY`, or `--jellyfin-url` /
+`--jellyfin-api-key`), gatefold talks to Jellyfin's API in both directions:
+
+```sh
+# Bring the images only Jellyfin has into the artist folders.
+gatefold jellyfin pull --dir ~/Music --dry-run
+gatefold jellyfin pull --dir ~/Music
+
+# Make Jellyfin show the folders' images, with backdrop.jpg first.
+gatefold jellyfin push --dir ~/Music
+```
+
+`--dir` takes an artist folder or a library of them (repeat it for several). Artists are
+matched by their `MusicBrainz` id, else by folder name.
+
+- **`push`** makes `folder.*` Jellyfin's photo, `logo.*` its logo, and `backdrop.*` its
+  first backdrop. Jellyfin's own older backdrops are kept, after ours: its reorder call swaps
+  the image *files* (it would overwrite `backdrop.jpg`), so they're deleted and uploaded
+  again instead, which appends them. A photo or logo Jellyfin stored itself is deleted so it
+  shows the folder's. Everything deleted is saved first under the state dir's
+  `backup/jellyfin/<item id>/`, and nothing in the artist folders is ever changed or
+  deleted. When the library saves artwork into media folders, uploads would land in the
+  artist folders, so backdrops are left as they are. A normal run with the server set pushes
+  every artist after its artist pass.
+- **`pull`** copies the images only Jellyfin has (not its copies of the folders' own files)
+  into the artist folders. Each is written when the folder has no file of its kind, and
+  archived, dated, in `.gatefold-archive/` otherwise, so [`restore`](#restoring-an-archived-image)
+  can bring it in. Existing files are never replaced, skip markers are honoured, images are
+  optimized like any download, and a second pull adds nothing. JPEG and PNG only: WebP and
+  AVIF stay in Jellyfin. Jellyfin itself isn't changed; run `push` next.
 
 ### Incremental runs (`--new-only`)
 
