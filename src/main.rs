@@ -1141,10 +1141,13 @@ enum ArtistOutcome {
     Fresh,
     SkippedNothingToDo,
     SkippedByFilter,
-    /// Nothing to write, and only because the artist has no Apple Music link
-    /// (on `MusicBrainz` or Wikidata): Spotify provides just an avatar, which is
-    /// already present (or never overwrites one).
-    SpotifyOnly,
+    /// Nothing to write, and only because Apple Music had nothing for the artist —
+    /// no link (on `MusicBrainz` or Wikidata), or a link whose page has no artist
+    /// photo: Spotify provides just an avatar, which is already present (or never
+    /// overwrites one).
+    SpotifyOnly {
+        apple_link: bool,
+    },
     NoLinks,
     NoImage,
     /// `--replace-artist-images`, but the images are the ones already written.
@@ -1162,6 +1165,9 @@ enum ArtistOutcome {
         reused: bool,
         /// Where replaced files were moved, relative to the artist folder.
         kept: Vec<String>,
+        /// The artist has an Apple Music link (so a Spotify source means its
+        /// page had no artist photo).
+        apple_link: bool,
     },
 }
 
@@ -1186,10 +1192,11 @@ fn process_artist(
     let now = revisions.stamp();
     let mode = replace_mode(cli, job, record.as_ref(), now);
     let replacing = mode == ReplaceMode::Replace;
+    let look_again = replacing || retry_apple(state, mode, record.as_ref(), mbid)?;
 
-    // Every folder already complete and not replacing: nothing to do, and no
-    // reason to touch the network.
-    if !replacing && !cli.cache_only && folders_complete(job, record.as_ref(), services.videos) {
+    // Every folder already complete and not replacing (or retrying Apple):
+    // nothing to do, and no reason to touch the network.
+    if !look_again && !cli.cache_only && folders_complete(job, record.as_ref(), services.videos) {
         return Ok(complete_outcome(mode, record.as_ref()));
     }
 
@@ -1207,7 +1214,7 @@ fn process_artist(
 
     // 2. Image URLs, from the artist's page. A replace run always re-resolves so
     //    a changed photo (which changes the URL) is noticed.
-    let reuse = record.as_ref().filter(|_| !replacing && !rechecking);
+    let reuse = record.as_ref().filter(|_| !look_again && !rechecking);
     let (resolved, reused): (Resolved, bool) = if let Some(record) = reuse {
         (record.resolved(), true)
     } else if let Some(resolved) = resolver.resolve(&links, progress)? {
@@ -1241,13 +1248,8 @@ fn process_artist(
         None => ArtistRecord::new(mbid, &job.name, &resolved, now),
     };
     let record_changed = record.is_none() || !reused;
-    let nothing_to_do = if resolved.source == Source::Spotify {
-        ArtistOutcome::SpotifyOnly
-    } else if replacing {
-        ArtistOutcome::Unchanged
-    } else {
-        ArtistOutcome::SkippedNothingToDo
-    };
+    let apple_link = links.apple_id.is_some();
+    let nothing_to_do = nothing_to_do(resolved.source, replacing, apple_link);
 
     let want_video = services.videos && resolved.video_url.is_some();
     let needs_write = cli.cache_only || missing_files(job, &resolved, replace, want_video);
@@ -1296,6 +1298,7 @@ fn process_artist(
             source: resolved.source,
             reused,
             kept: written.kept,
+            apple_link,
         })
     } else {
         if record_changed {
@@ -1305,14 +1308,27 @@ fn process_artist(
     }
 }
 
+/// What an artist that needed no writes amounts to.
+fn nothing_to_do(source: Source, replacing: bool, apple_link: bool) -> ArtistOutcome {
+    if source == Source::Spotify {
+        ArtistOutcome::SpotifyOnly { apple_link }
+    } else if replacing {
+        ArtistOutcome::Unchanged
+    } else {
+        ArtistOutcome::SkippedNothingToDo
+    }
+}
+
 /// What an artist whose folders already have every image amounts to.
 fn complete_outcome(mode: ReplaceMode, record: Option<&ArtistRecord>) -> ArtistOutcome {
     match mode {
         ReplaceMode::Kept => ArtistOutcome::Kept,
         ReplaceMode::Fresh => ArtistOutcome::Fresh,
         ReplaceMode::Plain | ReplaceMode::Replace => {
+            // Never a Spotify record with a cached Apple link: that one is
+            // retried instead (see [`retry_apple`]).
             if record.is_some_and(|r| r.source == Source::Spotify) {
-                ArtistOutcome::SpotifyOnly
+                ArtistOutcome::SpotifyOnly { apple_link: false }
             } else {
                 ArtistOutcome::SkippedNothingToDo
             }
@@ -1417,6 +1433,37 @@ fn folders_complete(job: &ArtistJob, record: Option<&ArtistRecord>, videos: bool
             && (!has_video_source || has(ArtistImage::Video))
             && (!has_logo_source || has(ArtistImage::Logo))
     })
+}
+
+/// A Spotify record for an artist with an Apple Music link means Apple's page
+/// gave no photo last time (a hiccup, or an older gatefold rejecting it), so a
+/// plain run looks again rather than settle for Spotify's avatar for good.
+fn retry_apple(
+    state: &State,
+    mode: ReplaceMode,
+    record: Option<&ArtistRecord>,
+    mbid: &str,
+) -> Result<bool> {
+    Ok(mode == ReplaceMode::Plain
+        && record.is_some_and(|r| r.source == Source::Spotify)
+        && cached_apple_link(state, mbid)?)
+}
+
+/// Whether the artist is already known (from cache alone, no network) to have an
+/// Apple Music link: pinned with --apple-url, or on its cached `MusicBrainz` or
+/// Wikidata lookup.
+fn cached_apple_link(state: &State, mbid: &str) -> Result<bool> {
+    if state.load_apple_pin(mbid)?.is_some() {
+        return Ok(true);
+    }
+    if let Some(lookup) = state.load_musicbrainz_artist(mbid)?
+        && musicbrainz::links_from(&lookup).apple_id.is_some()
+    {
+        return Ok(true);
+    }
+    Ok(state
+        .load_wikidata_artist(mbid)?
+        .is_some_and(|result| wikidata::links_from(&result).apple_id.is_some()))
 }
 
 /// The artist's streaming links from its `MusicBrainz` lookup, topped up from
@@ -1769,8 +1816,9 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
         )),
         ArtistOutcome::Kept => progress.info(format!("· {name}: artist images kept")),
         ArtistOutcome::Fresh => progress.info(format!("· {name}: artist page checked recently")),
-        ArtistOutcome::SpotifyOnly => progress.info(format!(
-            "· {name}: {NO_APPLE_LINK}; Spotify only has an avatar, and {} is already there (set one with --apple-url)",
+        ArtistOutcome::SpotifyOnly { apple_link } => progress.info(format!(
+            "· {name}: {}; Spotify only has an avatar, and {} is already there (set one with --apple-url)",
+            no_apple_photo(*apple_link),
             ArtistImage::Avatar.label("jpg")
         )),
         ArtistOutcome::NoLinks => {
@@ -1794,6 +1842,7 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             source,
             reused,
             kept,
+            apple_link,
         } => {
             let mut parts = Vec::new();
             for (kind, ext, write) in [
@@ -1816,7 +1865,7 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
                 format!(", previous in {}", kept.join(", "))
             };
             let why = if *source == Source::Spotify {
-                format!("; {NO_APPLE_LINK}, so no backdrop or logo")
+                format!("; {}, so no backdrop or logo", no_apple_photo(*apple_link))
             } else {
                 String::new()
             };
@@ -1826,7 +1875,13 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
 }
 
 /// Why a Spotify-sourced artist gets an avatar and nothing else.
-const NO_APPLE_LINK: &str = "no Apple Music link on MusicBrainz or Wikidata";
+fn no_apple_photo(apple_link: bool) -> &'static str {
+    if apple_link {
+        "no artist photo on its Apple Music page"
+    } else {
+        "no Apple Music link on MusicBrainz or Wikidata"
+    }
+}
 
 /// Aggregate counts printed at the end of the run.
 #[derive(Default)]
@@ -1928,7 +1983,7 @@ impl Summary {
             ArtistOutcome::NoFolder => self.artist_no_folder += 1,
             ArtistOutcome::Kept => self.artist_kept += 1,
             ArtistOutcome::Fresh => self.artist_fresh += 1,
-            ArtistOutcome::SpotifyOnly => self.artist_spotify_only += 1,
+            ArtistOutcome::SpotifyOnly { .. } => self.artist_spotify_only += 1,
             ArtistOutcome::NoLinks => self.artist_no_links += 1,
             ArtistOutcome::NoImage => self.artist_no_image += 1,
             ArtistOutcome::Unchanged => self.artist_unchanged += 1,

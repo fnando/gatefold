@@ -318,9 +318,7 @@ pub fn apple_artwork(html: &str) -> Option<AppleArtwork> {
     if let Some(json) = serialized_server_data(html)
         && let Ok(value) = serde_json::from_str::<Value>(json)
         && let Some(header) = object_with_key(&value, "circleArtwork")
-        && let Some(avatar) = artwork_base(header.get("circleArtwork"))
-        // Belt and braces: the page names its own album-cover stand-in.
-        && artwork_base(header.get("fallbackArtwork")).as_deref() != Some(&avatar)
+        && let Some(avatar) = artist_photo(header)
     {
         let video = header
             .get("wideVideoArtwork")
@@ -353,15 +351,32 @@ pub fn apple_artwork(html: &str) -> Option<AppleArtwork> {
     })
 }
 
+/// The asset base of the header's artist photo. When the page names its own
+/// album-cover stand-in (`fallbackArtwork`), anything else in `circleArtwork` is
+/// the photo, wherever it's stored: label-supplied press shots (`pr_source.png`)
+/// live under the catalogue's `Music123/` paths too. Without that key, only the
+/// path can tell a photo from a cover.
+fn artist_photo(header: &Map<String, Value>) -> Option<String> {
+    let circle = raw_artwork_base(header.get("circleArtwork"))?;
+    match raw_artwork_base(header.get("fallbackArtwork")) {
+        Some(fallback) => (circle != fallback).then_some(circle),
+        None => is_artist_asset(&circle).then_some(circle),
+    }
+}
+
 /// The asset base of an Apple artwork object (`{ "dictionary": { "url": "…/{w}x{h}{c}.{f}" } }`),
 /// or `None` when absent or not an artist photo.
 fn artwork_base(artwork: Option<&Value>) -> Option<String> {
+    raw_artwork_base(artwork).filter(|base| is_artist_asset(base))
+}
+
+/// The asset base of an Apple artwork object, whatever its path.
+fn raw_artwork_base(artwork: Option<&Value>) -> Option<String> {
     let url = artwork?
         .get("dictionary")
         .and_then(|d| d.get("url"))
         .and_then(Value::as_str)?;
-    let base = asset_base(url)?;
-    is_artist_asset(&base).then_some(base)
+    asset_base(url)
 }
 
 /// True unless `base` is catalogue art (`…/image/thumb/Music123/…`).
@@ -512,6 +527,18 @@ mod tests {
             Some(features.to_string())
         );
 
+        // Label press photos (`pr_source.png`) share the catalogue's `Music…`
+        // paths; next to a named fallback they're still the artist (Paramore).
+        let press = "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/3f/96/79/x/pr_source.png";
+        let json = format!(
+            r#"{{"items":[{{"circleArtwork":{{"dictionary":{{"url":"{press}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"fallbackArtwork":{{"dictionary":{{"url":"{cover}/{{w}}x{{h}}{{c}}.{{f}}"}}}}}}]}}"#
+        );
+        let html = format!(r#"<script id="serialized-server-data">{json}</script>"#);
+        assert_eq!(
+            apple_artwork(&html).map(|a| a.avatar),
+            Some(press.to_string())
+        );
+
         // Whatever the path, the page's own fallback is never the artist.
         let odd = "https://is1-ssl.mzstatic.com/image/thumb/Other1/v4/aa/x.jpg";
         let json = format!(
@@ -590,6 +617,9 @@ mod tests {
         assert!(logo_url.ends_with(LOGO_RENDITION), "{logo_url}");
         let logo = resolver.fetch_image(&logo_url, &NoWait).unwrap().unwrap();
         assert_eq!(logo.mime, "image/png");
+        // Paramore's photo is a label press shot under a catalogue `Music…` path.
+        let paramore = resolver.apple("75950796", &NoWait).unwrap();
+        assert_eq!(paramore.map(|p| p.source), Some(Source::Apple));
         let spotify = resolver
             .spotify("4Z8W4fKeB5YxbusRsdQVPb", &NoWait)
             .unwrap()
