@@ -143,6 +143,7 @@ fn main() -> Result<()> {
     }
 
     if !cli.cache_only
+        && !cli.skip_jellyfin
         && cli.artist_images_enabled()
         && let Some(server) = cli.jellyfin.server()
     {
@@ -215,6 +216,34 @@ fn jellyfin_options<'a>(
         saves_locally: false,
         poll: Duration::from_secs(1),
         polls: 15,
+    }
+}
+
+/// After a restore: have Jellyfin rescan the artist, so it shows the restored
+/// file even under the same name, then push its images. Trouble is reported;
+/// the restore itself already succeeded.
+fn rescan_in_jellyfin(dir: &Path, (url, api_key): (&str, &str), state_dir: Option<&PathBuf>) {
+    let label = dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let result = (|| {
+        let state_dir = resolve_state_dir(state_dir)?;
+        let state = State::new(&state_dir)
+            .with_context(|| format!("preparing state dir {}", state_dir.display()))?;
+        let session = jellyfin::Session::connect(url, api_key, cli::default_user_agent())
+            .with_context(|| format!("connecting to Jellyfin at {url}"))?;
+        let backups = state.backup_root().join("jellyfin");
+        let revisions = Revisions::new();
+        let opts = jellyfin_options(&backups, &revisions, false);
+        Ok::<_, anyhow::Error>(session.rescan_folder(dir, &opts))
+    })();
+    let lines = match result {
+        Ok(result) => jellyfin::Tally::default().record(&label, result, false),
+        Err(err) => vec![format!("✗ {label}: Jellyfin: {err:#}")],
+    };
+    for line in lines {
+        println!("  {line}");
     }
 }
 
@@ -301,13 +330,27 @@ fn run_command(command: &cli::Command) -> Result<()> {
             },
         ),
         cli::Command::Jellyfin { action } => jellyfin_command(action),
-        cli::Command::Restore { dir, file, keep } => {
+        cli::Command::Restore {
+            dir,
+            file,
+            keep,
+            state_dir,
+            env_file: _,
+            jellyfin,
+            skip_jellyfin,
+        } => {
             let target = match (dir, file) {
                 (Some(dir), _) => restore::Target::Dir(dir),
                 (None, Some(file)) => restore::Target::File(file),
                 (None, None) => unreachable!("clap requires --dir or --file"),
             };
-            restore::run(&target, *keep)
+            if let Some(dir) = restore::run(&target, *keep)?
+                && !skip_jellyfin
+                && let Some(server) = jellyfin.server()
+            {
+                rescan_in_jellyfin(&dir, server, state_dir.as_ref());
+            }
+            Ok(())
         }
     }
 }

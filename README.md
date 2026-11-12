@@ -109,6 +109,7 @@ gatefold [--dir <DIR>] [OPTIONS]
 | `--skip-artist-videos` | Don't download motion backdrops (`backdrops/backdrop.mp4`); still images only. |
 | `--jellyfin-url <URL>` | Jellyfin server to keep in line with the artist folders after the artist pass (see [Jellyfin](#jellyfin)). (env: `GATEFOLD_JELLYFIN_URL`) |
 | `--jellyfin-api-key <KEY>` | Jellyfin API key (Dashboard → API Keys). Prefer `--env-file`. (env: `GATEFOLD_JELLYFIN_API_KEY`) |
+| `--skip-jellyfin` | Don't talk to Jellyfin after the artist pass, even with the server set. |
 
 ### Examples
 
@@ -397,6 +398,12 @@ write it back. If the restored image had been skipped, its marker is removed. A
 upstream; pass `--keep` to also write its [keep marker](#keeping-your-own-images)
 (`.gatefold-primary-keep` for an avatar, and so on), so it stays.
 
+With the [Jellyfin](#jellyfin) server set (`GATEFOLD_JELLYFIN_URL` /
+`GATEFOLD_JELLYFIN_API_KEY`, or `--env-file`), the artist is then rescanned in Jellyfin and its
+images pushed, so Jellyfin shows the restored file right away even though its name didn't
+change. If Jellyfin can't be reached, that's reported and the restore still stands. Pass
+`--skip-jellyfin` to leave Jellyfin alone.
+
 ### Optimizing images
 
 Every image gatefold downloads (covers, artist images, logos) is optimized losslessly before
@@ -478,7 +485,7 @@ matched by their `MusicBrainz` id, else by folder name.
   `backup/jellyfin/<item id>/`, and nothing in the artist folders is ever changed or
   deleted. When the library saves artwork into media folders, uploads would land in the
   artist folders, so backdrops are left as they are. A normal run with the server set pushes
-  every artist after its artist pass.
+  every artist after its artist pass, unless given `--skip-jellyfin`.
 - **`pull`** copies the images only Jellyfin has (not its copies of the folders' own files)
   into the artist folders. Each is written when the folder has no file of its kind, and
   archived, dated, in `.gatefold-archive/` otherwise, so [`restore`](#restoring-an-archived-image)

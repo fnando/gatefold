@@ -157,6 +157,10 @@ pub struct Cli {
 
     #[command(flatten)]
     pub jellyfin: JellyfinArgs,
+
+    /// Don't talk to Jellyfin after the artist pass, even with the server set.
+    #[arg(long)]
+    pub skip_jellyfin: bool,
 }
 
 /// The Jellyfin server whose artist images are kept in line with the artist
@@ -261,7 +265,8 @@ pub enum Command {
         action: JellyfinCommand,
     },
     /// Bring back an artist file from an artist folder's `.gatefold-archive/`.
-    /// The file it replaces is skipped (see `skip`) and archived.
+    /// The file it replaces is skipped (see `skip`) and archived. With the
+    /// Jellyfin server set, Jellyfin is told to show it.
     Restore {
         /// Artist folder: list what's in its `.gatefold-archive/` and ask which
         /// one to restore.
@@ -282,6 +287,26 @@ pub enum Command {
         /// never replaces it.
         #[arg(long)]
         keep: bool,
+
+        /// Base directory for gatefold's state (see the main command), where
+        /// Jellyfin backups go.
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+
+        /// Load `GATEFOLD_JELLYFIN_URL` / `GATEFOLD_JELLYFIN_API_KEY` from a
+        /// `KEY=VALUE` env file (see the main command).
+        #[arg(long, value_name = "FILE")]
+        env_file: Option<PathBuf>,
+
+        /// With the Jellyfin server set, the artist is rescanned there after the
+        /// restore and its images pushed (see `jellyfin push`), so Jellyfin
+        /// shows the restored file.
+        #[command(flatten)]
+        jellyfin: JellyfinArgs,
+
+        /// Don't tell Jellyfin about the restore, even with the server set.
+        #[arg(long)]
+        skip_jellyfin: bool,
     },
 }
 
@@ -542,13 +567,43 @@ mod tests {
     }
 
     #[test]
+    fn restore_takes_the_jellyfin_server() {
+        let args = [
+            "gatefold",
+            "restore",
+            "--dir",
+            "Kemuri",
+            "--jellyfin-url",
+            "http://jf:8096",
+            "--jellyfin-api-key",
+            "k",
+        ];
+        let Some(Command::Restore { jellyfin, .. }) = Cli::try_parse_from(args).unwrap().command
+        else {
+            panic!("expected the restore subcommand");
+        };
+        assert_eq!(jellyfin.server(), Some(("http://jf:8096", "k")));
+
+        let skip = args.iter().copied().chain(["--skip-jellyfin"]);
+        let Some(Command::Restore { skip_jellyfin, .. }) =
+            Cli::try_parse_from(skip).unwrap().command
+        else {
+            panic!("expected the restore subcommand");
+        };
+        assert!(skip_jellyfin);
+        let run = Cli::try_parse_from(["gatefold", "--skip-jellyfin"]).unwrap();
+        assert!(run.skip_jellyfin);
+    }
+
+    #[test]
     fn restore_takes_either_a_dir_or_a_file() {
         let parse = |args: &[&str]| Cli::try_parse_from(["gatefold", "restore"].iter().chain(args));
         assert!(parse(&[]).is_err());
         assert!(parse(&["Kemuri"]).is_err(), "no positional path");
         assert!(parse(&["--dir", "a", "--file", "b"]).is_err());
-        let Some(Command::Restore { dir, file, keep }) =
-            parse(&["--dir", "Kemuri"]).unwrap().command
+        let Some(Command::Restore {
+            dir, file, keep, ..
+        }) = parse(&["--dir", "Kemuri"]).unwrap().command
         else {
             panic!("expected the restore subcommand");
         };

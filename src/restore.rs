@@ -136,8 +136,9 @@ pub enum Target<'a> {
 
 /// `gatefold restore --dir <artist>` lists the folder's archive and asks which
 /// one to restore; `gatefold restore --file <archived file>` restores it directly.
-/// With `keep`, the restored file also gets its keep marker.
-pub fn run(target: &Target, keep: bool) -> Result<()> {
+/// With `keep`, the restored file also gets its keep marker. Returns the artist
+/// folder when a file was restored.
+pub fn run(target: &Target, keep: bool) -> Result<Option<PathBuf>> {
     let revisions = Revisions::new();
     let (dir, entry) = match *target {
         Target::File(path) => {
@@ -163,13 +164,13 @@ pub fn run(target: &Target, keep: bool) -> Result<()> {
             let entries = list(path)?;
             if entries.is_empty() {
                 println!("nothing archived in {}", path.join(ARCHIVE_DIR).display());
-                return Ok(());
+                return Ok(None);
             }
             let stdin = std::io::stdin();
             let Some(entry) = choose(path, &entries, &mut stdin.lock(), &mut std::io::stdout())?
             else {
                 println!("nothing restored");
-                return Ok(());
+                return Ok(None);
             };
             (path.to_path_buf(), entry)
         }
@@ -191,7 +192,7 @@ pub fn run(target: &Target, keep: bool) -> Result<()> {
     } else if !keep::artist_image(&dir, entry.kind) {
         println!("  run with --keep to stop --replace-artist-images from replacing it");
     }
-    Ok(())
+    Ok(Some(dir))
 }
 
 /// Print the numbered archive of artist folder `dir` and read a choice. `None`
