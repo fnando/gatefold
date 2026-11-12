@@ -286,7 +286,7 @@ impl Services {
 
 /// The cover cache key variant: bumped when the sources or sizes change so that
 /// earlier caches are re-fetched rather than reused.
-const COVER_CACHE_VARIANT: &str = "apple-4000|front-1200";
+const COVER_CACHE_VARIANT: &str = "apple-1500|front-1200";
 
 /// Lyrics and cover art, track by track. Also notes every album artist seen, for
 /// the artist-images pass that follows.

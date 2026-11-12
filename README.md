@@ -8,8 +8,8 @@ you already have.
   the file's lyrics tag, and synced lyrics are written to a `<track>.lrc` sidecar when the
   track doesn't already have one.
 - **Cover art** comes from [Apple Music](https://music.apple.com) when the album can be
-  found there (via its public lookup API, matched by barcode or `MusicBrainz` link; Apple's
-  artwork is typically 3000–4000px), falling back to the
+  found there (via its public lookup API, matched by barcode or `MusicBrainz` link; requested
+  at 1500px), falling back to the
   [Cover Art Archive](https://coverartarchive.org) using the `MusicBrainz` ids in the tags.
   The front cover is embedded in the file and written once per album as `cover.jpg`.
 - **Artist images** come from the artist's public [Apple Music](https://music.apple.com)
@@ -28,13 +28,15 @@ you already have.
 - Embeds plain lyrics into the unsynced-lyrics tag (ID3v2 `USLT`, Vorbis
   `UNSYNCEDLYRICS`, MP4 `©lyr`) and creates a synced `.lrc` sidecar when one is missing.
 - Embeds the front cover and writes a per-folder `cover.jpg`. Apple Music's artwork is
-  requested at up to 4000px; the Cover Art Archive fallback uses its ~1200px variant,
+  requested at up to 1500px (its originals are often 3000–4000px, several megabytes in every
+  track for nothing visible; smaller ones come as they are); the Cover Art Archive fallback
+  uses its ~1200px variant,
   resolved from the track's `MusicBrainz` release id (then its release group, where art
   often lives). Cover art is fetched once per release and shared across the album's tracks.
 - Writes artist images once per album artist, into the folder named after the artist that
   sits above the album folders (`Artist/Album/track`). Apple's image host renders the
-  renditions server-side, so the avatar comes at native resolution and the backdrop as a
-  3840×2160 crop — nothing is resized or re-encoded locally.
+  renditions server-side from its originals, so the avatar comes at up to 1500×1500 and the
+  backdrop at 1920×1080 (matching the motion backdrops) — nothing is resized locally. AFI's photo, for one, is 3648×3648 at 4.0 MB on Apple; at 1500×1500 it's 683 KB.
 - **Optimizes every image losslessly** before writing it: JPEGs are repacked (progressive,
   optimized Huffman tables) and PNGs recompressed, typically 10–35% smaller with exactly the
   same pixels. `gatefold optimize --dir <folder>` does the same for the images already in a
@@ -156,7 +158,7 @@ For each discovered track:
    for on Apple Music through the public iTunes Lookup API (`itunes.apple.com/lookup`, no
    key): by the `BARCODE` tag if present, else by the barcode or Apple Music link on the
    `MusicBrainz` release, else by an Apple Music link on any other release in the same
-   release group (one browse request). A match yields the artwork at `…/4000x4000bb.jpg`
+   release group (one browse request). A match yields the artwork at `…/1500x1500bb.jpg`
    (capped at Apple's source size), which is the current digital edition's art. Otherwise
    the front cover comes from `coverartarchive.org/release/{id}/front`, falling back to
    `release-group/{id}/front`. The image is cached at `<state-dir>/art/<sha256(release)>.*`
@@ -175,10 +177,11 @@ id in the tags; "Various Artists" is skipped):
    one query to the public SPARQL endpoint, by the Wikidata item `MusicBrainz` links to or
    else by `MusicBrainz` artist id, cached at `<state-dir>/artist/<id>.wikidata.json`
    whether or not it found anything. The Apple Music page is fetched first: it carries the
-   artist's photo as a resizable asset, from which a native-size square avatar
-   (`…/4000x4000bb.jpg`) and a 3840×2160 centre-cropped backdrop (`…/3840x2160sr.jpg`) are
-   requested — when Apple has a dedicated wide banner for the artist, that is used for the
-   backdrop instead. Artists without a photo on Apple Music (the page shows an album cover
+   artist's photo as a resizable asset, from which a square avatar of up to 1500px
+   (`…/1500x1500bb.jpg`) is requested, and a 1920×1080 backdrop from the artwork Apple shows
+   as the artist's wide header (often the photo itself), or the photo when there's none. The
+   backdrop is cropped around the faces (`…/1920x1080vf.jpg`): a plain centre crop
+   (`…sr.jpg`) cuts through them on many band photos. Artists without a photo on Apple Music (the page shows an album cover
    in its place, which is detected and rejected) fall back to Spotify, which only exposes a
    640px avatar. Some artists also have a looping **motion backdrop** on Apple Music; it is
    served as HLS, so when `ffmpeg` is on `PATH` the best SDR H.264 rendition at or under
@@ -432,6 +435,11 @@ Files you [keep](#keeping-your-own-images) are left byte for byte as they are. A
 [skipped](#skipping-an-image) image stays skipped: its marker is renamed after the new
 contents. Pass `--verify` to check each track with `ffprobe` before its new tag replaces the
 original. Running it again finds nothing more to do.
+
+`gatefold optimize` never resizes: that would decode and re-encode the image. To bring
+artist images and covers written at Apple's larger sizes down to today's, run with
+`--replace-artist-images` and `--replace-cover`: Apple serves the smaller renditions, and
+the previous files are archived (artist images) or backed up (covers) as on any replace.
 
 Cached images from before this existed are optimized the next time they're used. Files that
 gatefold wrote before then still count as the same image, so `--replace-*` runs don't

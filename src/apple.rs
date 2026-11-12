@@ -22,9 +22,11 @@ const POLICY: Policy<'static> = Policy {
     default_wait_secs: (60, 10),
     throttle_statuses: &[403, 429, 503],
 };
-/// `<w>x<h>bb` fits inside the box, capped at the source size, so this is "the
-/// largest Apple has" for any album.
-pub const COVER_RENDITION: &str = "4000x4000bb.jpg";
+/// `<w>x<h>bb` fits inside the box, capped at the source size (smaller covers
+/// come as they are). 1500px is plenty on any screen, and the cover is
+/// embedded in every track, so Apple's 3000–4000px originals would cost
+/// several megabytes per track.
+pub const COVER_RENDITION: &str = "1500x1500bb.jpg";
 
 /// An album as returned by the Lookup API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +135,12 @@ pub fn asset_base(url: &str) -> Option<String> {
     is_rendition.then(|| base.to_string())
 }
 
+/// An artwork URL cached with the size asked for then, asking for today's
+/// [`COVER_RENDITION`] instead (unchanged when it isn't a rendition URL).
+fn current_rendition(url: &str) -> String {
+    asset_base(url).map_or_else(|| url.to_string(), |base| rendition(&base, COVER_RENDITION))
+}
+
 pub fn rendition(base: &str, spec: &str) -> String {
     format!("{base}/{spec}")
 }
@@ -170,9 +178,10 @@ pub fn resolve_release_art<W: RateLimitWaiter>(
     recheck: bool,
 ) -> Result<Option<ReleaseArt>> {
     if !recheck
-        && let Some(art) = state.load_release_art::<ReleaseArt>(release)?
+        && let Some(mut art) = state.load_release_art::<ReleaseArt>(release)?
         && art.version == RELEASE_ART_VERSION
     {
+        art.artwork_url = current_rendition(&art.artwork_url);
         return Ok(Some(art));
     }
 
@@ -327,8 +336,21 @@ mod tests {
         assert_eq!(asset_base(BASE), None);
         assert_eq!(
             rendition(BASE, COVER_RENDITION),
-            format!("{BASE}/4000x4000bb.jpg")
+            format!("{BASE}/1500x1500bb.jpg")
         );
+    }
+
+    #[test]
+    fn cached_artwork_urls_ask_for_todays_size() {
+        assert_eq!(
+            current_rendition(&format!("{BASE}/4000x4000bb.jpg")),
+            format!("{BASE}/1500x1500bb.jpg")
+        );
+        assert_eq!(
+            current_rendition(&format!("{BASE}/1500x1500bb.jpg")),
+            format!("{BASE}/1500x1500bb.jpg")
+        );
+        assert_eq!(current_rendition(BASE), BASE, "not a rendition: as is");
     }
 
     #[test]

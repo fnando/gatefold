@@ -28,9 +28,15 @@ const POLICY: Policy<'static> = Policy {
     throttle_statuses: net::THROTTLE,
 };
 /// Apple's image host: `<w>x<h>bb` fits inside the box (capped at the source
-/// size), `<w>x<h>sr` scales and centre-crops to exactly that aspect ratio.
-pub const AVATAR_RENDITION: &str = "4000x4000bb.jpg";
-pub const BACKDROP_RENDITION: &str = "3840x2160sr.jpg";
+/// size, so smaller photos come as they are); `<w>x<h>vf` fills the box
+/// exactly, cropping to keep the faces in frame (where a centre crop, `sr`,
+/// cuts through them on many band photos). Apple
+/// resizes from its original, so asking for the size we want beats resizing
+/// locally. 1500px is plenty for an avatar, and 1080p matches the motion
+/// backdrops; Apple's largest renditions (3000–4000px) are several times the
+/// bytes for nothing visible.
+pub const AVATAR_RENDITION: &str = "1500x1500bb.jpg";
+pub const BACKDROP_RENDITION: &str = "1920x1080vf.jpg";
 /// Logos are wordmarks on a transparent background, so PNG; `bb` caps at the
 /// source size, and the box is larger than any logo Apple serves.
 pub const LOGO_RENDITION: &str = "9999x9999bb.png";
@@ -194,6 +200,7 @@ impl Resolver {
         Ok(apple_artwork(&html).map(|art| Resolved {
             source: Source::Apple,
             page_url,
+            // Apple's wide header when it has one, else the photo.
             backdrop_url: Some(rendition(
                 art.wide.as_deref().unwrap_or(&art.avatar),
                 BACKDROP_RENDITION,
@@ -301,7 +308,8 @@ impl Resolver {
 pub struct AppleArtwork {
     /// Asset base of the artist photo.
     pub avatar: String,
-    /// Asset base of a dedicated wide banner, when Apple has one.
+    /// Asset base of the artwork Apple shows as the artist's wide header, when
+    /// it has one (a real banner, or often the photo itself).
     pub wide: Option<String>,
     /// HLS master playlist of the 16:9 motion backdrop, when the artist has one.
     pub video: Option<String>,
@@ -337,7 +345,7 @@ pub fn apple_artwork(html: &str) -> Option<AppleArtwork> {
             .and_then(asset_base);
         return Some(AppleArtwork {
             avatar,
-            wide: artwork_base(header.get("wideArtwork")),
+            wide: wide_artwork(header),
             video,
             logo,
         });
@@ -351,6 +359,17 @@ pub fn apple_artwork(html: &str) -> Option<AppleArtwork> {
     })
 }
 
+/// The header's `wideArtwork`, unless it's the page's album-cover stand-in;
+/// a catalogue path is fine next to a named fallback (label press shots live
+/// there), as for the photo.
+fn wide_artwork(header: &Map<String, Value>) -> Option<String> {
+    let wide = raw_artwork_base(header.get("wideArtwork"))?;
+    match raw_artwork_base(header.get("fallbackArtwork")) {
+        Some(fallback) => (wide != fallback).then_some(wide),
+        None => is_artist_asset(&wide).then_some(wide),
+    }
+}
+
 /// The asset base of the header's artist photo. When the page names its own
 /// album-cover stand-in (`fallbackArtwork`), anything else in `circleArtwork` is
 /// the photo, wherever it's stored: label-supplied press shots (`pr_source.png`)
@@ -362,12 +381,6 @@ fn artist_photo(header: &Map<String, Value>) -> Option<String> {
         Some(fallback) => (circle != fallback).then_some(circle),
         None => is_artist_asset(&circle).then_some(circle),
     }
-}
-
-/// The asset base of an Apple artwork object (`{ "dictionary": { "url": "…/{w}x{h}{c}.{f}" } }`),
-/// or `None` when absent or not an artist photo.
-fn artwork_base(artwork: Option<&Value>) -> Option<String> {
-    raw_artwork_base(artwork).filter(|base| is_artist_asset(base))
 }
 
 /// The asset base of an Apple artwork object, whatever its path.
@@ -560,7 +573,7 @@ mod tests {
         let video = "https://mvod.itunes.apple.com/itunes-assets/HLSMusic113/v4/x/P1_default.m3u8";
         let logo = "https://is1-ssl.mzstatic.com/image/thumb/V7EGiP85yrXypisuC8mDZA";
         let json = format!(
-            r#"[{{"artistLogo":{{"dictionary":{{"url":"{logo}/{{w}}x{{h}}{{c}}.{{f}}","width":6090,"height":2100}},"cropStyle":"bb"}},"wideArtwork":{{"dictionary":{{"url":"{wide}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"circleArtwork":{{"dictionary":{{"url":"{APPLE_BASE}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"wideVideoArtwork":{{"dictionary":{{"motionArtistFullscreen16x9":{{"video":"{video}"}}}}}}}}]"#
+            r#"[{{"artistLogo":{{"dictionary":{{"url":"{logo}/{{w}}x{{h}}{{c}}.{{f}}","width":6090,"height":2100}},"cropStyle":"bb"}},"wideArtwork":{{"dictionary":{{"url":"{wide}/{{w}}x{{h}}{{c}}.{{f}}","width":4320,"height":2160}}}},"circleArtwork":{{"dictionary":{{"url":"{APPLE_BASE}/{{w}}x{{h}}{{c}}.{{f}}"}}}},"wideVideoArtwork":{{"dictionary":{{"motionArtistFullscreen16x9":{{"video":"{video}"}}}}}}}}]"#
         );
         let html = format!(r#"<script id="serialized-server-data">{json}</script>"#);
         assert_eq!(
@@ -582,6 +595,33 @@ mod tests {
     }
 
     #[test]
+    fn backdrops_crop_around_faces_from_the_wide_header_or_the_photo() {
+        let wide = "https://is1-ssl.mzstatic.com/image/thumb/AMCArtistImages211/v4/00/wide.png";
+        let page = |wide_artwork: &str| {
+            let json = format!(
+                r#"[{{{wide_artwork}"circleArtwork":{{"dictionary":{{"url":"{APPLE_BASE}/{{w}}x{{h}}{{c}}.{{f}}"}}}}}}]"#
+            );
+            format!(r#"<script id="serialized-server-data">{json}</script>"#)
+        };
+        let with_wide = page(&format!(
+            r#""wideArtwork":{{"dictionary":{{"url":"{wide}/{{w}}x{{h}}{{c}}.{{f}}"}},"cropStyle":"sr"}},"#
+        ));
+        assert_eq!(
+            apple_artwork(&with_wide).unwrap().wide.as_deref(),
+            Some(wide)
+        );
+        assert_eq!(apple_artwork(&page("")).unwrap().wide, None);
+        assert_eq!(
+            apple_artwork(&page(r#""wideArtwork":null,"#)).unwrap().wide,
+            None
+        );
+        assert_eq!(
+            BACKDROP_RENDITION, "1920x1080vf.jpg",
+            "always around the faces"
+        );
+    }
+
+    #[test]
     #[ignore = "hits music.apple.com and open.spotify.com"]
     fn resolves_radiohead_live() {
         struct NoWait;
@@ -596,18 +636,30 @@ mod tests {
         );
         let apple = resolver.apple("657515", &NoWait).unwrap().unwrap();
         assert_eq!(apple.logo_url, None, "Radiohead has no logo on Apple Music");
+        // No wide header: the photo, cropped around what's in it.
+        assert_eq!(
+            apple.backdrop_url,
+            Some(
+                apple
+                    .avatar_url
+                    .replace(AVATAR_RENDITION, BACKDROP_RENDITION)
+            )
+        );
         assert_eq!(apple.source, Source::Apple);
         assert!(
             apple.avatar_url.ends_with(AVATAR_RENDITION),
             "{}",
             apple.avatar_url
         );
+        // Nirvana has a real wide banner.
+        let nirvana = resolver.apple("112018", &NoWait).unwrap().unwrap();
         assert!(
-            apple
+            nirvana
                 .backdrop_url
                 .as_deref()
-                .unwrap()
-                .ends_with(BACKDROP_RENDITION)
+                .is_some_and(|url| url.ends_with(BACKDROP_RENDITION)),
+            "{:?}",
+            nirvana.backdrop_url
         );
         // Metallica has a logo.
         let metallica = resolver.apple("3996865", &NoWait).unwrap().unwrap();
