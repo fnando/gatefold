@@ -178,7 +178,9 @@ id in the tags; "Various Artists" is skipped):
    in its place, which is detected and rejected) fall back to Spotify, which only exposes a
    640px avatar. Some artists also have a looping **motion backdrop** on Apple Music; it is
    served as HLS, so when `ffmpeg` is on `PATH` the best SDR H.264 rendition at or under
-   1080p is remuxed (no re-encoding) into `backdrops/backdrop.mp4` — Jellyfin's theme-video
+   1080p is re-encoded with x264 (CRF 23, fitted into 1920x1080, audio dropped — about
+   half Apple's size with no visible difference; the stream is copied as-is when ffmpeg
+   lacks `libx264` or only an HDR rendition exists) into `backdrops/backdrop.mp4` — Jellyfin's theme-video
    folder, where it plays as the artist's background rather than being imported as a music
    video (`--skip-artist-videos` opts out). Some artists also have a **logo** (their
    wordmark on a transparent background), requested at its native size as a PNG. The

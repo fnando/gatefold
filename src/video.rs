@@ -1,9 +1,12 @@
 //! Motion backdrops: Apple serves them as HLS, so a variant is picked from the
-//! master playlist and remuxed (no re-encoding) into a plain MP4 with ffmpeg.
+//! master playlist and written as a plain MP4 with ffmpeg. Apple's renditions
+//! are encoded at a generous bitrate, so SDR ones are re-encoded with x264
+//! (about half the size, visually the same); otherwise the stream is copied.
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 /// Backdrops above this are a lot of bytes for no visible gain.
 pub const MAX_HEIGHT: u32 = 1080;
@@ -117,8 +120,47 @@ pub fn pick(variants: &[Variant]) -> Option<&Variant> {
     })
 }
 
-/// Remux one variant playlist into `out` as MP4 (stream copy, `faststart`).
-pub fn remux(variant_url: &str, user_agent: &str, out: &Path) -> Result<()> {
+/// x264 constant-quality factor (ffmpeg's default): no visible loss on
+/// backdrops at roughly half Apple's bitrate.
+const CRF: &str = "23";
+
+/// True when this ffmpeg build has the `libx264` encoder (checked once).
+fn libx264_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("libx264"))
+    })
+}
+
+/// Downscale to fit 1920x1080 (keeping the aspect ratio, never upscaling), for
+/// artists whose playlist has no rendition at or under [`MAX_HEIGHT`].
+const FIT_1080P: &str =
+    "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+
+/// The ffmpeg output codec arguments for `variant`: SDR renditions are
+/// re-encoded with x264, fitted into 1080p and lose any audio (backdrops play
+/// muted); HDR ones are
+/// stream-copied, since squeezing them into 8-bit SDR without tone mapping
+/// would wash out the colours.
+fn codec_args(variant: &Variant, reencode: bool) -> &'static [&'static str] {
+    if reencode && variant.sdr {
+        &[
+            "-an", "-vf", FIT_1080P, "-c:v", "libx264", "-preset", "medium", "-crf", CRF,
+            "-pix_fmt", "yuv420p",
+        ]
+    } else {
+        &["-c", "copy"]
+    }
+}
+
+/// Write one variant playlist into `out` as MP4 (`faststart`), re-encoding it
+/// when possible (see [`codec_args`]).
+pub fn remux(variant: &Variant, user_agent: &str, out: &Path) -> Result<()> {
     let output = Command::new("ffmpeg")
         .args([
             "-loglevel",
@@ -128,8 +170,9 @@ pub fn remux(variant_url: &str, user_agent: &str, out: &Path) -> Result<()> {
             user_agent,
             "-i",
         ])
-        .arg(variant_url)
-        .args(["-c", "copy", "-movflags", "+faststart", "-f", "mp4", "-y"])
+        .arg(&variant.url)
+        .args(codec_args(variant, libx264_available()))
+        .args(["-movflags", "+faststart", "-f", "mp4", "-y"])
         .arg(out)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -181,6 +224,17 @@ rel/720.m3u8
         let only_big: Vec<Variant> = found.into_iter().filter(|v| v.height > 1080).collect();
         assert_eq!(pick(&only_big).map(|v| v.height), Some(2160));
         assert_eq!(pick(&[]), None);
+    }
+
+    #[test]
+    fn reencodes_only_sdr_variants_when_x264_is_there() {
+        let found = variants(MASTER, "https://host/master.m3u8");
+        let (sdr, hdr) = (&found[0], &found[1]);
+        assert!(codec_args(sdr, true).contains(&"libx264"));
+        assert!(codec_args(sdr, true).contains(&"-an"));
+        assert!(codec_args(sdr, true).contains(&FIT_1080P));
+        assert_eq!(codec_args(sdr, false), ["-c", "copy"]);
+        assert_eq!(codec_args(hdr, true), ["-c", "copy"]);
     }
 
     #[test]

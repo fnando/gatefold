@@ -1572,7 +1572,7 @@ fn artist_images(
 }
 
 /// An artist's motion backdrop: from the art cache, else the best fitting HLS
-/// variant remuxed to MP4 by ffmpeg and cached. `None` (logged) when the
+/// variant written to MP4 by ffmpeg and cached. `None` (logged) when the
 /// playlist is gone or ffmpeg fails, so the still images are still written.
 fn artist_video(
     state: &State,
@@ -1594,7 +1594,7 @@ fn artist_video(
             return Ok(None);
         };
         let work = std::env::temp_dir().join(format!("gatefold-{key}.mp4"));
-        let result = video::remux(&variant.url, resolver.user_agent(), &work)
+        let result = video::remux(variant, resolver.user_agent(), &work)
             .and_then(|()| std::fs::read(&work).context("reading remuxed video"));
         let _ = std::fs::remove_file(&work);
         result.map(Some)
