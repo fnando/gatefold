@@ -302,8 +302,15 @@ Music/
 
 For covers, gatefold checks the album folder and every folder above it up to the scanned
 root, so markers above the root don't count. An artist split across two roots follows each
-folder's own markers. On a replace run where every image an artist or album has is kept,
-gatefold skips the lookups and the summary counts it as `kept`.
+folder's own markers. On a replace run where every cover an album has is kept, gatefold skips
+the lookups and the summary counts it as `kept`.
+
+Kept artist images are still checked on `--replace-artist-images` runs (unless
+`--artist-refresh-after` says the artist was checked recently). When Apple Music has a
+different image than the one you kept, gatefold leaves yours in place and saves Apple's,
+dated, in `.gatefold-archive/`. Only images that aren't archived yet are saved, so the archive
+doesn't grow on every run. If you change your mind later,
+[`gatefold restore`](#restoring-an-archived-image) brings it in.
 
 ### Skipping an image
 
@@ -323,7 +330,9 @@ image's contents, and leaves the image where it is. On later runs:
   marker. The old file is archived (in `.gatefold-archive/`) or, for covers, backed
   up and swapped in each track as well as in `cover.jpg`.
 - A downloaded image with skipped contents is never written into that folder. Album covers
-  count these as `rejected` in the summary.
+  count these as `rejected` in the summary. Artist images are saved, dated, in
+  `.gatefold-archive/` instead, unless they're there already, so
+  [`gatefold restore`](#restoring-an-archived-image) can bring them back.
 - When the cached cover is the skipped one, it's looked up again once per run, so a new Apple
   Music or Cover Art Archive image is picked up. Artist photos are re-checked on
   `--replace-artist-images` runs, as usual.

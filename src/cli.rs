@@ -86,7 +86,8 @@ pub struct Cli {
     /// Replace an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop /
     /// `logo.png` when the artist's image has changed since it was written. The
     /// previous files are kept, dated, in the artist folder's hidden
-    /// `.gatefold-archive/`.
+    /// `.gatefold-archive/`. Images you keep (`gatefold keep`) stay, but Apple's
+    /// differing ones are archived there too, for `gatefold restore`.
     #[arg(long, conflicts_with_all = ["skip_artist_images", "lyrics_only", "cover_only"])]
     pub replace_artist_images: bool,
 

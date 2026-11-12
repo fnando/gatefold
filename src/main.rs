@@ -1165,6 +1165,8 @@ enum ArtistOutcome {
         reused: bool,
         /// Where replaced files were moved, relative to the artist folder.
         kept: Vec<String>,
+        /// Images not written but archived for `gatefold restore`.
+        alternatives: Vec<String>,
         /// The artist has an Apple Music link (so a Spotify source means its
         /// page had no artist photo).
         apple_link: bool,
@@ -1192,7 +1194,8 @@ fn process_artist(
     let now = revisions.stamp();
     let mode = replace_mode(cli, job, record.as_ref(), now);
     let replacing = mode == ReplaceMode::Replace;
-    let look_again = replacing || retry_apple(state, mode, record.as_ref(), mbid)?;
+    let wants_replace = replacing || mode == ReplaceMode::Kept;
+    let look_again = wants_replace || retry_apple(state, mode, record.as_ref(), mbid)?;
 
     // Every folder already complete and not replacing (or retrying Apple):
     // nothing to do, and no reason to touch the network.
@@ -1249,10 +1252,14 @@ fn process_artist(
     };
     let record_changed = record.is_none() || !reused;
     let apple_link = links.apple_id.is_some();
-    let nothing_to_do = nothing_to_do(resolved.source, replacing, apple_link);
+    let nothing_to_do = nothing_to_do(resolved.source, mode, apple_link);
+    // Apple images a keep marker turns away on a replace run are archived, so
+    // `gatefold restore` can bring them in (Spotify's avatar isn't worth it).
+    let alternatives = wants_replace && resolved.source == Source::Apple;
 
     let want_video = services.videos && resolved.video_url.is_some();
-    let needs_write = cli.cache_only || missing_files(job, &resolved, replace, want_video);
+    let needs_write =
+        cli.cache_only || missing_files(job, &resolved, replace, alternatives, want_video);
     if !needs_write {
         if record_changed {
             state.save_artist_record(mbid, &new_record)?;
@@ -1282,24 +1289,14 @@ fn process_artist(
     }
 
     // 4. Write into every artist folder.
-    let written = write_artist_images(job, &images, video.as_ref(), replace, revisions)?;
-    if written.avatar.happened()
-        || written.backdrop.happened()
-        || written.video.happened()
-        || written.logo.happened()
-    {
-        new_record.written_at = Some(now);
+    let writes = (replace, alternatives);
+    let written = write_artist_images(job, &images, video.as_ref(), writes, revisions)?;
+    if written.wrote() || !written.alternatives.is_empty() {
+        if written.wrote() {
+            new_record.written_at = Some(now);
+        }
         state.save_artist_record(mbid, &new_record)?;
-        Ok(ArtistOutcome::Applied {
-            avatar: written.avatar,
-            backdrop: written.backdrop,
-            video: written.video,
-            logo: written.logo,
-            source: resolved.source,
-            reused,
-            kept: written.kept,
-            apple_link,
-        })
+        Ok(written.into_outcome(resolved.source, reused, apple_link))
     } else {
         if record_changed {
             state.save_artist_record(mbid, &new_record)?;
@@ -1309,10 +1306,12 @@ fn process_artist(
 }
 
 /// What an artist that needed no writes amounts to.
-fn nothing_to_do(source: Source, replacing: bool, apple_link: bool) -> ArtistOutcome {
-    if source == Source::Spotify {
+fn nothing_to_do(source: Source, mode: ReplaceMode, apple_link: bool) -> ArtistOutcome {
+    if mode == ReplaceMode::Kept {
+        ArtistOutcome::Kept
+    } else if source == Source::Spotify {
         ArtistOutcome::SpotifyOnly { apple_link }
-    } else if replacing {
+    } else if mode == ReplaceMode::Replace {
         ArtistOutcome::Unchanged
     } else {
         ArtistOutcome::SkippedNothingToDo
@@ -1355,15 +1354,17 @@ enum ReplaceMode {
     /// No `--replace-artist-images`: only missing files are written.
     Plain,
     Replace,
-    /// Every folder keeps all its images (`.gatefold-keep` & co).
+    /// Every folder keeps all its images (`.gatefold-keep` & co). Still resolved,
+    /// so Apple's current images can be archived as alternatives.
     Kept,
     /// Checked within the `--artist-refresh-after` window.
     Fresh,
 }
 
 /// Keep markers in every folder turn a replace run into a plain one: missing
-/// files are still written, existing ones are left alone. So does a record
-/// resolved within the `--artist-refresh-after` window.
+/// files are still written, existing ones are left alone (Apple's differing
+/// ones are archived instead). A record resolved within the
+/// `--artist-refresh-after` window isn't resolved again at all.
 fn replace_mode(
     cli: &Cli,
     job: &ArtistJob,
@@ -1381,15 +1382,14 @@ fn replace_mode(
     if !cli.replace_artist_images {
         return ReplaceMode::Plain;
     }
-    if fully_kept(job) {
-        return ReplaceMode::Kept;
-    }
     let fresh = match (cli.artist_refresh_after, record) {
         (Some(window), Some(record)) => now.saturating_sub(record.resolved_at) < window.as_secs(),
         _ => false,
     };
     if fresh {
         ReplaceMode::Fresh
+    } else if fully_kept(job) {
+        ReplaceMode::Kept
     } else {
         ReplaceMode::Replace
     }
@@ -1402,14 +1402,23 @@ fn fully_kept(job: &ArtistJob) -> bool {
 }
 
 /// True when some artist folder lacks a file the resolution can provide (a
-/// skipped file counts as lacking), or a replace is due for a file no keep
-/// marker protects.
-fn missing_files(job: &ArtistJob, resolved: &Resolved, replace: bool, want_video: bool) -> bool {
+/// skipped file counts as lacking), a replace is due for a file no keep marker
+/// protects, or (with `alternatives`) a kept file may have an alternative to
+/// archive.
+fn missing_files(
+    job: &ArtistJob,
+    resolved: &Resolved,
+    replace: bool,
+    alternatives: bool,
+    want_video: bool,
+) -> bool {
     job.folders.iter().any(|dir| {
         let needs = |kind: ArtistImage, wanted: bool| {
+            let kept = keep::artist_image(dir, kind);
             wanted
                 && (skip::present(dir, kind).is_none()
-                    || (replace && !keep::artist_image(dir, kind)))
+                    || (replace && !kept)
+                    || (alternatives && kept))
         };
         needs(ArtistImage::Avatar, true)
             || needs(ArtistImage::Backdrop, resolved.backdrop_url.is_some())
@@ -1531,17 +1540,45 @@ struct Written {
     logo: writer::Write,
     /// Where replaced files were moved, relative to the artist folder.
     kept: Vec<String>,
+    /// Downloaded images not written (skipped, or kept out by a keep marker)
+    /// but archived for `gatefold restore`, relative to the artist folder.
+    alternatives: Vec<String>,
+}
+
+impl Written {
+    /// True when any file was created or replaced.
+    fn wrote(&self) -> bool {
+        [self.avatar, self.backdrop, self.video, self.logo]
+            .iter()
+            .any(|w| w.happened())
+    }
+
+    fn into_outcome(self, source: Source, reused: bool, apple_link: bool) -> ArtistOutcome {
+        ArtistOutcome::Applied {
+            avatar: self.avatar,
+            backdrop: self.backdrop,
+            video: self.video,
+            logo: self.logo,
+            source,
+            reused,
+            kept: self.kept,
+            alternatives: self.alternatives,
+            apple_link,
+        }
+    }
 }
 
 /// Write the avatar (and backdrop, video and logo, when there are any) into
-/// every folder of the job. A replace moves the previous file into its archive
-/// folder (`.gatefold-archive/primary/`, `…/backdrops/`, `…/logos/`) first. A skipped file is replaced
-/// whatever the mode; an image skipped in a folder is never written there.
+/// every folder of the job. `writes` is `(replace, alternatives)`. A replace
+/// moves the previous file into its archive folder (`.gatefold-archive/primary/`,
+/// `…/backdrops/`, `…/logos/`) first. A skipped file is replaced whatever the
+/// mode. An image skipped in a folder is never written there, but archived; so
+/// is one a keep marker turns away, with `alternatives`.
 fn write_artist_images(
     job: &ArtistJob,
     images: &ArtistImages,
     video: Option<&state::CachedArt>,
-    replace: bool,
+    (replace, alternatives): (bool, bool),
     revisions: &Revisions,
 ) -> Result<Written> {
     let mut written = Written {
@@ -1550,6 +1587,7 @@ fn write_artist_images(
         video: writer::Write::Skipped,
         logo: writer::Write::Skipped,
         kept: Vec::new(),
+        alternatives: Vec::new(),
     };
     let files = [
         (ArtistImage::Avatar, Some(&images.avatar)),
@@ -1560,12 +1598,17 @@ fn write_artist_images(
     for dir in &job.folders {
         for (kind, art) in &files {
             let Some(art) = art else { continue };
-            if skip::rejects(&kind.target_dir(dir), &art.data) {
+            let kept = keep::artist_image(dir, *kind);
+            let turned_away = skip::rejects(&kind.target_dir(dir), &art.data)
+                || (alternatives && kept && skip::present(dir, *kind).is_some());
+            if turned_away {
+                let saved =
+                    writer::archive_alternative(dir, *kind, &art.ext, &art.data, revisions)?;
+                written.alternatives.extend(saved);
                 continue;
             }
             // Hand-curated in this folder: written if missing, never replaced.
-            let replace =
-                (replace && !keep::artist_image(dir, *kind)) || skip::artist_image(dir, *kind);
+            let replace = (replace && !kept) || skip::artist_image(dir, *kind);
             let (wrote, kept) =
                 writer::write_artist_image(dir, *kind, &art.ext, &art.data, replace, revisions)?;
             let slot = match kind {
@@ -1842,6 +1885,7 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             source,
             reused,
             kept,
+            alternatives,
             apple_link,
         } => {
             let mut parts = Vec::new();
@@ -1857,6 +1901,12 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
                     writer::Write::Replaced => parts.push(format!("replaced {name}")),
                     writer::Write::Skipped => {}
                 }
+            }
+            if !alternatives.is_empty() {
+                parts.push(format!(
+                    "archived alternative {} (gatefold restore)",
+                    alternatives.join(", ")
+                ));
             }
             let src = if *reused { "cache" } else { source.label() };
             let kept = if kept.is_empty() {
@@ -2086,5 +2136,132 @@ impl Summary {
             self.cover_not_found,
             self.cover_errors
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn art(data: &[u8]) -> state::CachedArt {
+        state::CachedArt {
+            mime: "image/jpeg".to_string(),
+            ext: "jpg".to_string(),
+            data: data.to_vec(),
+            source: Some("apple music".to_string()),
+        }
+    }
+
+    fn job(dir: &Path) -> ArtistJob {
+        ArtistJob {
+            mbid: "mbid".to_string(),
+            name: "Artist".to_string(),
+            folders: BTreeSet::from([dir.to_path_buf()]),
+            sample_dir: dir.to_path_buf(),
+        }
+    }
+
+    fn avatar_only(data: &[u8]) -> ArtistImages {
+        ArtistImages {
+            avatar: art(data),
+            backdrop: None,
+            logo: None,
+        }
+    }
+
+    fn archived(dir: &Path) -> Vec<Vec<u8>> {
+        let archive = ArtistImage::Avatar.archive_dir(dir);
+        let Ok(entries) = fs::read_dir(&archive) else {
+            return Vec::new();
+        };
+        let mut files: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jpg"))
+            .map(|p| fs::read(p).unwrap())
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn archives_images_that_markers_turn_away() {
+        let root = std::env::temp_dir().join(format!("gatefold-alt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let revisions = Revisions::new();
+
+        // Kept folder.jpg: a replace run leaves it and archives Apple's image.
+        let kept = root.join("Kept");
+        fs::create_dir_all(&kept).unwrap();
+        fs::write(kept.join("folder.jpg"), b"mine").unwrap();
+        fs::write(kept.join(keep::ALL), b"").unwrap();
+        let written = write_artist_images(
+            &job(&kept),
+            &avatar_only(b"apple"),
+            None,
+            (false, true),
+            &revisions,
+        )
+        .unwrap();
+        assert_eq!(fs::read(kept.join("folder.jpg")).unwrap(), b"mine");
+        assert_eq!(archived(&kept), vec![b"apple".to_vec()]);
+        assert_eq!(written.alternatives.len(), 1);
+        assert!(!written.wrote());
+        // Again: already archived, nothing new.
+        let again = write_artist_images(
+            &job(&kept),
+            &avatar_only(b"apple"),
+            None,
+            (false, true),
+            &revisions,
+        )
+        .unwrap();
+        assert_eq!(again.alternatives, Vec::<String>::new());
+        // Apple's image being the kept one is no alternative.
+        let same = write_artist_images(
+            &job(&kept),
+            &avatar_only(b"mine"),
+            None,
+            (false, true),
+            &revisions,
+        )
+        .unwrap();
+        assert_eq!(same.alternatives, Vec::<String>::new());
+
+        // Not a replace run: a kept folder isn't touched at all.
+        let plain = root.join("Plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("folder.jpg"), b"mine").unwrap();
+        fs::write(plain.join(keep::ALL), b"").unwrap();
+        let written = write_artist_images(
+            &job(&plain),
+            &avatar_only(b"apple"),
+            None,
+            (false, false),
+            &revisions,
+        )
+        .unwrap();
+        assert_eq!(written.alternatives, Vec::<String>::new());
+        assert_eq!(archived(&plain), Vec::<Vec<u8>>::new());
+
+        // A skipped image is never written, but archived, whatever the run.
+        let skipped = root.join("Skipped");
+        fs::create_dir_all(&skipped).unwrap();
+        let marker = skip::marker_name(&state::digest_bytes(b"rejected"));
+        fs::write(skipped.join(marker), b"").unwrap();
+        let written = write_artist_images(
+            &job(&skipped),
+            &avatar_only(b"rejected"),
+            None,
+            (false, false),
+            &revisions,
+        )
+        .unwrap();
+        assert!(!skipped.join("folder.jpg").exists());
+        assert_eq!(archived(&skipped), vec![b"rejected".to_vec()]);
+        assert_eq!(written.alternatives.len(), 1);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

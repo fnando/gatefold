@@ -1,6 +1,8 @@
 //! Hand-curated images. Empty marker files tell gatefold never to replace (or
 //! archive) an existing image, even with `--replace-artist-images` /
-//! `--replace-cover`; a missing one is still written, as on any run. For artists
+//! `--replace-cover`; a missing one is still written, as on any run. A replace
+//! run archives the artist image it would have written instead (dated, in
+//! `.gatefold-archive/`), so `gatefold restore` can bring it in. For artists
 //! and albums whose art you picked yourself (small artists, a better scan than
 //! Apple Music or the Cover Art Archive have, …).
 //!

@@ -5,7 +5,9 @@
 //!   replaces it with a different image as soon as one is available (the old one
 //!   is archived / backed up as on any replace), even without `--replace-*` and
 //!   even under a keep marker;
-//! - a downloaded image with those contents is never written into that folder.
+//! - a downloaded image with those contents is never written into that folder
+//!   (an artist image is archived instead, so `gatefold restore` can bring it
+//!   back).
 //!
 //! Unlike a keep marker, a skip marker doesn't freeze the folder: any other image
 //! is welcome. Delete the marker to take the image back.

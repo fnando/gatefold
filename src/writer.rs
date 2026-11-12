@@ -452,6 +452,31 @@ pub fn write_artist_image(
     Ok((write, kept))
 }
 
+/// Archive `data`, an artist image gatefold won't write into `dir` (kept or
+/// skipped), as an alternative `gatefold restore` can bring in: dated in the
+/// kind's archive folder, unless it's the current file or already archived.
+/// Returns where it went, relative to `dir`.
+pub fn archive_alternative(
+    dir: &Path,
+    kind: ArtistImage,
+    ext: &str,
+    data: &[u8],
+    revisions: &Revisions,
+) -> Result<Option<String>> {
+    if let Some(current) = kind.existing(dir)
+        && revision::file_digest(&current)? == digest_bytes(data)
+    {
+        return Ok(None);
+    }
+    let saved = revisions.archive_bytes(&kind.archive_dir(dir), kind.stem(), ext, data)?;
+    Ok(saved.map(|path| {
+        path.strip_prefix(dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned()
+    }))
+}
+
 /// File extension for a picture's MIME type, defaulting to `jpg`.
 fn extension_for(mime: Option<&MimeType>) -> &'static str {
     match mime.map(MimeType::as_str) {

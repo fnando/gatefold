@@ -75,6 +75,47 @@ impl Revisions {
         let ext = previous
             .extension()
             .map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
+        let target = self.dated_target(archive_dir, &stem, &ext);
+        fs::rename(previous, &target)
+            .with_context(|| format!("moving {} to {}", previous.display(), target.display()))?;
+        let _ = fs::remove_file(digest_path(previous));
+        write_digest(&target, digest)?;
+        Ok(Archived::Moved(target))
+    }
+
+    /// Save `data`, an image gatefold downloaded but won't write (a keep marker
+    /// protects the current file, or a skip marker rejects these contents), into
+    /// `archive_dir` as `<stem>-<date>.<ext>`, named like a replaced file, so
+    /// `gatefold restore` can bring it in. `None` when the archive already holds
+    /// the same contents.
+    pub fn archive_bytes(
+        &self,
+        archive_dir: &Path,
+        stem: &str,
+        ext: &str,
+        data: &[u8],
+    ) -> Result<Option<PathBuf>> {
+        fs::create_dir_all(archive_dir)
+            .with_context(|| format!("creating {}", archive_dir.display()))?;
+        let digest = digest_bytes(data);
+        if find_archived(archive_dir, &digest)?.is_some() {
+            return Ok(None);
+        }
+        let target = self.dated_target(archive_dir, stem, &format!(".{ext}"));
+        // Written aside first, so an interrupted run never leaves a partial
+        // image under an archived name.
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        let work = archive_dir.join(format!(".{name}.part"));
+        fs::write(&work, data).with_context(|| format!("writing {}", work.display()))?;
+        fs::rename(&work, &target)
+            .with_context(|| format!("moving {} to {}", work.display(), target.display()))?;
+        write_digest(&target, &digest)?;
+        Ok(Some(target))
+    }
+
+    /// The first free `<stem>-<date><ext>` in `archive_dir`, appending `-2`,
+    /// `-3`, … when that name is already taken (a second run on the same day).
+    fn dated_target(&self, archive_dir: &Path, stem: &str, ext: &str) -> PathBuf {
         let date = self.date();
         let mut target = archive_dir.join(format!("{stem}-{date}{ext}"));
         let mut n = 1;
@@ -82,11 +123,7 @@ impl Revisions {
             n += 1;
             target = archive_dir.join(format!("{stem}-{date}-{n}{ext}"));
         }
-        fs::rename(previous, &target)
-            .with_context(|| format!("moving {} to {}", previous.display(), target.display()))?;
-        let _ = fs::remove_file(digest_path(previous));
-        write_digest(&target, digest)?;
-        Ok(Archived::Moved(target))
+        target
     }
 }
 
@@ -159,7 +196,10 @@ fn find_archived(archive_dir: &Path, digest: &str) -> Result<Option<PathBuf>> {
         fs::read_dir(archive_dir).with_context(|| format!("reading {}", archive_dir.display()))?;
     for entry in entries {
         let path = entry?.path();
-        if !path.is_file() || path.extension().is_some_and(|e| e == DIGEST_EXT) {
+        let hidden = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if hidden || !path.is_file() || path.extension().is_some_and(|e| e == DIGEST_EXT) {
             continue;
         }
         if file_digest(&path)? == digest {
@@ -319,6 +359,47 @@ mod tests {
             Archived::Duplicate(archive.join("folder-2020-01-01.jpg"))
         );
         assert!(archive.join("folder-2020-01-01.jpg.sha256").is_file());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn archives_downloaded_bytes_once() {
+        let root = std::env::temp_dir().join(format!("gatefold-rev-bytes-{}", std::process::id()));
+        let archive = root.join("Artist").join("primary");
+        let revisions = Revisions::new();
+        let date = revisions.date();
+
+        let saved = revisions
+            .archive_bytes(&archive, "folder", "jpg", b"alt")
+            .unwrap();
+        let path = archive.join(format!("folder-{date}.jpg"));
+        assert_eq!(saved, Some(path.clone()));
+        assert_eq!(fs::read(&path).unwrap(), b"alt");
+        assert_eq!(file_digest(&path).unwrap(), digest_bytes(b"alt"));
+
+        // Same contents again: already archived, nothing new.
+        assert_eq!(
+            revisions
+                .archive_bytes(&archive, "folder", "jpg", b"alt")
+                .unwrap(),
+            None
+        );
+        // Different contents the same day get the next free name.
+        assert_eq!(
+            revisions
+                .archive_bytes(&archive, "folder", "jpg", b"other")
+                .unwrap(),
+            Some(archive.join(format!("folder-{date}-2.jpg")))
+        );
+        // A leftover partial write is neither hashed nor counted.
+        fs::write(archive.join(".folder-x.jpg.part"), b"third").unwrap();
+        assert!(
+            revisions
+                .archive_bytes(&archive, "folder", "jpg", b"third")
+                .unwrap()
+                .is_some()
+        );
 
         fs::remove_dir_all(&root).unwrap();
     }
