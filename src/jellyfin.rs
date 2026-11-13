@@ -1266,14 +1266,13 @@ mod tests {
 
     fn archived(dir: &Path, sub: &str) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir.join(".gatefold-archive").join(sub))
-            .map(|entries| {
+            .map_or_default(|entries| {
                 entries
                     .filter_map(Result::ok)
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .filter(|n| !n.ends_with(".sha256"))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         names.sort();
         names
     }
