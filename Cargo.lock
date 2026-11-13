@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "gatefold"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "anyhow",
  "base64",
