@@ -841,10 +841,7 @@ pub fn pull(
 /// partial image) with its digest sidecar.
 fn write_new(folder: &Path, name: &str, data: &[u8]) -> Result<()> {
     let target = folder.join(name);
-    let work = folder.join(format!(".{name}.part"));
-    fs::write(&work, data).with_context(|| format!("writing {}", work.display()))?;
-    fs::rename(&work, &target)
-        .with_context(|| format!("moving {} to {}", work.display(), target.display()))?;
+    crate::paths::write_atomic(&target, data)?;
     revision::write_digest(&target, &digest_bytes(data))
 }
 

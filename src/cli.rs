@@ -155,6 +155,13 @@ pub struct Cli {
     #[arg(long)]
     pub skip_artist_videos: bool,
 
+    /// Write an `artist.nfo` in each artist folder with the artist's name and
+    /// `MusicBrainz` id, so Jellyfin matches the folder to the right artist. An
+    /// existing one only gets what it lacks; folders holding compilations or
+    /// several artists are skipped. Read from the tags, no network.
+    #[arg(long, conflicts_with_all = ["skip_artist_images", "lyrics_only", "cover_only"])]
+    pub write_nfo: bool,
+
     #[command(flatten)]
     pub jellyfin: JellyfinArgs,
 
@@ -593,6 +600,18 @@ mod tests {
             Cli::try_parse_from(["gatefold", "skip", "--file", "a", "b"]).is_err(),
             "one image per --file"
         );
+    }
+
+    #[test]
+    fn write_nfo_goes_with_the_artist_pass() {
+        assert!(
+            Cli::try_parse_from(["gatefold", "--write-nfo"])
+                .unwrap()
+                .write_nfo
+        );
+        assert!(Cli::try_parse_from(["gatefold", "--write-nfo", "--artist-images-only"]).is_ok());
+        assert!(Cli::try_parse_from(["gatefold", "--write-nfo", "--lyrics-only"]).is_err());
+        assert!(Cli::try_parse_from(["gatefold", "--write-nfo", "--skip-artist-images"]).is_err());
     }
 
     #[test]

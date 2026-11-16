@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use unicode_normalization::UnicodeNormalization;
 use ureq::Agent;
 
 const MAX_HTML_BYTES: u64 = 8 * 1024 * 1024;
@@ -454,8 +455,10 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 // ---- Artist folder ------------------------------------------------------------
 
 /// Lowercased alphanumerics only, so `AC/DC` matches a folder named `AC-DC` or `ACDC`.
+/// Composed first (NFC), so a folder stored as `a` + combining tilde matches a
+/// tag's `ã`.
 pub fn normalize_name(name: &str) -> String {
-    name.chars()
+    name.nfc()
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
@@ -487,6 +490,15 @@ mod tests {
     use std::fs;
 
     const APPLE_BASE: &str = "https://is1-ssl.mzstatic.com/image/thumb/AMCArtistImages211/v4/8a/49/84/x/ami-identity-abc_cropped.png";
+
+    #[test]
+    fn names_match_in_either_unicode_form() {
+        assert_eq!(
+            normalize_name("Ratos de Pora\u{303}o"),
+            normalize_name("Ratos de Porão")
+        );
+        assert_eq!(normalize_name("AC/DC"), "acdc");
+    }
 
     #[test]
     fn og_image_reads_the_meta_tag() {

@@ -63,6 +63,8 @@ you already have.
 - **Jellyfin, both ways**: `gatefold jellyfin push` makes Jellyfin show the artist folders'
   images (with `backdrop.jpg` first), and `gatefold jellyfin pull` brings the images only
   Jellyfin has into the folders. See [Jellyfin](#jellyfin).
+- **`artist.nfo`** with `--write-nfo`: the artist's name and `MusicBrainz` id, so Jellyfin
+  matches each artist folder to the right artist. See [artist.nfo](#artistnfo).
 - `--cache-only` mode that populates the cache without touching any music file.
 - Respects service rate limits: sequential requests with a configurable delay, and
   automatic `Retry-After` back-off (with jitter) on `429`/`503`, shown with a live
@@ -107,6 +109,7 @@ gatefold [--dir <DIR>] [OPTIONS]
 | `--artist-images-only` | Process artist images only; skip lyrics and cover art. Only needs each album folder's album artist, so it reads the tags of up to 3 tracks per folder (first, middle, last) and goes with the `MusicBrainz` album artist most of them carry. |
 | `--skip-artist-images` | Skip the artist-images pass. `--lyrics-only` / `--cover-only` imply it. |
 | `--skip-artist-videos` | Don't download motion backdrops (`backdrops/backdrop.mp4`); still images only. |
+| `--write-nfo` | Write an `artist.nfo` (name and `MusicBrainz` id) in each artist folder; see [artist.nfo](#artistnfo). |
 | `--jellyfin-url <URL>` | Jellyfin server to keep in line with the artist folders after the artist pass (see [Jellyfin](#jellyfin)). (env: `GATEFOLD_JELLYFIN_URL`) |
 | `--jellyfin-api-key <KEY>` | Jellyfin API key (Dashboard → API Keys). Prefer `--env-file`. (env: `GATEFOLD_JELLYFIN_API_KEY`) |
 | `--skip-jellyfin` | Don't talk to Jellyfin after the artist pass, even with the server set. |
@@ -462,6 +465,29 @@ the previous files are archived (artist images) or backed up (covers) as on any 
 Cached images from before this existed are optimized the next time they're used. Files that
 gatefold wrote before then still count as the same image, so `--replace-*` runs don't
 rewrite them just because they weren't optimized.
+
+### artist.nfo
+
+With `--write-nfo`, each artist folder gets an `artist.nfo` naming the artist and its
+`MusicBrainz` id, as read from the tags (no network). Jellyfin reads it, so the folder is matched
+to the right artist instead of by name:
+
+```xml
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<artist>
+  <title>Ratos de Porão</title>
+  <musicbrainzartistid>…</musicbrainzartistid>
+</artist>
+```
+
+An existing `artist.nfo` is only completed: a missing `<title>` or `<musicbrainzartistid>` is
+added right after `<artist>`, and everything else (a biography you wrote, say) stays byte for
+byte. A value that's already there is never changed; a different id is reported. Folders that
+hold compilations or several artists get none: albums tagged with the "Various Artists" id are
+never an artist's, a folder claimed by more than one album artist or named like `Various
+Artists`, `VA`, `Compilations` or `Soundtracks` is skipped, and so is a folder whose name doesn't
+match what `MusicBrainz` calls the artist (a joint "A & B" tagged with A's id). Album nfo files
+will come later under the same flag.
 
 ### Jellyfin
 

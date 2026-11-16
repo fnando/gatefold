@@ -11,6 +11,7 @@ mod lrclib;
 mod metadata;
 mod musicbrainz;
 mod net;
+mod nfo;
 mod optimize;
 mod paths;
 mod progress;
@@ -143,6 +144,11 @@ fn main() -> Result<()> {
         );
     }
 
+    // Like every other write, not on a --cache-only run.
+    if cli.write_nfo && cli.artist_images_enabled() && !cli.cache_only {
+        summary.nfo = Some(run_nfo_pass(&state, &progress, &artist_jobs));
+    }
+
     if !cli.cache_only
         && !cli.skip_jellyfin
         && cli.artist_images_enabled()
@@ -161,6 +167,89 @@ fn main() -> Result<()> {
     progress.section("Summary");
     summary.print(&progress, &cli);
     Ok(())
+}
+
+/// Counts for the nfo pass.
+#[derive(Debug, Default)]
+struct NfoTally {
+    wrote: u64,
+    completed: u64,
+    already: u64,
+    skipped: u64,
+    errors: u64,
+}
+
+/// `--write-nfo`: an `artist.nfo` in each artist folder found, naming the
+/// artist and its `MusicBrainz` id (see [`nfo`]). Problems are logged; they never
+/// fail the run.
+fn run_nfo_pass(
+    state: &State,
+    progress: &Progress,
+    jobs: &BTreeMap<String, ArtistJob>,
+) -> NfoTally {
+    progress.section("nfo");
+    let mut tally = NfoTally::default();
+    let mut claims: BTreeMap<&Path, usize> = BTreeMap::new();
+    for job in jobs.values() {
+        for folder in &job.folders {
+            *claims.entry(folder.as_path()).or_default() += 1;
+        }
+    }
+    for job in jobs.values() {
+        let mb_name = state
+            .load_musicbrainz_artist(&job.mbid)
+            .ok()
+            .flatten()
+            .and_then(|record| record["name"].as_str().map(String::from));
+        for folder in &job.folders {
+            let label = folder.file_name().map_or_else(
+                || folder.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let skip = nfo::skip_reason(&label, mb_name.as_deref(), claims[folder.as_path()]);
+            if let Some(skip) = skip {
+                tally.skipped += 1;
+                match skip {
+                    nfo::Skip::Compilation => {}
+                    nfo::Skip::Shared => progress.info(format!(
+                        "· {label}: no artist.nfo, albums of several artists live here"
+                    )),
+                    nfo::Skip::OtherName(name) => progress.info(format!(
+                        "· {label}: no artist.nfo, MusicBrainz calls {} \"{name}\"",
+                        job.mbid
+                    )),
+                }
+                continue;
+            }
+            match nfo::write_artist(folder, &job.name, &job.mbid) {
+                Ok(nfo::Outcome::Wrote) => {
+                    tally.wrote += 1;
+                    progress.info(format!("✓ {label}: wrote artist.nfo"));
+                }
+                Ok(nfo::Outcome::Completed) => {
+                    tally.completed += 1;
+                    progress.info(format!("✓ {label}: completed artist.nfo"));
+                }
+                Ok(nfo::Outcome::Already) => tally.already += 1,
+                Ok(nfo::Outcome::Differs(id)) => {
+                    tally.already += 1;
+                    progress.info(format!(
+                        "· {label}: artist.nfo names another MusicBrainz id ({id}, tags say {})",
+                        job.mbid
+                    ));
+                }
+                Ok(nfo::Outcome::NotArtistXml) => {
+                    tally.skipped += 1;
+                    progress.info(format!("· {label}: artist.nfo has no <artist>, left alone"));
+                }
+                Err(err) => {
+                    tally.errors += 1;
+                    progress.info(format!("✗ {label}: artist.nfo: {err:#}"));
+                }
+            }
+        }
+    }
+    tally
 }
 
 /// `--state-dir`, else `$XDG_DATA_HOME/gatefold` or `~/.local/share/gatefold`.
@@ -2182,6 +2271,7 @@ struct Summary {
     artist_no_image: u64,
     artist_cache_only: u64,
     artist_errors: u64,
+    nfo: Option<NfoTally>,
     // jellyfin
     jellyfin: Option<jellyfin::Tally>,
 }
@@ -2283,6 +2373,13 @@ impl Summary {
         }
         if cli.artist_images_enabled() {
             self.print_artist(progress, cache_only);
+        }
+        if let Some(tally) = &self.nfo {
+            progress.info("nfo:");
+            progress.info(format!(
+                "  wrote {} artist.nfo, completed {}, already {}, skipped {}, errors {}",
+                tally.wrote, tally.completed, tally.already, tally.skipped, tally.errors
+            ));
         }
         if let Some(tally) = &self.jellyfin {
             progress.info("jellyfin:");

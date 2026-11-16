@@ -3,7 +3,7 @@
 //! `ã` composed; a Samba share may store it as `a` + a combining tilde, and
 //! doesn't treat the two as the same name).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -96,6 +96,18 @@ pub fn require_file(path: &Path, hint: Option<&str>) -> Result<()> {
         bail!("{} is a folder, not a file{hint}", path.display());
     }
     bail!("{} doesn't exist", path.display());
+}
+
+/// Write `target` through a hidden `.<name>.part` next to it, renamed into
+/// place, so a reader never sees half a file.
+pub fn write_atomic(target: &Path, data: &[u8]) -> Result<()> {
+    let name = target
+        .file_name()
+        .with_context(|| format!("{} has no file name", target.display()))?;
+    let work = target.with_file_name(format!(".{}.part", name.to_string_lossy()));
+    fs::write(&work, data).with_context(|| format!("writing {}", work.display()))?;
+    fs::rename(&work, target)
+        .with_context(|| format!("moving {} to {}", work.display(), target.display()))
 }
 
 /// Clap value parser for a music path: [`resolve`]d, never refused (a path
