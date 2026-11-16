@@ -46,9 +46,7 @@ pub fn skip_and_archive(
 
 /// Archive the artist file at `path`.
 pub fn file(path: &Path, revisions: &Revisions) -> Result<Moved> {
-    if !path.is_file() {
-        bail!("{} is not a file", path.display());
-    }
+    crate::paths::require_file(path, None)?;
     let Some((Managed::Artist(kind), dir)) = skip::classify(path) else {
         bail!(
             "{} is not an artist file gatefold writes (folder.jpg, backdrop.jpg, \

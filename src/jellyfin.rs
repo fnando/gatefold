@@ -8,6 +8,7 @@
 //! Nothing in the artist folder is ever deleted: only images Jellyfin keeps in
 //! its own metadata folder are.
 
+use crate::paths::normalize;
 use crate::revision::{self, Revisions};
 use crate::state::digest_bytes;
 use crate::writer::ArtistImage;
@@ -22,7 +23,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
-use unicode_normalization::UnicodeNormalization;
 use ureq::http::Response;
 use ureq::{Agent, Body};
 
@@ -198,6 +198,64 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Tell Jellyfin these folders (its own paths) were just created, so it
+    /// scans them in. Jellyfin ignores paths it can't find.
+    fn report_created(&self, paths: &[String]) -> Result<()> {
+        let updates: Vec<Value> = paths
+            .iter()
+            .map(|path| serde_json::json!({ "Path": path, "UpdateType": "Created" }))
+            .collect();
+        let body = serde_json::json!({ "Updates": updates }).to_string();
+        let path = "/Library/Media/Updated";
+        let response = self
+            .agent
+            .post(self.url(path))
+            .header("Authorization", self.auth.as_str())
+            .header("User-Agent", self.user_agent.as_str())
+            .header("Content-Type", "application/json")
+            .send(body)
+            .map_err(|e| anyhow!("Jellyfin request failed: {e}"))?;
+        ok(response, path).map(drop)
+    }
+}
+
+/// Where Jellyfin would see local artist folder `name` in each library
+/// location: as stored, and with the characters a Samba server keeps as
+/// private-use ones mapped that way, when that differs.
+fn server_paths(locations: &[String], name: &str) -> Vec<String> {
+    let stored: String = name
+        .chars()
+        .map(|c| match c {
+            '"' => '\u{F020}',
+            '*' => '\u{F021}',
+            ':' => '\u{F022}',
+            '<' => '\u{F023}',
+            '>' => '\u{F024}',
+            '?' => '\u{F025}',
+            '\\' => '\u{F026}',
+            '|' => '\u{F027}',
+            c => c,
+        })
+        .collect();
+    let mut names = vec![name.to_string()];
+    if stored != name {
+        names.push(stored);
+    }
+    locations
+        .iter()
+        .flat_map(|location| {
+            let location = location.trim_end_matches('/');
+            names.iter().map(move |name| format!("{location}/{name}"))
+        })
+        .collect()
+}
+
+/// How long to wait for Jellyfin to scan in a folder it was told about (it
+/// waits a while for more changes before it looks).
+const ADD_POLL: Duration = Duration::from_secs(5);
+const ADD_POLLS: u32 = 36;
+
 fn ok(response: Response<Body>, what: &str) -> Result<Response<Body>> {
     let status = response.status();
     if !status.is_success() {
@@ -283,27 +341,6 @@ fn sniff(data: &[u8]) -> (&'static str, &'static str) {
     }
 }
 
-/// A folder name as Jellyfin and macOS would agree on it: composed (NFC), with
-/// the private-use characters a Samba server stores for `" * : < > ? \ |`
-/// mapped back, and `/` read as `:` (how macOS shows it).
-pub fn normalize(name: &str) -> String {
-    name.nfc()
-        .map(|c| match c {
-            '\u{F020}' => '"',
-            '\u{F021}' => '*',
-            '\u{F022}' | '/' => ':',
-            '\u{F023}' => '<',
-            '\u{F024}' => '>',
-            '\u{F025}' => '?',
-            '\u{F026}' => '\\',
-            '\u{F027}' => '|',
-            '\u{F028}' => ' ',
-            '\u{F029}' => '.',
-            c => c,
-        })
-        .collect()
-}
-
 /// Jellyfin's album artists that live in a music library folder, to look up by
 /// local folder.
 pub struct Index {
@@ -364,6 +401,10 @@ pub struct Options<'a> {
 /// What [`sync`] did (or, on a dry run, would do) for an artist.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Synced {
+    /// The folder was new to Jellyfin: reported, and scanned in.
+    pub added: bool,
+    /// The folder was reported, but Jellyfin hadn't scanned it in yet.
+    pub pending: bool,
     pub rescanned: bool,
     /// The folder files that are now Jellyfin's Primary or Logo.
     pub replaced: Vec<String>,
@@ -374,11 +415,26 @@ pub struct Synced {
 
 impl Synced {
     pub fn changed(&self) -> bool {
-        self.rescanned || !self.replaced.is_empty() || self.moved_behind > 0
+        self.added
+            || self.pending
+            || self.rescanned
+            || !self.replaced.is_empty()
+            || self.moved_behind > 0
     }
 
     /// One line on what changed, or `None` when nothing did.
     pub fn describe(&self, dry_run: bool) -> Option<String> {
+        if self.pending {
+            return Some(
+                "sent to Jellyfin, not scanned in yet; run `gatefold jellyfin refresh` again later"
+                    .to_string(),
+            );
+        }
+        let added = match (self.added, dry_run) {
+            (false, _) => None,
+            (true, true) => Some("would add to Jellyfin"),
+            (true, false) => Some("added to Jellyfin"),
+        };
         let mut parts = Vec::new();
         if !self.replaced.is_empty() {
             parts.push(format!("shows {}", self.replaced.join(", ")));
@@ -393,14 +449,15 @@ impl Synced {
             parts.push("rescanned".to_string());
         }
         if parts.is_empty() {
-            return None;
+            return added.map(String::from);
         }
         let verb = if dry_run {
             "would make Jellyfin"
         } else {
             "Jellyfin now"
         };
-        Some(format!("{verb}: {}", parts.join("; ")))
+        let changes = format!("{verb}: {}", parts.join("; "));
+        Some(added.map_or_else(|| changes.clone(), |added| format!("{added}; {changes}")))
     }
 }
 
@@ -441,11 +498,16 @@ pub fn subfolders(library: &Path) -> Result<Vec<PathBuf>> {
     Ok(folders)
 }
 
+/// The folder holds artist images of its own.
+pub fn is_artist_folder(folder: &Path) -> bool {
+    local_files(folder).is_ok_and(|files| !files.is_empty())
+}
+
 /// The subfolders of a library that hold artist images.
 pub fn artist_folders(library: &Path) -> Result<Vec<PathBuf>> {
     Ok(subfolders(library)?
         .into_iter()
-        .filter(|path| local_files(path).is_ok_and(|files| !files.is_empty()))
+        .filter(|path| is_artist_folder(path))
         .collect())
 }
 
@@ -789,6 +851,7 @@ fn write_new(folder: &Path, name: &str, data: &[u8]) -> Result<()> {
 /// A connected server: the client, its artists, and the library settings.
 pub struct Session {
     client: Client,
+    locations: Vec<String>,
     index: Index,
     saves_locally: bool,
 }
@@ -800,6 +863,7 @@ impl Session {
         let index = Index::new(client.artists()?, &locations);
         Ok(Self {
             client,
+            locations,
             index,
             saves_locally,
         })
@@ -825,10 +889,13 @@ impl Session {
     }
 
     /// Have Jellyfin rescan an artist folder (a file may have changed under
-    /// the same name), then sync it; `None` when Jellyfin has no artist for it.
-    /// A dry run only reports what the sync would do.
-    pub fn rescan_folder(&self, folder: &Path, opts: &Options<'_>) -> Option<Result<Synced>> {
-        let artist = self.find(folder, None)?;
+    /// the same name), then sync it. A folder Jellyfin has no artist for is
+    /// reported to it as new, and synced once it's scanned in. A dry run only
+    /// reports what would happen.
+    pub fn rescan_folder(&mut self, folder: &Path, opts: &Options<'_>) -> Result<Synced> {
+        let Some(artist) = self.index.find(folder, None) else {
+            return self.add_folder(folder, opts);
+        };
         let opts = Options {
             saves_locally: self.saves_locally,
             ..*opts
@@ -838,11 +905,42 @@ impl Session {
         } else {
             self.client.refresh(&artist.id)
         };
-        Some(refresh.and_then(|()| {
+        refresh.and_then(|()| {
             let mut synced = sync(&self.client, artist, folder, &opts)?;
             synced.rescanned = true;
             Ok(synced)
-        }))
+        })
+    }
+
+    /// Report a folder Jellyfin doesn't know as new, wait for it to show up
+    /// as an artist, then sync it.
+    fn add_folder(&mut self, folder: &Path, opts: &Options<'_>) -> Result<Synced> {
+        if opts.dry_run {
+            return Ok(Synced {
+                added: true,
+                ..Synced::default()
+            });
+        }
+        let name = folder
+            .file_name()
+            .context("the folder has no name")?
+            .to_string_lossy();
+        self.client
+            .report_created(&server_paths(&self.locations, &name))?;
+        for _ in 0..ADD_POLLS {
+            sleep(ADD_POLL);
+            self.index = Index::new(self.client.artists()?, &self.locations);
+            if let Some(synced) = self.sync_folder(folder, None, opts) {
+                return Ok(Synced {
+                    added: true,
+                    ..synced?
+                });
+            }
+        }
+        Ok(Synced {
+            pending: true,
+            ..Synced::default()
+        })
     }
 
     /// Pull one artist folder's images; `None` when Jellyfin has no artist for it.
@@ -955,6 +1053,56 @@ impl Tally {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_paths_cover_each_location_and_the_samba_spelling() {
+        let locations = ["/media/music/".to_string(), "/more".to_string()];
+        assert_eq!(
+            server_paths(&locations, "Ratos de Pora\u{303}o"),
+            [
+                "/media/music/Ratos de Pora\u{303}o",
+                "/more/Ratos de Pora\u{303}o"
+            ]
+        );
+        assert_eq!(
+            server_paths(&locations[..1], "Bad Cop:Bad Cop"),
+            [
+                "/media/music/Bad Cop:Bad Cop",
+                "/media/music/Bad Cop\u{F022}Bad Cop"
+            ]
+        );
+    }
+
+    #[test]
+    fn describes_an_added_folder() {
+        let added = Synced {
+            added: true,
+            ..Synced::default()
+        };
+        assert_eq!(
+            added.describe(true).as_deref(),
+            Some("would add to Jellyfin")
+        );
+        let shown = Synced {
+            replaced: vec!["folder.jpg".into()],
+            ..added
+        };
+        assert_eq!(
+            shown.describe(false).as_deref(),
+            Some("added to Jellyfin; Jellyfin now: shows folder.jpg")
+        );
+        let pending = Synced {
+            pending: true,
+            ..Synced::default()
+        };
+        assert!(
+            pending
+                .describe(false)
+                .unwrap()
+                .starts_with("sent to Jellyfin")
+        );
+        assert!(pending.changed());
+    }
     use std::cell::RefCell;
 
     const BASE: &str = "/media/music/AFI";

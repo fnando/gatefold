@@ -114,9 +114,7 @@ pub struct Kept {
 /// `gatefold keep --dir <dir>`: write `.gatefold-keep`, keeping everything the
 /// folder governs, and remove the folder's granular markers it replaces.
 pub fn mark_dir(dir: &Path) -> Result<Kept> {
-    if !dir.is_dir() {
-        bail!("{} is not a folder", dir.display());
-    }
+    crate::paths::require_dir(dir, Some("use --file to keep one image"))?;
     let marker = write_marker(dir, ALL)?;
     let mut replaced = Vec::new();
     for name in ARTIST_IMAGES.map(artist_marker).into_iter().chain([COVER]) {
@@ -138,9 +136,7 @@ pub fn mark_dir(dir: &Path) -> Result<Kept> {
 /// folder for `cover.*`, `.gatefold-video-keep` in the artist folder for
 /// `backdrops/backdrop.mp4`, …).
 pub fn mark_file(path: &Path) -> Result<Kept> {
-    if !path.is_file() {
-        bail!("{} is not a file", path.display());
-    }
+    crate::paths::require_file(path, Some("use --dir to keep everything in a folder"))?;
     let Some((managed, dir)) = skip::classify(path) else {
         bail!(
             "{} is not an image gatefold writes (cover.jpg, folder.jpg, backdrop.jpg, \

@@ -504,7 +504,9 @@ matched by their `MusicBrainz` id, else by folder name.
 - **`refresh`** asks Jellyfin to rescan each artist folder, with no check first, then
   pushes. `push` only rescans when one of the folder's images is missing from Jellyfin, so
   it misses a file replaced under the same name; `refresh` doesn't. `restore` does the same
-  for the artist it restored into. With `--dry-run`, nothing is rescanned.
+  for the artist it restored into. A folder Jellyfin doesn't have yet is reported to it as
+  new, so it scans just that folder in (Jellyfin waits about a minute before it looks), and
+  is pushed once it shows up. With `--dry-run`, nothing is rescanned or added.
 
 ### Incremental runs (`--new-only`)
 

@@ -119,9 +119,7 @@ impl What {
 pub fn run(dirs: &[PathBuf], options: &Options) -> Result<()> {
     let mut run = Run::default();
     for root in dirs {
-        if !root.is_dir() {
-            bail!("{} is not a folder", root.display());
-        }
+        crate::paths::require_dir(root, None)?;
         let walk = WalkDir::new(root).sort_by_file_name().into_iter();
         for entry in walk {
             let entry = match entry {

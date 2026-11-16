@@ -12,6 +12,7 @@ mod metadata;
 mod musicbrainz;
 mod net;
 mod optimize;
+mod paths;
 mod progress;
 mod restore;
 mod revision;
@@ -295,7 +296,7 @@ fn sync_jellyfin(
     let backups = state.backup_root().join("jellyfin");
     let revisions = Revisions::new();
     let opts = jellyfin_options(&backups, &revisions, dry_run);
-    let session = jellyfin::Session::connect(url, api_key, cli::default_user_agent())
+    let mut session = jellyfin::Session::connect(url, api_key, cli::default_user_agent())
         .with_context(|| format!("connecting to Jellyfin at {url}"))?;
 
     let mut push = jellyfin::Tally::default();
@@ -303,7 +304,9 @@ fn sync_jellyfin(
     for dir in dirs {
         let dir =
             std::fs::canonicalize(dir).with_context(|| format!("reading {}", dir.display()))?;
-        let folders = if session.find(&dir, None).is_some() {
+        // An artist folder Jellyfin doesn't know yet is still an artist folder
+        // (reported as not in Jellyfin), not a library to walk.
+        let folders = if session.find(&dir, None).is_some() || jellyfin::is_artist_folder(&dir) {
             vec![dir]
         } else if action == JellyfinAction::Pull {
             // A folder with no images yet is just where a pull helps.
@@ -326,7 +329,7 @@ fn sync_jellyfin(
                 }
                 JellyfinAction::Push | JellyfinAction::Refresh => {
                     let result = if action == JellyfinAction::Refresh {
-                        session.rescan_folder(&folder, &opts)
+                        Some(session.rescan_folder(&folder, &opts))
                     } else {
                         session.sync_folder(&folder, None, &opts)
                     };
@@ -394,9 +397,9 @@ fn skip_images(images: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
     let mut failed = 0;
     let mut all = images.to_vec();
     for dir in dirs {
-        if !dir.is_dir() {
+        if let Err(err) = paths::require_dir(dir, Some("use --file to skip one image")) {
             failed += 1;
-            eprintln!("✗ {} is not a folder", dir.display());
+            eprintln!("✗ {err:#}");
             continue;
         }
         let found = skip::managed_in(dir);

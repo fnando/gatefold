@@ -112,9 +112,7 @@ pub enum Marked {
 /// manages) by writing a marker next to it. The image itself is left in place
 /// until a run finds something to replace it with.
 pub fn mark(image: &Path) -> Result<Marked> {
-    if !image.is_file() {
-        bail!("{} is not a file", image.display());
-    }
+    crate::paths::require_file(image, Some("use --dir to skip every image in a folder"))?;
     if !managed(image) {
         bail!(
             "{} is not an image gatefold writes (cover.jpg, folder.jpg, backdrop.jpg, \

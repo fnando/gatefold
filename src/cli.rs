@@ -17,7 +17,7 @@ pub struct Cli {
     pub command: Option<Command>,
 
     /// Folder to scan recursively for music files.
-    #[arg(long, value_name = "DIR", default_value = ".")]
+    #[arg(long, value_parser = crate::paths::parse, value_name = "DIR", default_value = ".")]
     pub dir: PathBuf,
 
     /// Base directory for cached API responses (`lrc/`, `artist/`, `release/`),
@@ -204,13 +204,13 @@ pub enum Command {
         /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
         /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Repeat for
         /// several (`--file a --file b`).
-        #[arg(long = "file", value_name = "IMAGE", required_unless_present = "dirs")]
+        #[arg(long = "file", value_parser = crate::paths::parse, value_name = "IMAGE", required_unless_present = "dirs")]
         images: Vec<PathBuf>,
 
         /// Artist or album folders, to skip every image gatefold wrote in them
         /// (album folders below an artist folder are left alone). Repeat for
         /// several.
-        #[arg(long = "dir", value_name = "DIR")]
+        #[arg(long = "dir", value_parser = crate::paths::parse, value_name = "DIR")]
         dirs: Vec<PathBuf>,
     },
     /// Never replace an image, even with `--replace-cover` /
@@ -222,12 +222,12 @@ pub enum Command {
         /// Album covers (`cover.jpg`) or artist files (`folder.jpg`,
         /// `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Repeat for
         /// several.
-        #[arg(long = "file", value_name = "IMAGE", required_unless_present = "dirs")]
+        #[arg(long = "file", value_parser = crate::paths::parse, value_name = "IMAGE", required_unless_present = "dirs")]
         files: Vec<PathBuf>,
 
         /// Artist or album folders, to keep everything they govern. Repeat
         /// for several.
-        #[arg(long = "dir", value_name = "DIR")]
+        #[arg(long = "dir", value_parser = crate::paths::parse, value_name = "DIR")]
         dirs: Vec<PathBuf>,
     },
     /// Move an artist file into its artist folder's `.gatefold-archive/`,
@@ -237,7 +237,7 @@ pub enum Command {
     Archive {
         /// Artist files (`folder.jpg`, `backdrop.jpg`, `backdrops/backdrop.mp4`,
         /// `logo.png`). Repeat for several.
-        #[arg(long = "file", value_name = "FILE", required = true)]
+        #[arg(long = "file", value_parser = crate::paths::parse, value_name = "FILE", required = true)]
         files: Vec<PathBuf>,
     },
     /// Shrink the images and motion backdrops already in a library, as gatefold
@@ -251,7 +251,7 @@ pub enum Command {
     Optimize {
         /// Folders to walk (a whole library, an artist, an album). Repeat for
         /// several.
-        #[arg(long = "dir", value_name = "DIR", required = true)]
+        #[arg(long = "dir", value_parser = crate::paths::parse, value_name = "DIR", required = true)]
         dirs: Vec<PathBuf>,
 
         /// Report what would be saved without writing anything.
@@ -278,6 +278,7 @@ pub enum Command {
         /// one to restore.
         #[arg(
             long,
+            value_parser = crate::paths::parse,
             value_name = "DIR",
             required_unless_present = "file",
             conflicts_with = "file"
@@ -286,7 +287,7 @@ pub enum Command {
 
         /// A file in an artist folder's `.gatefold-archive/`, restored without
         /// asking.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, value_parser = crate::paths::parse, value_name = "FILE")]
         file: Option<PathBuf>,
 
         /// Also keep the restored file (see `keep`), so `--replace-artist-images`
@@ -337,8 +338,9 @@ pub enum JellyfinCommand {
     Pull(JellyfinTarget),
     /// Have Jellyfin rescan each artist folder, then `push`. The rescan is
     /// always asked for, with no check first, so Jellyfin notices files
-    /// replaced under the same name (as after `restore`). A dry run doesn't
-    /// rescan.
+    /// replaced under the same name (as after `restore`). A folder Jellyfin
+    /// doesn't have yet is reported to it as new and pushed once it's scanned
+    /// in (Jellyfin waits about a minute first). A dry run changes nothing.
     Refresh(JellyfinTarget),
 }
 
@@ -347,7 +349,7 @@ pub enum JellyfinCommand {
 pub struct JellyfinTarget {
     /// Artist folders, or a library whose subfolders are artist folders.
     /// Repeat for several.
-    #[arg(long = "dir", value_name = "DIR", required = true)]
+    #[arg(long = "dir", value_parser = crate::paths::parse, value_name = "DIR", required = true)]
     pub dirs: Vec<PathBuf>,
 
     /// Report what would change without changing anything.

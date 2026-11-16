@@ -142,9 +142,7 @@ pub fn run(target: &Target, keep: bool) -> Result<Option<PathBuf>> {
     let revisions = Revisions::new();
     let (dir, entry) = match *target {
         Target::File(path) => {
-            if !path.is_file() {
-                bail!("{} is not a file", path.display());
-            }
+            crate::paths::require_file(path, Some("use --dir to choose from a folder"))?;
             let kind = kind_of(path).context(format!(
             "{} is not an archived artist file (expected <artist>/{ARCHIVE_DIR}/<primary|backdrops|logos>/<file>)",
             path.display()
@@ -161,6 +159,7 @@ pub fn run(target: &Target, keep: bool) -> Result<Option<PathBuf>> {
             )
         }
         Target::Dir(path) => {
+            crate::paths::require_dir(path, Some("use --file to restore one archived file"))?;
             let entries = list(path)?;
             if entries.is_empty() {
                 println!("nothing archived in {}", path.join(ARCHIVE_DIR).display());
