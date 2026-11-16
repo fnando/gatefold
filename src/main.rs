@@ -104,11 +104,7 @@ fn main() -> Result<()> {
     let revisions = Revisions::new();
 
     if !artist_only {
-        progress.section(if cli.cache_only {
-            "Processing (cache-only)"
-        } else {
-            "Processing"
-        });
+        progress.section(&section_title(&cli, "Processing"));
     }
 
     let mut summary = Summary::default();
@@ -144,13 +140,11 @@ fn main() -> Result<()> {
         );
     }
 
-    // Like every other write, not on a --cache-only run.
-    if cli.write_nfo && cli.artist_images_enabled() && !cli.cache_only {
-        summary.nfo = Some(run_nfo_pass(&state, &progress, &artist_jobs));
+    if cli.write_nfo && cli.artist_images_enabled() {
+        summary.nfo = Some(run_nfo_pass(&state, &progress, &artist_jobs, cli.dry_run));
     }
 
-    if !cli.cache_only
-        && !cli.skip_jellyfin
+    if !cli.skip_jellyfin
         && cli.artist_images_enabled()
         && let Some(server) = cli.jellyfin.server()
     {
@@ -186,8 +180,9 @@ fn run_nfo_pass(
     state: &State,
     progress: &Progress,
     jobs: &BTreeMap<String, ArtistJob>,
+    dry_run: bool,
 ) -> NfoTally {
-    progress.section("nfo");
+    progress.section(if dry_run { "nfo (dry run)" } else { "nfo" });
     let mut tally = NfoTally::default();
     let mut claims: BTreeMap<&Path, usize> = BTreeMap::new();
     for job in jobs.values() {
@@ -195,6 +190,7 @@ fn run_nfo_pass(
             *claims.entry(folder.as_path()).or_default() += 1;
         }
     }
+    progress.info(format!("{} artist folder(s)", claims.len()));
     for job in jobs.values() {
         let mb_name = state
             .load_musicbrainz_artist(&job.mbid)
@@ -221,14 +217,16 @@ fn run_nfo_pass(
                 }
                 continue;
             }
-            match nfo::write_artist(folder, &job.name, &job.mbid) {
+            match nfo::write_artist(folder, &job.name, &job.mbid, dry_run) {
                 Ok(nfo::Outcome::Wrote) => {
                     tally.wrote += 1;
-                    progress.info(format!("✓ {label}: wrote artist.nfo"));
+                    let wrote = act(dry_run, "wrote", "write");
+                    progress.info(format!("✓ {label}: {wrote} artist.nfo"));
                 }
                 Ok(nfo::Outcome::Completed) => {
                     tally.completed += 1;
-                    progress.info(format!("✓ {label}: completed artist.nfo"));
+                    let completed = act(dry_run, "completed", "complete");
+                    progress.info(format!("✓ {label}: {completed} artist.nfo"));
                 }
                 Ok(nfo::Outcome::Already) => tally.already += 1,
                 Ok(nfo::Outcome::Differs(id)) => {
@@ -248,6 +246,12 @@ fn run_nfo_pass(
                 }
             }
         }
+    }
+    if tally.wrote + tally.completed + tally.errors == 0 {
+        progress.info(format!(
+            "· nothing to write ({} already complete, {} skipped)",
+            tally.already, tally.skipped
+        ));
     }
     tally
 }
@@ -282,11 +286,11 @@ fn run_jellyfin_pass(
         }
     };
     let backups = state.backup_root().join("jellyfin");
-    let opts = jellyfin_options(&backups, revisions, false);
+    let opts = jellyfin_options(&backups, revisions, cli.dry_run);
     for job in jobs.values() {
         for folder in &job.folders {
             let result = session.sync_folder(folder, Some(&job.mbid), &opts);
-            for line in tally.record(&job.name, result, false) {
+            for line in tally.record(&job.name, result, cli.dry_run) {
                 progress.info(line);
             }
         }
@@ -783,11 +787,7 @@ fn run_artist_pass(
     summary: &mut Summary,
 ) {
     let mb = &services.musicbrainz;
-    progress.section(if cli.cache_only {
-        "Artist images (cache-only)"
-    } else {
-        "Artist images"
-    });
+    progress.section(&section_title(cli, "Artist images"));
     progress.info(format!(
         "{} distinct album artist(s) with a MusicBrainz id",
         jobs.len()
@@ -800,13 +800,13 @@ fn run_artist_pass(
     for (i, job) in jobs.values().enumerate() {
         bar.status(job.name.clone());
         let start = Instant::now();
-        if !cli.cache_only {
+        if !cli.dry_run {
             migrate_archives(&bar, job);
         }
         match process_artist(cli, state, services, revisions, &bar, job) {
             Ok(outcome) => {
                 summary.record_artist(&outcome);
-                log_artist(&bar, job, &outcome);
+                log_artist(&bar, job, &outcome, cli.dry_run);
             }
             Err(err) => {
                 summary.artist_errors += 1;
@@ -874,11 +874,7 @@ fn env_file_arg() -> Option<std::path::PathBuf> {
 /// A one-line banner summarizing what this run will do, across every axis.
 /// `mb_host` names a non-public `MusicBrainz` server so a misconfigured one is obvious.
 fn run_summary(cli: &Cli, mb_host: Option<&str>) -> String {
-    let mode = if cli.cache_only {
-        "cache-only"
-    } else {
-        "writing"
-    };
+    let mode = if cli.dry_run { "dry run" } else { "writing" };
     let scope = join_enabled(&[
         ("lyrics", cli.lyrics_enabled()),
         ("cover", cli.cover_enabled()),
@@ -915,6 +911,15 @@ fn run_summary(cli: &Cli, mb_host: Option<&str>) -> String {
     format!(
         "gatefold · {mode} · scope: {scope} · select: {select} · replace: {replace} · verify: {verify}{mb}"
     )
+}
+
+/// A section title, marked when the run changes nothing.
+fn section_title(cli: &Cli, title: &str) -> String {
+    if cli.dry_run {
+        format!("{title} (dry run)")
+    } else {
+        title.to_string()
+    }
 }
 
 /// `"a + b"` for the enabled entries, or `"none"`.
@@ -980,7 +985,7 @@ fn process_track(
         ) {
             Ok(outcome) => {
                 summary.record_lyrics(&outcome);
-                log_lyrics(progress, name, &outcome);
+                log_lyrics(progress, name, &outcome, cli.dry_run);
             }
             Err(err) if err.downcast_ref::<Unauthorized>().is_some() => return Err(err),
             Err(err) => {
@@ -1004,7 +1009,7 @@ fn process_track(
         ) {
             Ok(outcome) => {
                 summary.record_cover(&outcome);
-                log_cover(progress, name, &outcome);
+                log_cover(progress, name, &outcome, cli.dry_run);
             }
             Err(err) => {
                 summary.cover_errors += 1;
@@ -1063,11 +1068,6 @@ enum LyricsOutcome {
         lrc: bool,
         reused: bool,
     },
-    CacheOnly {
-        has_plain: bool,
-        has_synced: bool,
-        reused: bool,
-    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1115,14 +1115,6 @@ fn process_lyrics(
         return Ok(LyricsOutcome::NotFound);
     };
 
-    if cli.cache_only {
-        return Ok(LyricsOutcome::CacheOnly {
-            has_plain: record.has_plain(),
-            has_synced: record.has_synced(),
-            reused,
-        });
-    }
-
     if record.instrumental || (!record.has_plain() && !record.has_synced()) {
         return Ok(LyricsOutcome::NoLyrics);
     }
@@ -1134,12 +1126,13 @@ fn process_lyrics(
             cli.replace_lyrics,
             cli.verify,
             Some(backup),
+            cli.dry_run,
         )?
     } else {
         writer::Write::Skipped
     };
     let wrote_lrc = if need_lrc && record.has_synced() {
-        writer::write_lrc(path, record.synced_lyrics.as_deref().unwrap())?
+        writer::write_lrc(path, record.synced_lyrics.as_deref().unwrap(), cli.dry_run)?
     } else {
         false
     };
@@ -1211,10 +1204,6 @@ enum CoverOutcome {
     Applied {
         embedded: writer::Write,
         sidecar: writer::Write,
-        reused: bool,
-        source: String,
-    },
-    CacheOnly {
         reused: bool,
         source: String,
     },
@@ -1319,17 +1308,15 @@ fn process_cover(
         .clone()
         .unwrap_or_else(|| "cover art archive".to_string());
 
-    if cli.cache_only {
-        return Ok(CoverOutcome::CacheOnly { reused, source });
-    }
-
     let embedded = if need_embed {
-        writer::embed_cover(path, &art, replace, cli.verify, Some(backup))?
+        writer::embed_cover(path, &art, replace, cli.verify, Some(backup), cli.dry_run)?
     } else {
         writer::Write::Skipped
     };
     let sidecar = match folder {
-        Some(dir) if need_sidecar => writer::write_cover_sidecar(dir, &art, replace, Some(backup))?,
+        Some(dir) if need_sidecar => {
+            writer::write_cover_sidecar(dir, &art, replace, Some(backup), cli.dry_run)?
+        }
         _ => writer::Write::Skipped,
     };
 
@@ -1469,10 +1456,6 @@ enum ArtistOutcome {
     NoImage,
     /// `--replace-artist-images`, but the images are the ones already written.
     Unchanged,
-    CacheOnly {
-        source: Source,
-        reused: bool,
-    },
     Applied {
         avatar: writer::Write,
         backdrop: writer::Write,
@@ -1501,7 +1484,7 @@ fn process_artist(
 ) -> Result<ArtistOutcome> {
     let resolver = &services.resolver;
     let mbid = job.mbid.as_str();
-    if job.folders.is_empty() && !cli.cache_only {
+    if job.folders.is_empty() {
         return Ok(ArtistOutcome::NoFolder);
     }
 
@@ -1516,7 +1499,7 @@ fn process_artist(
 
     // Every folder already complete and not replacing (or retrying Apple):
     // nothing to do, and no reason to touch the network.
-    if !look_again && !cli.cache_only && folders_complete(job, record.as_ref(), services.videos) {
+    if !look_again && folders_complete(job, record.as_ref(), services.videos) {
         return Ok(complete_outcome(mode, record.as_ref()));
     }
 
@@ -1550,7 +1533,7 @@ fn process_artist(
     // Churn guard: only overwrite when the images differ from what was written.
     // Spotify only ever provides an avatar, and a lower-quality one than Apple's —
     // so never let a Spotify fall-through overwrite an existing file. A record
-    // that was never written (e.g. from --cache-only) says nothing about what's
+    // that was never written (e.g. from a --dry-run) says nothing about what's
     // on disk, so it can't vouch that the images are already there. Nor can any
     // record under --apple-url, which may be swapping in a different artist's
     // page; the writer still compares each file's digest before replacing it.
@@ -1575,9 +1558,7 @@ fn process_artist(
     let alternatives = wants_replace && resolved.source == Source::Apple;
 
     let want_video = services.videos && resolved.video_url.is_some();
-    let needs_write =
-        cli.cache_only || missing_files(job, &resolved, replace, alternatives, want_video);
-    if !needs_write {
+    if !missing_files(job, &resolved, replace, alternatives, want_video) {
         if record_changed {
             state.save_artist_record(mbid, &new_record)?;
         }
@@ -1597,19 +1578,13 @@ fn process_artist(
         _ => None,
     };
 
-    if cli.cache_only {
-        state.save_artist_record(mbid, &new_record)?;
-        return Ok(ArtistOutcome::CacheOnly {
-            source: resolved.source,
-            reused,
-        });
-    }
-
     // 4. Write into every artist folder.
     let writes = (replace, alternatives);
-    let written = write_artist_images(job, &images, video.as_ref(), writes, revisions)?;
+    let written =
+        write_artist_images(job, &images, video.as_ref(), writes, revisions, cli.dry_run)?;
     if written.wrote() || !written.alternatives.is_empty() {
-        if written.wrote() {
+        // A dry run wrote nothing: the record still caches what was resolved.
+        if written.wrote() && !cli.dry_run {
             new_record.written_at = Some(now);
         }
         state.save_artist_record(mbid, &new_record)?;
@@ -1897,6 +1872,7 @@ fn write_artist_images(
     video: Option<&state::CachedArt>,
     (replace, alternatives): (bool, bool),
     revisions: &Revisions,
+    dry_run: bool,
 ) -> Result<Written> {
     let mut written = Written {
         avatar: writer::Write::Skipped,
@@ -1919,13 +1895,14 @@ fn write_artist_images(
             let turned_away = skip::rejects_art(&kind.target_dir(dir), art)
                 || (alternatives && kept && skip::present(dir, *kind).is_some());
             if turned_away {
-                let saved = writer::archive_alternative(dir, *kind, art, revisions)?;
+                let saved = writer::archive_alternative(dir, *kind, art, revisions, dry_run)?;
                 written.alternatives.extend(saved);
                 continue;
             }
             // Hand-curated in this folder: written if missing, never replaced.
             let replace = (replace && !kept) || skip::artist_image(dir, *kind);
-            let (wrote, kept) = writer::write_artist_image(dir, *kind, art, replace, revisions)?;
+            let (wrote, kept) =
+                writer::write_artist_image(dir, *kind, art, replace, revisions, dry_run)?;
             let slot = match kind {
                 ArtistImage::Avatar => &mut written.avatar,
                 ArtistImage::Backdrop => &mut written.backdrop,
@@ -2065,7 +2042,7 @@ fn pad_track_number(name: &str) -> String {
     }
 }
 
-fn log_lyrics(progress: &Progress, name: &str, outcome: &LyricsOutcome) {
+fn log_lyrics(progress: &Progress, name: &str, outcome: &LyricsOutcome, dry_run: bool) {
     match outcome {
         LyricsOutcome::SkippedNothingToDo => {
             progress.info(format!("· {name}: lyrics already present"));
@@ -2080,30 +2057,25 @@ fn log_lyrics(progress: &Progress, name: &str, outcome: &LyricsOutcome) {
         LyricsOutcome::Applied { tag, lrc, reused } => {
             let mut parts = Vec::new();
             match tag {
-                writer::Write::Created => parts.push("wrote lyrics tag".to_string()),
-                writer::Write::Replaced => parts.push("replaced lyrics tag".to_string()),
+                writer::Write::Created => {
+                    parts.push(format!("{} lyrics tag", act(dry_run, "wrote", "write")));
+                }
+                writer::Write::Replaced => parts.push(format!(
+                    "{} lyrics tag",
+                    act(dry_run, "replaced", "replace")
+                )),
                 writer::Write::Skipped => {}
             }
             if *lrc {
-                parts.push("wrote .lrc file".to_string());
+                parts.push(format!("{} .lrc file", act(dry_run, "wrote", "write")));
             }
             let src = if *reused { " (from cache)" } else { "" };
             progress.info(format!("✓ {name}: {}{src}", parts.join(", ")));
         }
-        LyricsOutcome::CacheOnly {
-            has_plain,
-            has_synced,
-            reused,
-        } => {
-            let src = if *reused { "cache" } else { "api" };
-            progress.info(format!(
-                "~ {name}: lyrics via {src} (plain={has_plain}, synced={has_synced})"
-            ));
-        }
     }
 }
 
-fn log_cover(progress: &Progress, name: &str, outcome: &CoverOutcome) {
+fn log_cover(progress: &Progress, name: &str, outcome: &CoverOutcome, dry_run: bool) {
     match outcome {
         // Missing MBID, "nothing to do", and filter skips are common; keep them quiet.
         // Kept covers would log once per track of the album; the summary counts them.
@@ -2123,13 +2095,24 @@ fn log_cover(progress: &Progress, name: &str, outcome: &CoverOutcome) {
         } => {
             let mut parts = Vec::new();
             match embedded {
-                writer::Write::Created => parts.push("embedded cover".to_string()),
-                writer::Write::Replaced => parts.push("replaced embedded cover".to_string()),
+                writer::Write::Created => {
+                    parts.push(format!("{} cover", act(dry_run, "embedded", "embed")));
+                }
+                writer::Write::Replaced => {
+                    parts.push(format!(
+                        "{} embedded cover",
+                        act(dry_run, "replaced", "replace")
+                    ));
+                }
                 writer::Write::Skipped => {}
             }
             match sidecar {
-                writer::Write::Created => parts.push("wrote cover.jpg".to_string()),
-                writer::Write::Replaced => parts.push("replaced cover.jpg".to_string()),
+                writer::Write::Created => {
+                    parts.push(format!("{} cover.jpg", act(dry_run, "wrote", "write")));
+                }
+                writer::Write::Replaced => {
+                    parts.push(format!("{} cover.jpg", act(dry_run, "replaced", "replace")));
+                }
                 writer::Write::Skipped => {}
             }
             if parts.is_empty() {
@@ -2142,14 +2125,10 @@ fn log_cover(progress: &Progress, name: &str, outcome: &CoverOutcome) {
             };
             progress.info(format!("✓ {name}: {} ({src})", parts.join(", ")));
         }
-        CoverOutcome::CacheOnly { reused, source } => {
-            let src = if *reused { "cache" } else { source.as_str() };
-            progress.info(format!("~ {name}: cover via {src}"));
-        }
     }
 }
 
-fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
+fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome, dry_run: bool) {
     let name = &job.name;
     match outcome {
         ArtistOutcome::SkippedNothingToDo | ArtistOutcome::SkippedByFilter => {}
@@ -2173,10 +2152,6 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             progress.info(format!("· {name}: no artist image on Apple Music/Spotify"));
         }
         ArtistOutcome::Unchanged => progress.info(format!("· {name}: artist images unchanged")),
-        ArtistOutcome::CacheOnly { source, reused } => {
-            let src = if *reused { "cache" } else { source.label() };
-            progress.info(format!("~ {name}: artist images via {src}"));
-        }
         ArtistOutcome::Applied {
             avatar,
             backdrop,
@@ -2197,14 +2172,17 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             ] {
                 let name = kind.label(ext);
                 match write {
-                    writer::Write::Created => parts.push(format!("wrote {name}")),
-                    writer::Write::Replaced => parts.push(format!("replaced {name}")),
+                    writer::Write::Created => parts.push(format!("{} {name}", act(dry_run, "wrote", "write"))),
+                    writer::Write::Replaced => {
+                        parts.push(format!("{} {name}", act(dry_run, "replaced", "replace")));
+                    }
                     writer::Write::Skipped => {}
                 }
             }
             if !alternatives.is_empty() {
                 parts.push(format!(
-                    "archived alternative {} (gatefold restore)",
+                    "{} alternative {} (gatefold restore)",
+                    act(dry_run, "archived", "archive"),
                     alternatives.join(", ")
                 ));
             }
@@ -2221,6 +2199,15 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
             };
             progress.info(format!("✓ {name}: {} ({src}{kept}){why}", parts.join(", ")));
         }
+    }
+}
+
+/// `done` ("wrote"), or on a dry run "would" + `todo` ("would write").
+fn act(dry_run: bool, done: &str, todo: &str) -> String {
+    if dry_run {
+        format!("would {todo}")
+    } else {
+        done.to_string()
     }
 }
 
@@ -2245,7 +2232,6 @@ struct Summary {
     lyrics_skipped: u64,
     lyrics_not_found: u64,
     no_lyrics: u64,
-    lyrics_cache_only: u64,
     lyrics_errors: u64,
     // cover art
     embedded_cover: u64,
@@ -2256,7 +2242,6 @@ struct Summary {
     cover_kept: u64,
     cover_rejected: u64,
     cover_not_found: u64,
-    cover_cache_only: u64,
     cover_errors: u64,
     // artist images
     artist_wrote: u64,
@@ -2269,7 +2254,6 @@ struct Summary {
     artist_spotify_only: u64,
     artist_no_links: u64,
     artist_no_image: u64,
-    artist_cache_only: u64,
     artist_errors: u64,
     nfo: Option<NfoTally>,
     // jellyfin
@@ -2286,7 +2270,6 @@ impl Summary {
             }
             LyricsOutcome::NotFound => self.lyrics_not_found += 1,
             LyricsOutcome::NoLyrics => self.no_lyrics += 1,
-            LyricsOutcome::CacheOnly { .. } => self.lyrics_cache_only += 1,
             LyricsOutcome::Applied { tag, lrc, .. } => {
                 match tag {
                     writer::Write::Created => self.wrote_tag += 1,
@@ -2310,7 +2293,6 @@ impl Summary {
             CoverOutcome::NotFound => self.cover_not_found += 1,
             CoverOutcome::Kept => self.cover_kept += 1,
             CoverOutcome::Rejected => self.cover_rejected += 1,
-            CoverOutcome::CacheOnly { .. } => self.cover_cache_only += 1,
             CoverOutcome::Applied {
                 embedded, sidecar, ..
             } => {
@@ -2340,7 +2322,6 @@ impl Summary {
             ArtistOutcome::NoLinks => self.artist_no_links += 1,
             ArtistOutcome::NoImage => self.artist_no_image += 1,
             ArtistOutcome::Unchanged => self.artist_unchanged += 1,
-            ArtistOutcome::CacheOnly { .. } => self.artist_cache_only += 1,
             ArtistOutcome::Applied {
                 avatar,
                 backdrop,
@@ -2358,7 +2339,6 @@ impl Summary {
     }
 
     fn print(&self, progress: &Progress, cli: &Cli) {
-        let cache_only = cli.cache_only;
         if self.unreadable > 0 {
             progress.info(format!(
                 "unreadable: {} file(s) could not be parsed and were skipped",
@@ -2366,37 +2346,43 @@ impl Summary {
             ));
         }
         if cli.lyrics_enabled() {
-            self.print_lyrics(progress, cache_only);
+            self.print_lyrics(progress, cli.dry_run);
         }
         if cli.cover_enabled() {
-            self.print_cover(progress, cache_only);
+            self.print_cover(progress, cli.dry_run);
         }
         if cli.artist_images_enabled() {
-            self.print_artist(progress, cache_only);
+            self.print_artist(progress, cli.dry_run);
         }
         if let Some(tally) = &self.nfo {
             progress.info("nfo:");
+            let d = cli.dry_run;
             progress.info(format!(
-                "  wrote {} artist.nfo, completed {}, already {}, skipped {}, errors {}",
-                tally.wrote, tally.completed, tally.already, tally.skipped, tally.errors
+                "  {} {} artist.nfo, {} {}, already {}, skipped {}, errors {}",
+                act(d, "wrote", "write"),
+                tally.wrote,
+                act(d, "completed", "complete"),
+                tally.completed,
+                tally.already,
+                tally.skipped,
+                tally.errors
             ));
         }
         if let Some(tally) = &self.jellyfin {
             progress.info("jellyfin:");
-            progress.info(format!("  {}", tally.summary(false)));
+            progress.info(format!("  {}", tally.summary(cli.dry_run)));
         }
     }
 
-    fn print_artist(&self, progress: &Progress, cache_only: bool) {
+    fn print_artist(&self, progress: &Progress, d: bool) {
         progress.info("artist images:");
-        if cache_only {
-            progress.info(format!("  cached {} artist(s)", self.artist_cache_only));
-        } else {
-            progress.info(format!(
-                "  wrote images for {} artist(s), replaced {}",
-                self.artist_wrote, self.artist_replaced
-            ));
-        }
+        progress.info(format!(
+            "  {} images for {} artist(s), {} {}",
+            act(d, "wrote", "write"),
+            self.artist_wrote,
+            act(d, "replaced", "replace"),
+            self.artist_replaced
+        ));
         progress.info(format!(
             "  unchanged {}, skipped {}, kept {}, fresh {}, no folder {}, no apple music link {}, no links {}, no image {}, errors {}",
             self.artist_unchanged,
@@ -2411,37 +2397,42 @@ impl Summary {
         ));
     }
 
-    fn print_lyrics(&self, progress: &Progress, cache_only: bool) {
+    fn print_lyrics(&self, progress: &Progress, d: bool) {
         progress.info("lyrics:");
-        if cache_only {
-            progress.info(format!("  cached {} response(s)", self.lyrics_cache_only));
-        } else {
-            progress.info(format!(
-                "  wrote {} tag(s), replaced {}",
-                self.wrote_tag, self.replaced_tag
-            ));
-            progress.info(format!("  created {} .lrc file(s)", self.wrote_lrc));
-        }
+        progress.info(format!(
+            "  {} {} tag(s), {} {}",
+            act(d, "wrote", "write"),
+            self.wrote_tag,
+            act(d, "replaced", "replace"),
+            self.replaced_tag
+        ));
+        progress.info(format!(
+            "  {} {} .lrc file(s)",
+            act(d, "created", "create"),
+            self.wrote_lrc
+        ));
         progress.info(format!(
             "  skipped {}, not found {}, none {}, errors {}",
             self.lyrics_skipped, self.lyrics_not_found, self.no_lyrics, self.lyrics_errors
         ));
     }
 
-    fn print_cover(&self, progress: &Progress, cache_only: bool) {
+    fn print_cover(&self, progress: &Progress, d: bool) {
         progress.info("cover art:");
-        if cache_only {
-            progress.info(format!("  cached {} image(s)", self.cover_cache_only));
-        } else {
-            progress.info(format!(
-                "  embedded {} cover(s), replaced {}",
-                self.embedded_cover, self.replaced_cover
-            ));
-            progress.info(format!(
-                "  wrote {} cover.jpg sidecar(s), replaced {}",
-                self.wrote_cover_sidecar, self.replaced_cover_sidecar
-            ));
-        }
+        progress.info(format!(
+            "  {} {} cover(s), {} {}",
+            act(d, "embedded", "embed"),
+            self.embedded_cover,
+            act(d, "replaced", "replace"),
+            self.replaced_cover
+        ));
+        progress.info(format!(
+            "  {} {} cover.jpg sidecar(s), {} {}",
+            act(d, "wrote", "write"),
+            self.wrote_cover_sidecar,
+            act(d, "replaced", "replace"),
+            self.replaced_cover_sidecar
+        ));
         progress.info(format!(
             "  skipped {}, kept {}, rejected {}, not found {}, errors {}",
             self.cover_skipped,
@@ -2511,6 +2502,7 @@ mod tests {
             None,
             (false, true),
             &revisions,
+            false,
         )
         .unwrap();
         assert_eq!(fs::read(kept.join("folder.jpg")).unwrap(), b"mine");
@@ -2524,6 +2516,7 @@ mod tests {
             None,
             (false, true),
             &revisions,
+            false,
         )
         .unwrap();
         assert_eq!(again.alternatives, Vec::<String>::new());
@@ -2534,6 +2527,7 @@ mod tests {
             None,
             (false, true),
             &revisions,
+            false,
         )
         .unwrap();
         assert_eq!(same.alternatives, Vec::<String>::new());
@@ -2549,6 +2543,7 @@ mod tests {
             None,
             (false, false),
             &revisions,
+            false,
         )
         .unwrap();
         assert_eq!(written.alternatives, Vec::<String>::new());
@@ -2565,6 +2560,7 @@ mod tests {
             None,
             (false, false),
             &revisions,
+            false,
         )
         .unwrap();
         assert!(!skipped.join("folder.jpg").exists());

@@ -68,8 +68,9 @@ pub fn skip_reason(folder_name: &str, mb_name: Option<&str>, claims: usize) -> O
 }
 
 /// Write `artist.nfo` in `folder` naming the artist and its `MusicBrainz` id,
-/// or complete an existing one with whichever of the two it lacks.
-pub fn write_artist(folder: &Path, name: &str, mbid: &str) -> Result<Outcome> {
+/// or complete an existing one with whichever of the two it lacks. On a
+/// `dry_run`, says what it would do and writes nothing.
+pub fn write_artist(folder: &Path, name: &str, mbid: &str, dry_run: bool) -> Result<Outcome> {
     let path = folder.join(ARTIST_FILE);
     let existing = match fs::read(&path) {
         Ok(bytes) => Some(
@@ -79,6 +80,9 @@ pub fn write_artist(folder: &Path, name: &str, mbid: &str) -> Result<Outcome> {
         Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
     };
     let Some(existing) = existing else {
+        if dry_run {
+            return Ok(Outcome::Wrote);
+        }
         let xml = format!(
             "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n<artist>\n  {}\n  {}\n</artist>\n",
             element(TITLE, name),
@@ -89,7 +93,9 @@ pub fn write_artist(folder: &Path, name: &str, mbid: &str) -> Result<Outcome> {
     };
     Ok(match complete(&existing, name, mbid) {
         Completion::Changed(xml) => {
-            write_atomic(&path, xml.as_bytes())?;
+            if !dry_run {
+                write_atomic(&path, xml.as_bytes())?;
+            }
             Outcome::Completed
         }
         Completion::Already => Outcome::Already,
@@ -192,7 +198,7 @@ mod tests {
     fn writes_a_new_file_with_an_escaped_name() {
         let dir = dir("new");
         assert_eq!(
-            write_artist(&dir, "AC/DC & Friends <x>", ID).unwrap(),
+            write_artist(&dir, "AC/DC & Friends <x>", ID, false).unwrap(),
             Outcome::Wrote
         );
         let xml = fs::read_to_string(dir.join(ARTIST_FILE)).unwrap();
@@ -200,7 +206,7 @@ mod tests {
         assert!(xml.contains(&format!("<musicbrainzartistid>{ID}</musicbrainzartistid>")));
         assert!(!dir.join(".artist.nfo.part").exists());
         assert_eq!(
-            write_artist(&dir, "AC/DC & Friends <x>", ID).unwrap(),
+            write_artist(&dir, "AC/DC & Friends <x>", ID, false).unwrap(),
             Outcome::Already
         );
         fs::remove_dir_all(&dir).unwrap();
@@ -212,7 +218,7 @@ mod tests {
         let bio = "<?xml version=\"1.0\"?>\n<artist>\n  <biography>Porto Alegre &amp; more.\n\n## Style</biography>\n</artist>\n";
         fs::write(dir.join(ARTIST_FILE), bio).unwrap();
         assert_eq!(
-            write_artist(&dir, "Wonkavision", ID).unwrap(),
+            write_artist(&dir, "Wonkavision", ID, false).unwrap(),
             Outcome::Completed
         );
         let xml = fs::read_to_string(dir.join(ARTIST_FILE)).unwrap();
@@ -223,7 +229,7 @@ mod tests {
             )
         );
         assert_eq!(
-            write_artist(&dir, "Wonkavision", ID).unwrap(),
+            write_artist(&dir, "Wonkavision", ID, false).unwrap(),
             Outcome::Already
         );
         fs::remove_dir_all(&dir).unwrap();
@@ -239,7 +245,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            write_artist(&dir, "Tagged", ID).unwrap(),
+            write_artist(&dir, "Tagged", ID, false).unwrap(),
             Outcome::Completed
         );
         assert_eq!(
@@ -252,14 +258,14 @@ mod tests {
         let other = "<artist><musicbrainzartistid>ffffffff-312a-4bb9-8dbc-1461af2788c9</musicbrainzartistid></artist>";
         fs::write(&path, other).unwrap();
         assert_eq!(
-            write_artist(&dir, "Tagged", ID).unwrap(),
+            write_artist(&dir, "Tagged", ID, false).unwrap(),
             Outcome::Differs("ffffffff-312a-4bb9-8dbc-1461af2788c9".into())
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), other);
 
         fs::write(&path, "<album><title>x</title></album>").unwrap();
         assert_eq!(
-            write_artist(&dir, "Tagged", ID).unwrap(),
+            write_artist(&dir, "Tagged", ID, false).unwrap(),
             Outcome::NotArtistXml
         );
         assert_eq!(
@@ -292,5 +298,33 @@ mod tests {
             None
         );
         assert_eq!(skip_reason("Bodyjar", None, 1), None);
+    }
+
+    #[test]
+    fn a_dry_run_says_what_it_would_do_and_writes_nothing() {
+        let dir = dir("dry");
+        let path = dir.join(ARTIST_FILE);
+        assert_eq!(
+            write_artist(&dir, "Wonkavision", ID, true).unwrap(),
+            Outcome::Wrote
+        );
+        assert!(!path.exists());
+        assert!(!dir.join(".artist.nfo.part").exists());
+
+        fs::write(&path, "<artist><biography>x</biography></artist>").unwrap();
+        assert_eq!(
+            write_artist(&dir, "Wonkavision", ID, true).unwrap(),
+            Outcome::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "<artist><biography>x</biography></artist>"
+        );
+        write_artist(&dir, "Wonkavision", ID, false).unwrap();
+        assert_eq!(
+            write_artist(&dir, "Wonkavision", ID, true).unwrap(),
+            Outcome::Already
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -104,7 +104,8 @@ pub struct ArtistRecord {
     pub logo_url: Option<String>,
     /// Unix seconds.
     pub resolved_at: u64,
-    /// Unix seconds; `None` after a `--cache-only` resolution.
+    /// Unix seconds; `None` until images were written (a `--dry-run` resolves
+    /// without writing).
     #[serde(default)]
     pub written_at: Option<u64>,
 }

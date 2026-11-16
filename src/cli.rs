@@ -68,10 +68,11 @@ pub struct Cli {
     #[arg(long, value_name = "MS", default_value_t = 300)]
     pub delay_ms: u64,
 
-    /// Populate the caches (lookups + downloads) but make no changes to music files
-    /// or folders.
+    /// Do everything a run would (lookups, downloads, decisions), but change no
+    /// music file, folder or Jellyfin; report what would change instead.
+    /// Lookups and downloads are still cached, so a real run after it is quick.
     #[arg(long)]
-    pub cache_only: bool,
+    pub dry_run: bool,
 
     /// Replace an existing embedded lyrics tag instead of keeping it. The previous
     /// value is snapshotted under the state dir's `backup/` tree so it can be restored.
@@ -599,6 +600,23 @@ mod tests {
         assert!(
             Cli::try_parse_from(["gatefold", "skip", "--file", "a", "b"]).is_err(),
             "one image per --file"
+        );
+    }
+
+    #[test]
+    fn dry_run_goes_with_everything() {
+        assert!(
+            Cli::try_parse_from(["gatefold", "--dry-run"])
+                .unwrap()
+                .dry_run
+        );
+        assert!(
+            Cli::try_parse_from(["gatefold", "--dry-run", "--write-nfo", "--replace-cover"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["gatefold", "--cache-only"]).is_err(),
+            "dropped for --dry-run"
         );
     }
 

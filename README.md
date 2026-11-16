@@ -65,7 +65,8 @@ you already have.
   Jellyfin has into the folders. See [Jellyfin](#jellyfin).
 - **`artist.nfo`** with `--write-nfo`: the artist's name and `MusicBrainz` id, so Jellyfin
   matches each artist folder to the right artist. See [artist.nfo](#artistnfo).
-- `--cache-only` mode that populates the cache without touching any music file.
+- `--dry-run` to see what a run would change without changing anything; what it looks up
+  and downloads is cached, so the real run after it is quick.
 - Respects service rate limits: sequential requests with a configurable delay, and
   automatic `Retry-After` back-off (with jitter) on `429`/`503`, shown with a live
   countdown spinner.
@@ -94,7 +95,7 @@ gatefold [--dir <DIR>] [OPTIONS]
 | `--user-agent <UA>` | Override the `User-Agent` sent to lrclib.net, the Cover Art Archive, `MusicBrainz`, and Wikidata. (env: `GATEFOLD_USER_AGENT`) |
 | `--musicbrainz-url <URL>` | Base URL of the `MusicBrainz` web service (default `https://musicbrainz.org`). Point it at a local mirror to skip the public server's 1 request/second floor, which gatefold applies only to `musicbrainz.org`. (env: `GATEFOLD_MUSICBRAINZ_URL`) |
 | `--delay-ms <MS>` | Delay between API requests in milliseconds (default `300`; docs recommend 200–500). |
-| `--cache-only` | Populate the caches but make no changes to music files. |
+| `--dry-run` | Do everything a run would, but change no music file, folder or Jellyfin; report what would change ("would embed cover", "would replace folder.jpg"). Lookups and downloads are still cached. |
 | `--replace-lyrics` | Overwrite an existing embedded lyrics tag (backing up the previous value). |
 | `--replace-cover` | Overwrite an existing embedded cover and `cover.jpg` sidecar (backing up the previous values), e.g. to upgrade to Apple Music's larger artwork. |
 | `--replace-artist-images` | Overwrite an artist folder's `folder.jpg` / `backdrop.jpg` / motion backdrop / `logo.png` when the artist's image has changed; the previous files are kept, dated, in `.gatefold-archive/` (`primary/`, `backdrops/` and `logos/`). |
@@ -116,13 +117,13 @@ gatefold [--dir <DIR>] [OPTIONS]
 
 ### Examples
 
-Preview what would happen and warm the cache, without modifying any files:
+See what a run would change, without changing anything (lookups and downloads are cached):
 
 ```sh
-gatefold --cache-only --dir ~/Music
+gatefold --dir ~/Music --replace-artist-images --write-nfo --dry-run
 ```
 
-Apply lyrics, reusing any cached responses from a previous `--cache-only` run:
+Then apply, reusing what the dry run cached:
 
 ```sh
 gatefold --dir ~/Music
@@ -161,7 +162,7 @@ For each discovered track:
 2. **Lyrics**: unless the track already has both a lyrics tag and an adjacent `.lrc`, the
    lyrics record is loaded from `<state-dir>/lrc/<sha256(path)>.json` if present, otherwise
    fetched from `GET /api/get`. Only successful (`200`) responses are cached; `404` is not.
-   When applying (non-`--cache-only`), the plain lyrics are written to the lyrics tag (if the
+   When applying (not `--dry-run`), the plain lyrics are written to the lyrics tag (if the
    track has none) and the synced lyrics to `<track>.lrc` (if no sidecar exists).
 3. **Cover art**: when the file has a `MusicBrainz` release id, the album is first looked
    for on Apple Music through the public iTunes Lookup API (`itunes.apple.com/lookup`, no

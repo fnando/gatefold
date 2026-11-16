@@ -113,6 +113,25 @@ impl Revisions {
         Ok(Some(target))
     }
 
+    /// Where [`Self::archive`] / [`Self::archive_bytes`] would put contents with
+    /// this `digest`, without touching anything: the identical file already
+    /// archived (`Duplicate`), else the next dated name (`Moved`). `ext`
+    /// includes its dot (`.jpg`). A missing `archive_dir` counts as empty.
+    pub fn would_archive(
+        &self,
+        archive_dir: &Path,
+        stem: &str,
+        ext: &str,
+        digest: &str,
+    ) -> Result<Archived> {
+        if archive_dir.is_dir()
+            && let Some(existing) = find_archived(archive_dir, digest)?
+        {
+            return Ok(Archived::Duplicate(existing));
+        }
+        Ok(Archived::Moved(self.dated_target(archive_dir, stem, ext)))
+    }
+
     /// The first free `<stem>-<date><ext>` in `archive_dir`, appending `-2`,
     /// `-3`, … when that name is already taken (a second run on the same day).
     fn dated_target(&self, archive_dir: &Path, stem: &str, ext: &str) -> PathBuf {
@@ -428,6 +447,43 @@ mod tests {
                 .is_some()
         );
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn would_archive_names_without_touching_anything() {
+        let root = std::env::temp_dir().join(format!("gatefold-rev-would-{}", std::process::id()));
+        let archive = root.join("Artist").join("primary");
+        let revisions = Revisions::new();
+        let date = revisions.date();
+        let digest = digest_bytes(b"old");
+
+        // A missing folder is an empty archive, and isn't created.
+        assert_eq!(
+            revisions
+                .would_archive(&archive, "folder", ".jpg", &digest)
+                .unwrap(),
+            Archived::Moved(archive.join(format!("folder-{date}.jpg")))
+        );
+        assert!(!archive.exists());
+
+        let saved = revisions
+            .archive_bytes(&archive, "folder", "jpg", b"old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            revisions
+                .would_archive(&archive, "folder", ".jpg", &digest)
+                .unwrap(),
+            Archived::Duplicate(saved)
+        );
+        assert_eq!(
+            revisions
+                .would_archive(&archive, "folder", ".jpg", &digest_bytes(b"new"))
+                .unwrap(),
+            Archived::Moved(archive.join(format!("folder-{date}-2.jpg")))
+        );
+        assert!(!archive.join(format!("folder-{date}-2.jpg")).exists());
         fs::remove_dir_all(&root).unwrap();
     }
 }

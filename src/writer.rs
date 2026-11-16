@@ -132,6 +132,15 @@ impl Write {
     pub fn happened(self) -> bool {
         !matches!(self, Write::Skipped)
     }
+
+    /// `Replaced` when there was a previous value, else `Created`.
+    fn of(replaced: bool) -> Self {
+        if replaced {
+            Write::Replaced
+        } else {
+            Write::Created
+        }
+    }
 }
 
 /// True when a lyrics value (synced or unsynced) is already present and non-empty.
@@ -155,11 +164,14 @@ pub fn folder_has_cover(dir: &Path) -> bool {
 }
 
 /// Write `<stem>.lrc` next to the track. Never overwrites an existing file.
-/// Returns true when a file was created.
-pub fn write_lrc(path: &Path, synced: &str) -> Result<bool> {
+/// Returns true when a file was (or, on a `dry_run`, would be) created.
+pub fn write_lrc(path: &Path, synced: &str, dry_run: bool) -> Result<bool> {
     let lrc = scanner::lrc_path_for(path);
     if lrc.exists() {
         return Ok(false);
+    }
+    if dry_run {
+        return Ok(true);
     }
     fs::write(&lrc, synced).with_context(|| format!("writing {}", lrc.display()))?;
     Ok(true)
@@ -167,13 +179,15 @@ pub fn write_lrc(path: &Path, synced: &str) -> Result<bool> {
 
 /// Embed `lyrics` into the file's unsynced-lyrics tag. When an existing value is
 /// present it's kept unless `replace` is set and the value differs, in which case
-/// the previous value is backed up. Returns what happened.
+/// the previous value is backed up. Returns what happened (on a `dry_run`, what
+/// would, with nothing written).
 pub fn write_lyrics_tag(
     path: &Path,
     lyrics: &str,
     replace: bool,
     verify: bool,
     backup: Option<&Backup>,
+    dry_run: bool,
 ) -> Result<Write> {
     let mut tagged =
         read_from_path(path).with_context(|| format!("reading tags from {}", path.display()))?;
@@ -199,6 +213,9 @@ pub fn write_lyrics_tag(
         return Ok(Write::Skipped);
     }
     let replaced = existing.is_some();
+    if dry_run {
+        return Ok(Write::of(replaced));
+    }
 
     // `ItemKey::Lyrics` is unsupported in ID3v2; `UnsyncLyrics` maps to USLT /
     // Vorbis UNSYNCEDLYRICS / MP4 ©lyr and is what we want for plain lyrics.
@@ -219,13 +236,15 @@ pub fn write_lyrics_tag(
 
 /// Embed `art` as the front-cover picture. An existing front cover is kept unless
 /// `replace` is set and the image differs (as cached or as downloaded), in which
-/// case the previous image is backed up. Returns what happened.
+/// case the previous image is backed up. Returns what happened (on a `dry_run`,
+/// what would, with nothing written).
 pub fn embed_cover(
     path: &Path,
     art: &CachedArt,
     replace: bool,
     verify: bool,
     backup: Option<&Backup>,
+    dry_run: bool,
 ) -> Result<Write> {
     let mut tagged =
         read_from_path(path).with_context(|| format!("reading tags from {}", path.display()))?;
@@ -254,6 +273,9 @@ pub fn embed_cover(
         )),
     };
     let replaced = previous.is_some();
+    if dry_run {
+        return Ok(Write::of(replaced));
+    }
 
     if replaced {
         tag.remove_picture_type(PictureType::CoverFront);
@@ -366,12 +388,14 @@ fn existing_cover_sidecar(dir: &Path) -> Option<PathBuf> {
 /// Write `cover.<ext>` into the track's folder. An existing `cover.*` is kept
 /// unless `replace` is set and the bytes differ, in which case the previous file
 /// is snapshotted to the backup (as `cover-sidecar.<ext>`) and swapped out. A
-/// folder whose cover is some other file (`folder.jpg`) is left alone.
+/// folder whose cover is some other file (`folder.jpg`) is left alone. On a
+/// `dry_run`, returns what would happen, with nothing written.
 pub fn write_cover_sidecar(
     dir: &Path,
     art: &CachedArt,
     replace: bool,
     backup: Option<&Backup>,
+    dry_run: bool,
 ) -> Result<Write> {
     let previous = match existing_cover_sidecar(dir) {
         None if folder_has_cover(dir) => return Ok(Write::Skipped),
@@ -385,6 +409,9 @@ pub fn write_cover_sidecar(
             Some((path, current))
         }
     };
+    if dry_run {
+        return Ok(Write::of(previous.is_some()));
+    }
 
     if let Some((path, bytes)) = &previous {
         if let Some(backup) = backup {
@@ -440,12 +467,15 @@ pub fn migrate_archives(dir: &Path) -> Result<usize> {
 /// image's as cached nor as downloaded, in which
 /// case the previous file is moved into its dated archive folder first. Returns
 /// what happened and, when a file was moved aside, where it went (relative to `dir`).
+/// On a `dry_run`, what would happen and where the file would go, with nothing
+/// written or moved.
 pub fn write_artist_image(
     dir: &Path,
     kind: ArtistImage,
     art: &CachedArt,
     replace: bool,
     revisions: &Revisions,
+    dry_run: bool,
 ) -> Result<(Write, Option<String>)> {
     let digest = digest_bytes(&art.data);
     let existing = match kind.existing(dir) {
@@ -462,7 +492,15 @@ pub fn write_artist_image(
 
     let mut kept = None;
     if let Some((previous, previous_digest)) = &existing {
-        let archived = revisions.archive(&kind.archive_dir(dir), previous, previous_digest)?;
+        let archive_dir = kind.archive_dir(dir);
+        let archived = if dry_run {
+            let ext = previous
+                .extension()
+                .map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
+            revisions.would_archive(&archive_dir, kind.stem(), &ext, previous_digest)?
+        } else {
+            revisions.archive(&archive_dir, previous, previous_digest)?
+        };
         let relative = archived
             .path()
             .strip_prefix(dir)
@@ -473,6 +511,9 @@ pub fn write_artist_image(
             Archived::Moved(_) => relative,
             Archived::Duplicate(_) => format!("{relative} (already kept)"),
         });
+    }
+    if dry_run {
+        return Ok((Write::of(existing.is_some()), kept));
     }
 
     let target = kind.target_dir(dir);
@@ -496,12 +537,13 @@ pub fn write_artist_image(
 /// Archive `data`, an artist image gatefold won't write into `dir` (kept or
 /// skipped), as an alternative `gatefold restore` can bring in: dated in the
 /// kind's archive folder, unless it's the current file or already archived.
-/// Returns where it went, relative to `dir`.
+/// Returns where it went (on a `dry_run`, would go), relative to `dir`.
 pub fn archive_alternative(
     dir: &Path,
     kind: ArtistImage,
     art: &CachedArt,
     revisions: &Revisions,
+    dry_run: bool,
 ) -> Result<Option<String>> {
     if let Some(current) = kind.existing(dir)
         && art.is(&revision::file_digest(&current)?)
@@ -509,7 +551,15 @@ pub fn archive_alternative(
         return Ok(None);
     }
     let archive = kind.archive_dir(dir);
-    let saved = revisions.archive_bytes(&archive, kind.stem(), &art.ext, &art.data)?;
+    let saved = if dry_run {
+        let ext = format!(".{}", art.ext);
+        match revisions.would_archive(&archive, kind.stem(), &ext, &digest_bytes(&art.data))? {
+            Archived::Moved(path) => Some(path),
+            Archived::Duplicate(_) => None,
+        }
+    } else {
+        revisions.archive_bytes(&archive, kind.stem(), &art.ext, &art.data)?
+    };
     Ok(saved.map(|path| {
         path.strip_prefix(dir)
             .unwrap_or(&path)
@@ -552,9 +602,10 @@ mod tests {
         ] {
             let old = format!("old {sub} {ext}");
             let old_art = CachedArt::new(ext, old.as_bytes());
-            write_artist_image(&dir, kind, &old_art, false, &revisions).unwrap();
+            write_artist_image(&dir, kind, &old_art, false, &revisions, false).unwrap();
             let new_art = CachedArt::new(ext, b"new");
-            let (wrote, kept) = write_artist_image(&dir, kind, &new_art, true, &revisions).unwrap();
+            let (wrote, kept) =
+                write_artist_image(&dir, kind, &new_art, true, &revisions, false).unwrap();
             assert_eq!(wrote, Write::Replaced);
             let stem = kind.stem();
             let archived = format!("{ARCHIVE_DIR}/{sub}/{stem}-{date}.{ext}");
@@ -584,12 +635,20 @@ mod tests {
             &CachedArt::new("jpg", b"as downloaded"),
             false,
             &revisions,
+            false,
         )
         .unwrap();
         let mut optimized = CachedArt::new("jpg", b"optimized");
         optimized.original = Some(digest_bytes(b"as downloaded"));
-        let (wrote, kept) =
-            write_artist_image(&dir, ArtistImage::Avatar, &optimized, true, &revisions).unwrap();
+        let (wrote, kept) = write_artist_image(
+            &dir,
+            ArtistImage::Avatar,
+            &optimized,
+            true,
+            &revisions,
+            false,
+        )
+        .unwrap();
         assert_eq!((wrote, kept), (Write::Skipped, None));
         assert_eq!(fs::read(dir.join("folder.jpg")).unwrap(), b"as downloaded");
         fs::remove_dir_all(&dir).unwrap();
@@ -642,6 +701,104 @@ mod tests {
         assert!(!dir.join("logos").exists());
         assert!(dir.join("backdrops/backdrop.mp4").is_file());
         assert!(dir.join("backdrops/clip.mp4").is_file());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every file under `dir` with its bytes, to compare before and after.
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let bytes = fs::read(&path).unwrap();
+                    files.push((path, bytes));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn a_dry_run_decides_like_a_real_one_and_writes_nothing() {
+        let dir = artist("dry");
+        let revisions = Revisions::new();
+        let date = revisions.date();
+        let old = CachedArt::new("jpg", b"old");
+        let new = CachedArt::new("jpg", b"new");
+
+        // Missing files: would be created.
+        let track = dir.join("01. Song.flac");
+        fs::write(&track, b"audio").unwrap();
+        let before = snapshot(&dir);
+        assert!(write_lrc(&track, "[00:01.00] hi", true).unwrap());
+        assert_eq!(
+            write_cover_sidecar(&dir, &old, false, None, true).unwrap(),
+            Write::Created
+        );
+        assert_eq!(
+            write_artist_image(&dir, ArtistImage::Avatar, &old, false, &revisions, true).unwrap(),
+            (Write::Created, None)
+        );
+        assert_eq!(snapshot(&dir), before);
+
+        // Existing files: kept without replace, replaced (and archived) with it,
+        // skipped when the same.
+        write_cover_sidecar(&dir, &old, false, None, false).unwrap();
+        write_artist_image(&dir, ArtistImage::Avatar, &old, false, &revisions, false).unwrap();
+        fs::write(track.with_extension("lrc"), b"mine").unwrap();
+        let before = snapshot(&dir);
+        assert!(!write_lrc(&track, "[00:01.00] hi", true).unwrap());
+        assert_eq!(
+            write_cover_sidecar(&dir, &new, false, None, true).unwrap(),
+            Write::Skipped
+        );
+        assert_eq!(
+            write_cover_sidecar(&dir, &new, true, None, true).unwrap(),
+            Write::Replaced
+        );
+        assert_eq!(
+            write_cover_sidecar(&dir, &old, true, None, true).unwrap(),
+            Write::Skipped
+        );
+        assert_eq!(
+            write_artist_image(&dir, ArtistImage::Avatar, &new, true, &revisions, true).unwrap(),
+            (
+                Write::Replaced,
+                Some(format!("{ARCHIVE_DIR}/primary/folder-{date}.jpg"))
+            )
+        );
+        assert_eq!(
+            write_artist_image(&dir, ArtistImage::Avatar, &old, true, &revisions, true).unwrap(),
+            (Write::Skipped, None)
+        );
+        assert_eq!(
+            archive_alternative(&dir, ArtistImage::Avatar, &new, &revisions, true).unwrap(),
+            Some(format!("{ARCHIVE_DIR}/primary/folder-{date}.jpg"))
+        );
+        assert_eq!(
+            archive_alternative(&dir, ArtistImage::Avatar, &old, &revisions, true).unwrap(),
+            None,
+            "the current file isn't an alternative"
+        );
+        assert_eq!(snapshot(&dir), before, "a dry run changes nothing");
+
+        // The real calls agree with what the dry run said.
+        assert_eq!(
+            write_cover_sidecar(&dir, &new, true, None, false).unwrap(),
+            Write::Replaced
+        );
+        assert_eq!(
+            write_artist_image(&dir, ArtistImage::Avatar, &new, true, &revisions, false).unwrap(),
+            (
+                Write::Replaced,
+                Some(format!("{ARCHIVE_DIR}/primary/folder-{date}.jpg"))
+            )
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }
