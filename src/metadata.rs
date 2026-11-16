@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 
 /// Bumped whenever the set of extracted fields changes, so cached entries from
 /// an older build are re-parsed instead of silently missing new data.
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 5;
 
 /// Cheap identity of a file's contents: its modification time and size, both
 /// from a single `stat`. A cached snapshot whose fingerprint no longer matches
@@ -77,6 +77,42 @@ pub struct TrackMetadata {
     /// Release barcode (UPC/EAN) as tagged, used to find the album on Apple Music.
     #[serde(default)]
     pub barcode: Option<String>,
+    /// Everything else about the release and the track, for `album.nfo`.
+    #[serde(default)]
+    pub release: ReleaseTags,
+}
+
+/// The rest of what the tags say about the release and the track's place in
+/// it (as Picard writes them), for `album.nfo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReleaseTags {
+    pub track_number: Option<u32>,
+    pub track_total: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub disc_total: Option<u32>,
+    /// Release date as tagged (`DATE`): `YYYY`, `YYYY-MM` or `YYYY-MM-DD`.
+    pub date: Option<String>,
+    /// First release of the release group (`ORIGINALDATE`).
+    pub original_date: Option<String>,
+    pub genres: Vec<String>,
+    pub labels: Vec<String>,
+    pub catalog_number: Option<String>,
+    /// `album`, `ep`, `single`, … (`RELEASETYPE`).
+    pub release_type: Option<String>,
+    pub release_country: Option<String>,
+    /// `CD`, `Digital Media`, `12" Vinyl`, … (`MEDIA`).
+    pub media: Option<String>,
+    pub compilation: Option<bool>,
+    /// Each album artist (`ALBUMARTISTS`), when tagged separately.
+    pub album_artists: Vec<String>,
+    /// Every `MusicBrainz` album-artist id, not just the first.
+    pub album_artist_ids: Vec<String>,
+    /// `MusicBrainz` recording id (Picard's `MUSICBRAINZ_TRACKID`).
+    pub recording_id: Option<String>,
+    /// `MusicBrainz` release-track id (`MUSICBRAINZ_RELEASETRACKID`).
+    pub release_track_id: Option<String>,
+    pub isrc: Option<String>,
 }
 
 impl TrackMetadata {
@@ -159,6 +195,7 @@ pub fn extract(path: &Path) -> Result<TrackMetadata> {
         .and_then(|v| first_mbid(&v));
     let has_cover_art = tag.is_some_and(tag_has_front_cover);
     let barcode = string_tag(tag, ItemKey::Barcode);
+    let release = tag.map_or_default(release_tags);
 
     Ok(TrackMetadata {
         version: CURRENT_VERSION,
@@ -175,7 +212,63 @@ pub fn extract(path: &Path) -> Result<TrackMetadata> {
         musicbrainz_album_artist_id,
         has_cover_art,
         barcode,
+        release,
     })
+}
+
+fn release_tags(tag: &lofty::tag::Tag) -> ReleaseTags {
+    let one = |key| string_tag(Some(tag), key);
+    let ids = |key| tag.get_strings(key).flat_map(mbids).collect::<Vec<_>>();
+    let mut album_artist_ids = ids(ItemKey::MusicBrainzReleaseArtistId);
+    if album_artist_ids.is_empty() {
+        album_artist_ids = ids(ItemKey::MusicBrainzArtistId);
+    }
+    ReleaseTags {
+        track_number: tag.track(),
+        track_total: tag.track_total(),
+        disc_number: tag.disk(),
+        disc_total: tag.disk_total(),
+        date: one(ItemKey::RecordingDate)
+            .or_else(|| one(ItemKey::ReleaseDate))
+            .or_else(|| one(ItemKey::Year)),
+        original_date: one(ItemKey::OriginalReleaseDate),
+        genres: many(tag, ItemKey::Genre),
+        labels: many(tag, ItemKey::Label),
+        catalog_number: one(ItemKey::CatalogNumber),
+        release_type: one(ItemKey::MusicBrainzReleaseType),
+        release_country: one(ItemKey::ReleaseCountry),
+        media: one(ItemKey::OriginalMediaType),
+        compilation: one(ItemKey::FlagCompilation)
+            .map(|v| matches!(v.trim(), "1" | "true" | "True" | "TRUE")),
+        album_artists: many(tag, ItemKey::AlbumArtists),
+        album_artist_ids,
+        recording_id: one(ItemKey::MusicBrainzRecordingId).and_then(|v| first_mbid(&v)),
+        release_track_id: one(ItemKey::MusicBrainzTrackId).and_then(|v| first_mbid(&v)),
+        isrc: one(ItemKey::Isrc),
+    }
+}
+
+/// Every value for `key`, also split on `;` (how some taggers join several
+/// into one), trimmed, without empties or repeats.
+fn many(tag: &lofty::tag::Tag, key: ItemKey) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    for value in tag.get_strings(key).flat_map(|v| v.split(';')) {
+        let value = value.trim();
+        if !value.is_empty() && !values.iter().any(|seen| seen == value) {
+            values.push(value.to_string());
+        }
+    }
+    values
+}
+
+/// Every UUID-looking token in `value` (see [`first_mbid`]), lowercased.
+fn mbids(value: &str) -> Vec<String> {
+    value
+        .split(['/', ';', ','])
+        .map(str::trim)
+        .filter(|s| is_uuid(s))
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 #[cfg(test)]
@@ -201,6 +294,35 @@ mod tests {
     }
 
     #[test]
+    fn release_tags_round_trip_and_old_entries_default() {
+        let release = ReleaseTags {
+            track_number: Some(3),
+            disc_number: Some(2),
+            genres: vec!["Punk".into(), "Ska".into()],
+            album_artist_ids: vec!["a74b1b7f-71a5-4011-9441-d0b5e4122711".into()],
+            compilation: Some(false),
+            ..ReleaseTags::default()
+        };
+        let json = serde_json::to_string(&release).unwrap();
+        assert_eq!(serde_json::from_str::<ReleaseTags>(&json).unwrap(), release);
+        // An entry cached before these fields existed reads as empty.
+        let old: TrackMetadata = serde_json::from_str(
+            r#"{"version":4,"path":"x","track_name":null,"artist_name":null,"album_name":null,"duration":null,"has_lyrics_tag":false}"#,
+        )
+        .unwrap();
+        assert_eq!(old.release, ReleaseTags::default());
+        assert_eq!(
+            mbids(
+                "A74B1B7F-71A5-4011-9441-D0B5E4122711; junk/00000000-0000-0000-0000-000000000000"
+            ),
+            [
+                "a74b1b7f-71a5-4011-9441-d0b5e4122711",
+                "00000000-0000-0000-0000-000000000000"
+            ]
+        );
+    }
+
+    #[test]
     fn is_current_requires_matching_version_and_fingerprint() {
         let fp = Fingerprint { mtime: 1, size: 2 };
         let mut meta = TrackMetadata {
@@ -218,6 +340,7 @@ mod tests {
             musicbrainz_album_artist_id: None,
             has_cover_art: false,
             barcode: None,
+            release: ReleaseTags::default(),
         };
         assert!(meta.is_current(&fp));
         assert!(!meta.is_current(&Fingerprint { mtime: 1, size: 3 }));
@@ -262,6 +385,7 @@ mod tests {
             musicbrainz_album_artist_id: None,
             has_cover_art: false,
             barcode: None,
+            release: ReleaseTags::default(),
         };
         assert_eq!(meta.album_artist(), Some("Thom Yorke"));
         meta.album_artist_name = Some("Radiohead".into());

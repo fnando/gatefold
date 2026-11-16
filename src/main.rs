@@ -141,7 +141,13 @@ fn main() -> Result<()> {
     }
 
     if cli.write_nfo && cli.artist_images_enabled() {
-        summary.nfo = Some(run_nfo_pass(&state, &progress, &artist_jobs, cli.dry_run));
+        summary.nfo = Some(run_nfo_pass(
+            &state,
+            &progress,
+            (&root, &tracks),
+            &artist_jobs,
+            cli.dry_run,
+        ));
     }
 
     if !cli.skip_jellyfin
@@ -163,7 +169,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Counts for the nfo pass.
+/// Counts for one kind of nfo file.
 #[derive(Debug, Default)]
 struct NfoTally {
     wrote: u64,
@@ -173,16 +179,108 @@ struct NfoTally {
     errors: u64,
 }
 
-/// `--write-nfo`: an `artist.nfo` in each artist folder found, naming the
-/// artist and its `MusicBrainz` id (see [`nfo`]). Problems are logged; they never
-/// fail the run.
+impl NfoTally {
+    /// Count one file and log what needs saying; `file` names it
+    /// (`artist.nfo`), `id` is the `MusicBrainz` id the tags give.
+    fn record(
+        &mut self,
+        progress: &Progress,
+        (label, file, id): (&str, &str, &str),
+        result: Result<nfo::Outcome>,
+        dry_run: bool,
+    ) {
+        match result {
+            Ok(nfo::Outcome::Wrote) => {
+                self.wrote += 1;
+                let wrote = act(dry_run, "wrote", "write");
+                progress.info(format!("✓ {label}: {wrote} {file}"));
+            }
+            Ok(nfo::Outcome::Completed) => {
+                self.completed += 1;
+                let completed = act(dry_run, "completed", "complete");
+                progress.info(format!("✓ {label}: {completed} {file}"));
+            }
+            Ok(nfo::Outcome::Already) => self.already += 1,
+            Ok(nfo::Outcome::Differs(found)) => {
+                self.already += 1;
+                progress.info(format!(
+                    "· {label}: {file} names another MusicBrainz id ({found}, tags say {id})"
+                ));
+            }
+            Ok(nfo::Outcome::WrongRoot) => {
+                self.skipped += 1;
+                progress.info(format!(
+                    "· {label}: {file} isn't one gatefold reads, left alone"
+                ));
+            }
+            Err(err) => {
+                self.errors += 1;
+                progress.info(format!("✗ {label}: {file}: {err:#}"));
+            }
+        }
+    }
+
+    fn summary(&self, file: &str, dry_run: bool) -> String {
+        format!(
+            "{} {} {file}, {} {}, already {}, skipped {}, errors {}",
+            act(dry_run, "wrote", "write"),
+            self.wrote,
+            act(dry_run, "completed", "complete"),
+            self.completed,
+            self.already,
+            self.skipped,
+            self.errors
+        )
+    }
+}
+
+/// What the nfo pass did, per kind of file.
+#[derive(Debug, Default)]
+struct NfoSummary {
+    artists: NfoTally,
+    albums: NfoTally,
+}
+
+/// `--write-nfo`: an `artist.nfo` in each artist folder found and an
+/// `album.nfo` in each album folder (see [`nfo`]). Problems are logged; they
+/// never fail the run.
 fn run_nfo_pass(
+    state: &State,
+    progress: &Progress,
+    (root, tracks): (&Path, &[Track]),
+    jobs: &BTreeMap<String, ArtistJob>,
+    dry_run: bool,
+) -> NfoSummary {
+    progress.section(if dry_run { "nfo (dry run)" } else { "nfo" });
+    let summary = NfoSummary {
+        artists: write_artist_nfos(state, progress, jobs, dry_run),
+        albums: write_album_nfos(state, progress, (root, tracks), jobs, dry_run),
+    };
+    let (artists, albums) = (&summary.artists, &summary.albums);
+    if artists.wrote
+        + artists.completed
+        + artists.errors
+        + albums.wrote
+        + albums.completed
+        + albums.errors
+        == 0
+    {
+        progress.info(format!(
+            "· nothing to write ({} already complete, {} skipped)",
+            artists.already + albums.already,
+            artists.skipped + albums.skipped
+        ));
+    }
+    summary
+}
+
+/// An `artist.nfo` per artist folder, naming the artist and its `MusicBrainz` id.
+fn write_artist_nfos(
     state: &State,
     progress: &Progress,
     jobs: &BTreeMap<String, ArtistJob>,
     dry_run: bool,
 ) -> NfoTally {
-    progress.section(if dry_run { "nfo (dry run)" } else { "nfo" });
     let mut tally = NfoTally::default();
     let mut claims: BTreeMap<&Path, usize> = BTreeMap::new();
     for job in jobs.values() {
@@ -198,10 +296,7 @@ fn run_nfo_pass(
             .flatten()
             .and_then(|record| record["name"].as_str().map(String::from));
         for folder in &job.folders {
-            let label = folder.file_name().map_or_else(
-                || folder.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
+            let label = folder_label(folder);
             let skip = nfo::skip_reason(&label, mb_name.as_deref(), claims[folder.as_path()]);
             if let Some(skip) = skip {
                 tally.skipped += 1;
@@ -217,43 +312,80 @@ fn run_nfo_pass(
                 }
                 continue;
             }
-            match nfo::write_artist(folder, &job.name, &job.mbid, dry_run) {
-                Ok(nfo::Outcome::Wrote) => {
-                    tally.wrote += 1;
-                    let wrote = act(dry_run, "wrote", "write");
-                    progress.info(format!("✓ {label}: {wrote} artist.nfo"));
-                }
-                Ok(nfo::Outcome::Completed) => {
-                    tally.completed += 1;
-                    let completed = act(dry_run, "completed", "complete");
-                    progress.info(format!("✓ {label}: {completed} artist.nfo"));
-                }
-                Ok(nfo::Outcome::Already) => tally.already += 1,
-                Ok(nfo::Outcome::Differs(id)) => {
-                    tally.already += 1;
-                    progress.info(format!(
-                        "· {label}: artist.nfo names another MusicBrainz id ({id}, tags say {})",
-                        job.mbid
-                    ));
-                }
-                Ok(nfo::Outcome::NotArtistXml) => {
-                    tally.skipped += 1;
-                    progress.info(format!("· {label}: artist.nfo has no <artist>, left alone"));
-                }
-                Err(err) => {
-                    tally.errors += 1;
-                    progress.info(format!("✗ {label}: artist.nfo: {err:#}"));
-                }
+            let result = nfo::write_artist(folder, &job.name, &job.mbid, dry_run);
+            let what = (label.as_str(), nfo::ARTIST_FILE, job.mbid.as_str());
+            tally.record(progress, what, result, dry_run);
+        }
+    }
+    tally
+}
+
+/// An `album.nfo` per album folder, from every track's tags (read from the
+/// metadata cache, so only changed files are parsed again).
+fn write_album_nfos(
+    state: &State,
+    progress: &Progress,
+    (root, tracks): (&Path, &[Track]),
+    jobs: &BTreeMap<String, ArtistJob>,
+    dry_run: bool,
+) -> NfoTally {
+    let mut tally = NfoTally::default();
+    let mut read = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        progress.status(track_name(track));
+        match track_metadata(state, track) {
+            Ok(meta) => read.push((track.path.clone(), meta)),
+            Err(err) => {
+                tally.errors += 1;
+                progress.info(format!("✗ {}: {err:#}", track.path.display()));
             }
         }
     }
-    if tally.wrote + tally.completed + tally.errors == 0 {
-        progress.info(format!(
-            "· nothing to write ({} already complete, {} skipped)",
-            tally.already, tally.skipped
-        ));
+    let artist_folders: BTreeSet<PathBuf> = jobs
+        .values()
+        .flat_map(|job| job.folders.iter().cloned())
+        .collect();
+    let (albums, skipped) = nfo::album_folders(root, &artist_folders, &read);
+    progress.info(format!("{} album folder(s)", albums.len()));
+    for (folder, why) in skipped {
+        tally.skipped += 1;
+        let label = album_label(root, &folder);
+        match why {
+            nfo::AlbumSkip::Mixed => progress.info(format!(
+                "· {label}: no album.nfo, tracks of several albums live here"
+            )),
+            // Loose tracks in an artist folder or the root: nothing to say.
+            nfo::AlbumSkip::NotAnAlbumFolder => {}
+        }
+    }
+    for (folder, metas) in albums {
+        let album = nfo::album_from(&metas);
+        let label = album_label(root, &folder);
+        let id = album.release_id.clone().unwrap_or_default();
+        let result = nfo::write_album(&folder, &album, dry_run);
+        tally.record(progress, (&label, nfo::ALBUM_FILE, &id), result, dry_run);
     }
     tally
+}
+
+/// `Artist/Album` for an album folder under `root`.
+fn album_label(root: &Path, folder: &Path) -> String {
+    folder
+        .strip_prefix(root)
+        .ok()
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .or_else(|| folder.file_name().map(Path::new))
+        .unwrap_or(folder)
+        .display()
+        .to_string()
+}
+
+/// A track's tags, from the metadata cache when the file hasn't changed.
+fn track_metadata(state: &State, track: &Track) -> Result<TrackMetadata> {
+    let abs = std::fs::canonicalize(&track.path).unwrap_or_else(|_| track.path.clone());
+    let digest = digest_for(&abs);
+    let cached = state.load_metadata::<TrackMetadata>(&digest)?;
+    refresh_metadata(state, track, &digest, cached)
 }
 
 /// `--state-dir`, else `$XDG_DATA_HOME/gatefold` or `~/.local/share/gatefold`.
@@ -2255,7 +2387,7 @@ struct Summary {
     artist_no_links: u64,
     artist_no_image: u64,
     artist_errors: u64,
-    nfo: Option<NfoTally>,
+    nfo: Option<NfoSummary>,
     // jellyfin
     jellyfin: Option<jellyfin::Tally>,
 }
@@ -2354,19 +2486,12 @@ impl Summary {
         if cli.artist_images_enabled() {
             self.print_artist(progress, cli.dry_run);
         }
-        if let Some(tally) = &self.nfo {
+        if let Some(nfo) = &self.nfo {
             progress.info("nfo:");
-            let d = cli.dry_run;
-            progress.info(format!(
-                "  {} {} artist.nfo, {} {}, already {}, skipped {}, errors {}",
-                act(d, "wrote", "write"),
-                tally.wrote,
-                act(d, "completed", "complete"),
-                tally.completed,
-                tally.already,
-                tally.skipped,
-                tally.errors
-            ));
+            let summary = nfo.artists.summary(nfo::ARTIST_FILE, cli.dry_run);
+            progress.info(format!("  {summary}"));
+            let summary = nfo.albums.summary(nfo::ALBUM_FILE, cli.dry_run);
+            progress.info(format!("  {summary}"));
         }
         if let Some(tally) = &self.jellyfin {
             progress.info("jellyfin:");

@@ -63,8 +63,8 @@ you already have.
 - **Jellyfin, both ways**: `gatefold jellyfin push` makes Jellyfin show the artist folders'
   images (with `backdrop.jpg` first), and `gatefold jellyfin pull` brings the images only
   Jellyfin has into the folders. See [Jellyfin](#jellyfin).
-- **`artist.nfo`** with `--write-nfo`: the artist's name and `MusicBrainz` id, so Jellyfin
-  matches each artist folder to the right artist. See [artist.nfo](#artistnfo).
+- **`artist.nfo` and `album.nfo`** with `--write-nfo`: the artist's name and `MusicBrainz` id,
+  and everything the tags say about each album and its tracks. See [nfo files](#nfo-files).
 - `--dry-run` to see what a run would change without changing anything; what it looks up
   and downloads is cached, so the real run after it is quick.
 - Respects service rate limits: sequential requests with a configurable delay, and
@@ -110,7 +110,7 @@ gatefold [--dir <DIR>] [OPTIONS]
 | `--artist-images-only` | Process artist images only; skip lyrics and cover art. Only needs each album folder's album artist, so it reads the tags of up to 3 tracks per folder (first, middle, last) and goes with the `MusicBrainz` album artist most of them carry. |
 | `--skip-artist-images` | Skip the artist-images pass. `--lyrics-only` / `--cover-only` imply it. |
 | `--skip-artist-videos` | Don't download motion backdrops (`backdrops/backdrop.mp4`); still images only. |
-| `--write-nfo` | Write an `artist.nfo` (name and `MusicBrainz` id) in each artist folder; see [artist.nfo](#artistnfo). |
+| `--write-nfo` | Write an `artist.nfo` in each artist folder and an `album.nfo` in each album folder; see [nfo files](#nfo-files). |
 | `--jellyfin-url <URL>` | Jellyfin server to keep in line with the artist folders after the artist pass (see [Jellyfin](#jellyfin)). (env: `GATEFOLD_JELLYFIN_URL`) |
 | `--jellyfin-api-key <KEY>` | Jellyfin API key (Dashboard → API Keys). Prefer `--env-file`. (env: `GATEFOLD_JELLYFIN_API_KEY`) |
 | `--skip-jellyfin` | Don't talk to Jellyfin after the artist pass, even with the server set. |
@@ -467,28 +467,70 @@ Cached images from before this existed are optimized the next time they're used.
 gatefold wrote before then still count as the same image, so `--replace-*` runs don't
 rewrite them just because they weren't optimized.
 
-### artist.nfo
+### nfo files
 
-With `--write-nfo`, each artist folder gets an `artist.nfo` naming the artist and its
-`MusicBrainz` id, as read from the tags (no network). Jellyfin reads it, so the folder is matched
-to the right artist instead of by name:
+With `--write-nfo`, gatefold writes the `.nfo` files Jellyfin (and Kodi) read, from the tags (no
+network):
 
-```xml
-<?xml version="1.0" encoding="utf-8" standalone="yes"?>
-<artist>
-  <title>Ratos de Porão</title>
-  <musicbrainzartistid>…</musicbrainzartistid>
-</artist>
-```
+- **`artist.nfo`** in each artist folder, naming the artist and its `MusicBrainz` id, so the
+  folder is matched to the right artist instead of by name:
 
-An existing `artist.nfo` is only completed: a missing `<title>` or `<musicbrainzartistid>` is
-added right after `<artist>`, and everything else (a biography you wrote, say) stays byte for
-byte. A value that's already there is never changed; a different id is reported. Folders that
-hold compilations or several artists get none: albums tagged with the "Various Artists" id are
-never an artist's, a folder claimed by more than one album artist or named like `Various
-Artists`, `VA`, `Compilations` or `Soundtracks` is skipped, and so is a folder whose name doesn't
-match what `MusicBrainz` calls the artist (a joint "A & B" tagged with A's id). Album nfo files
-will come later under the same flag.
+  ```xml
+  <?xml version="1.0" encoding="utf-8" standalone="yes"?>
+  <artist>
+    <title>Ratos de Porão</title>
+    <musicbrainzartistid>…</musicbrainzartistid>
+  </artist>
+  ```
+
+- **`album.nfo`** in each album folder, with everything the tags say: title, album artists,
+  the release, release group and album artist ids, year (the original release's), release and
+  original dates, genres, labels, catalog number, barcode, release type and country, media,
+  disc count, running time, and every track (disc, position, title, artist when it differs
+  from the album's, duration, recording and release track ids, ISRC). A track without
+  `MusicBrainz` ids is still listed, without them. Album-wide values are the most common
+  among the tracks; genres are all of them, most common first.
+
+  ```xml
+  <album>
+    <title>Sandinista!</title>
+    <artist>The Clash</artist>
+    <albumartist>The Clash</albumartist>
+    <musicbrainzalbumid>…</musicbrainzalbumid>
+    <year>1980</year>
+    <originalreleasedate>1980-12-12</originalreleasedate>
+    <genre>Rock</genre>
+    <genre>Dub</genre>
+    <label>Columbia</label>
+    …
+    <totaldiscs>3</totaldiscs>
+    <track>
+      <disc>1</disc>
+      <position>1</position>
+      <title>The Magnificent Seven</title>
+      <duration>5:33</duration>
+      <musicbrainztrackid>…</musicbrainztrackid>
+    </track>
+    …
+  </album>
+  ```
+
+  An album lives in the deepest folder holding all its tracks, so a multi-disc release with
+  `CD 01`/`CD 02` subfolders gets one `album.nfo`, next to them. A folder whose tracks belong
+  to more than one album, and loose tracks in an artist folder, get none. Compilations do get
+  one.
+
+An existing file is only completed: a missing element is added right after `<artist>` /
+`<album>` (an `album.nfo`'s tracks only when it lists none), and everything else (a biography
+you wrote, say) stays byte for byte. A value that's already there is never changed; a different
+`MusicBrainz` id is reported. Folders that hold compilations or several artists get no
+`artist.nfo`: albums tagged with the "Various Artists" id are never an artist's, a folder
+claimed by more than one album artist or named like `Various Artists`, `VA`, `Compilations` or
+`Soundtracks` is skipped, and so is a folder whose name doesn't match what `MusicBrainz` calls
+the artist (a joint "A & B" tagged with A's id).
+
+The first run after upgrading reads every track's tags again, once, to pick up the fields
+`album.nfo` needs; later runs reuse the cache.
 
 ### Jellyfin
 

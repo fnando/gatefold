@@ -156,10 +156,13 @@ pub struct Cli {
     #[arg(long)]
     pub skip_artist_videos: bool,
 
-    /// Write an `artist.nfo` in each artist folder with the artist's name and
-    /// `MusicBrainz` id, so Jellyfin matches the folder to the right artist. An
-    /// existing one only gets what it lacks; folders holding compilations or
-    /// several artists are skipped. Read from the tags, no network.
+    /// Write an `artist.nfo` in each artist folder (the artist's name and
+    /// `MusicBrainz` id, so Jellyfin matches the folder to the right artist) and an
+    /// `album.nfo` in each album folder (everything the tags say about the
+    /// release, and every track). An existing file only gets what it lacks;
+    /// folders holding compilations or several artists get no `artist.nfo`, and
+    /// folders mixing several albums no `album.nfo`. Read from the tags, no
+    /// network.
     #[arg(long, conflicts_with_all = ["skip_artist_images", "lyrics_only", "cover_only"])]
     pub write_nfo: bool,
 
