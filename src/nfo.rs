@@ -55,25 +55,34 @@ pub enum Skip {
     Shared,
     /// Named like a compilations folder.
     Compilation,
-    /// `MusicBrainz` names the artist differently from the folder (a joint
-    /// album artist tagged with one artist's id, say).
+    /// The artist's name (from `MusicBrainz`, else the tag) differs from the
+    /// folder's (a joint album artist tagged with one artist's id, say).
     OtherName(String),
 }
 
-/// Whether artist folder `folder_name` should be skipped: `claims` is how many
-/// album artists found it their folder, `mb_name` the `MusicBrainz` artist's name
-/// when known.
-pub fn skip_reason(folder_name: &str, mb_name: Option<&str>, claims: usize) -> Option<Skip> {
+/// The name to write in artist folder `folder_name`'s `artist.nfo`, or why it
+/// gets none: `claims` is how many album artists found it their folder,
+/// `mb_name` the `MusicBrainz` artist's name when known, `tagged` the album
+/// artist as tagged. The tag can be a joint credit ("A & B") tagged with one
+/// artist's id, so the `MusicBrainz` name wins, and either must match the folder.
+pub fn artist_title<'a>(
+    folder_name: &str,
+    mb_name: Option<&'a str>,
+    tagged: &'a str,
+    claims: usize,
+) -> Result<&'a str, Skip> {
     let folder = normalize_name(folder_name);
     if claims > 1 {
-        return Some(Skip::Shared);
+        return Err(Skip::Shared);
     }
     if COMPILATION_NAMES.contains(&folder.as_str()) {
-        return Some(Skip::Compilation);
+        return Err(Skip::Compilation);
     }
-    match mb_name {
-        Some(name) if normalize_name(name) != folder => Some(Skip::OtherName(name.to_string())),
-        _ => None,
+    let name = mb_name.unwrap_or(tagged);
+    if normalize_name(name) == folder {
+        Ok(name)
+    } else {
+        Err(Skip::OtherName(name.to_string()))
     }
 }
 
@@ -687,27 +696,42 @@ mod tests {
 
     #[test]
     fn skips_shared_compilation_and_misnamed_folders() {
-        assert_eq!(skip_reason("Bodyjar", None, 2), Some(Skip::Shared));
+        assert_eq!(
+            artist_title("Bodyjar", None, "Bodyjar", 2),
+            Err(Skip::Shared)
+        );
         for name in ["Various Artists", "Soundtracks", "VA", "O.S.T."] {
             assert_eq!(
-                skip_reason(name, None, 1),
-                Some(Skip::Compilation),
+                artist_title(name, None, name, 1),
+                Err(Skip::Compilation),
                 "{name}"
             );
         }
         assert_eq!(
-            skip_reason("A & B", Some("A"), 1),
-            Some(Skip::OtherName("A".into()))
+            artist_title("A & B", Some("A"), "A & B", 1),
+            Err(Skip::OtherName("A".into()))
         );
         assert_eq!(
-            skip_reason("Bad Cop\u{F022}Bad Cop", Some("Bad Cop/Bad Cop"), 1),
-            None
+            artist_title("A", None, "A & B", 1),
+            Err(Skip::OtherName("A & B".into()))
         );
         assert_eq!(
-            skip_reason("Bad Cop:Bad Cop", Some("Bad Cop/Bad Cop"), 1),
-            None
+            artist_title("Bad Cop\u{F022}Bad Cop", Some("Bad Cop/Bad Cop"), "x", 1),
+            Ok("Bad Cop/Bad Cop")
         );
-        assert_eq!(skip_reason("Bodyjar", None, 1), None);
+        assert_eq!(
+            artist_title("Bad Cop:Bad Cop", Some("Bad Cop/Bad Cop"), "x", 1),
+            Ok("Bad Cop/Bad Cop")
+        );
+        assert_eq!(artist_title("Bodyjar", None, "Bodyjar", 1), Ok("Bodyjar"));
+    }
+
+    #[test]
+    fn names_the_artist_not_a_joint_credit() {
+        assert_eq!(
+            artist_title("Joey Cape", Some("Joey Cape"), "Joey Cape & Tony Sly", 1),
+            Ok("Joey Cape")
+        );
     }
 
     #[test]

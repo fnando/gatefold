@@ -297,22 +297,30 @@ fn write_artist_nfos(
             .and_then(|record| record["name"].as_str().map(String::from));
         for folder in &job.folders {
             let label = folder_label(folder);
-            let skip = nfo::skip_reason(&label, mb_name.as_deref(), claims[folder.as_path()]);
-            if let Some(skip) = skip {
-                tally.skipped += 1;
-                match skip {
-                    nfo::Skip::Compilation => {}
-                    nfo::Skip::Shared => progress.info(format!(
-                        "· {label}: no artist.nfo, albums of several artists live here"
-                    )),
-                    nfo::Skip::OtherName(name) => progress.info(format!(
-                        "· {label}: no artist.nfo, MusicBrainz calls {} \"{name}\"",
-                        job.mbid
-                    )),
+            let skip = nfo::artist_title(
+                &label,
+                mb_name.as_deref(),
+                &job.name,
+                claims[folder.as_path()],
+            );
+            let name = match skip {
+                Ok(name) => name,
+                Err(skip) => {
+                    tally.skipped += 1;
+                    match skip {
+                        nfo::Skip::Compilation => {}
+                        nfo::Skip::Shared => progress.info(format!(
+                            "· {label}: no artist.nfo, albums of several artists live here"
+                        )),
+                        nfo::Skip::OtherName(name) => progress.info(format!(
+                            "· {label}: no artist.nfo, {} is named \"{name}\"",
+                            job.mbid
+                        )),
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let result = nfo::write_artist(folder, &job.name, &job.mbid, dry_run);
+            };
+            let result = nfo::write_artist(folder, name, &job.mbid, dry_run);
             let what = (label.as_str(), nfo::ARTIST_FILE, job.mbid.as_str());
             tally.record(progress, what, result, dry_run);
         }
