@@ -266,13 +266,15 @@ fn value(xml: &str, tag: &str) -> Option<String> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Album {
     pub title: Option<String>,
-    /// The album artist credit, as tagged (`ALBUMARTIST`).
+    /// The album artist credit, as tagged (`ALBUMARTIST`): only to tell which
+    /// tracks are credited the same, never written itself.
     pub credit: Option<String>,
     /// Each album artist (`ALBUMARTISTS`), else the credit.
     pub artists: Vec<String>,
     pub release_id: Option<String>,
     pub release_group_id: Option<String>,
-    /// Each album artist's `MusicBrainz` id.
+    /// Each album artist's `MusicBrainz` id, in the order of [`Self::artists`];
+    /// empty unless there's exactly one per artist (see [`credited`]).
     pub artist_ids: Vec<String>,
     pub year: Option<String>,
     pub date: Option<String>,
@@ -297,8 +299,9 @@ pub struct AlbumTrack {
     pub disc: Option<u32>,
     pub position: Option<u32>,
     pub title: Option<String>,
-    /// Only when it differs from the album artist credit.
-    pub artist: Option<String>,
+    /// Only when it differs from the album's: the credit as tagged (`ARTIST`),
+    /// or each artist (`ARTISTS`) on an album credited to several.
+    pub artists: Vec<String>,
     /// Seconds.
     pub duration: Option<u64>,
     pub recording_id: Option<String>,
@@ -325,10 +328,12 @@ pub fn album_from(tracks: &[&TrackMetadata]) -> Album {
             .map_or_default(<[String]>::to_vec)
     };
     let credit = text(|t| t.album_artist_name.as_deref());
-    let mut artists = list(|t| &t.release.album_artists);
-    if artists.is_empty() {
-        artists.extend(credit.clone());
-    }
+    let (artists, artist_ids) = credited(
+        credit.as_deref(),
+        list(|t| &t.release.album_artists),
+        list(|t| &t.release.album_artist_ids),
+    );
+    let joint = artists.len() > 1;
     let date = text(|t| t.release.date.as_deref());
     let original_date = text(|t| t.release.original_date.as_deref());
     let year = original_date
@@ -359,10 +364,7 @@ pub fn album_from(tracks: &[&TrackMetadata]) -> Album {
             disc: t.release.disc_number,
             position: t.release.track_number,
             title: t.track_name.clone().filter(|v| !v.trim().is_empty()),
-            artist: t
-                .artist_name
-                .clone()
-                .filter(|a| !a.trim().is_empty() && Some(a) != credit.as_ref()),
+            artists: track_artists(t, credit.as_deref(), &artists, joint),
             duration: t.duration,
             recording_id: t.release.recording_id.clone(),
             release_track_id: t.release.release_track_id.clone(),
@@ -376,7 +378,7 @@ pub fn album_from(tracks: &[&TrackMetadata]) -> Album {
         artists,
         release_id: text(|t| t.musicbrainz_release_id.as_deref()),
         release_group_id: text(|t| t.musicbrainz_release_group_id.as_deref()),
-        artist_ids: list(|t| &t.release.album_artist_ids),
+        artist_ids,
         year,
         date,
         original_date,
@@ -391,6 +393,71 @@ pub fn album_from(tracks: &[&TrackMetadata]) -> Album {
         total_discs,
         runtime: (seconds > 0).then(|| (seconds + 30) / 60),
         tracks: album_tracks,
+    }
+}
+
+/// The album artist tag Jellyfin misreads, if the album's tracks carry one: a
+/// single `ALBUMARTIST` value ("A + B") next to several album artist ids, which
+/// Jellyfin reads as the first artist's name, renaming that artist. Returns the
+/// value and the id count.
+pub fn joint_album_artist_tag(tracks: &[&TrackMetadata]) -> Option<(String, usize)> {
+    tracks.iter().find_map(|t| {
+        let ids = t.release.album_artist_ids.len();
+        match t.release.album_artist_values.as_slice() {
+            [one] if ids > 1 => Some((one.clone(), ids)),
+            _ => None,
+        }
+    })
+}
+
+/// The album artists to write and their `MusicBrainz` ids, from the credit as
+/// tagged, each album artist (`names`) and the ids (`ids`, in credit order). A
+/// name and an id are only ever written together when they're the same
+/// artist's: one id per name, or a lone credit with a lone id. A credit naming
+/// several artists ("A + B") with several ids keeps its name but gets no id,
+/// rather than the first artist's.
+fn credited(
+    credit: Option<&str>,
+    names: Vec<String>,
+    ids: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let names = if names.is_empty() {
+        credit.map(str::to_string).into_iter().collect()
+    } else {
+        names
+    };
+    if names.is_empty() || names.len() == ids.len() {
+        (names, ids)
+    } else {
+        (names, Vec::new())
+    }
+}
+
+/// A track's artists, when they differ from the album's: on an album credited
+/// to several artists (`joint`), each of the track's (`ARTISTS`) when tagged;
+/// otherwise the credit as tagged ("A feat. B" stays as is).
+fn track_artists(
+    track: &TrackMetadata,
+    credit: Option<&str>,
+    album: &[String],
+    joint: bool,
+) -> Vec<String> {
+    let each = &track.release.artists;
+    if joint && each.len() > 1 {
+        return if each.as_slice() == album {
+            Vec::new()
+        } else {
+            each.clone()
+        };
+    }
+    let Some(name) = track.artist_name.as_deref().map(str::trim) else {
+        return Vec::new();
+    };
+    let same = Some(name) == credit.map(str::trim) || [name] == album;
+    if name.is_empty() || same {
+        Vec::new()
+    } else {
+        vec![name.to_string()]
     }
 }
 
@@ -435,7 +502,7 @@ fn album_elements(album: &Album) -> Vec<Element> {
     let mut out = Vec::new();
     let a = album;
     text(&mut out, "title", a.title.as_deref());
-    text(&mut out, "artist", a.credit.as_deref());
+    repeated(&mut out, "artist", &a.artists);
     repeated(&mut out, "albumartist", &a.artists);
     text(&mut out, ALBUM_ID, a.release_id.as_deref());
     text(
@@ -510,7 +577,9 @@ fn track_xml(track: &AlbumTrack) -> String {
     push("disc", track.disc.map(|n| n.to_string()));
     push("position", track.position.map(|n| n.to_string()));
     push("title", track.title.clone());
-    push("artist", track.artist.clone());
+    for artist in &track.artists {
+        push("artist", Some(artist.clone()));
+    }
     push(
         "duration",
         track.duration.map(|s| format!("{}:{:02}", s / 60, s % 60)),
@@ -600,7 +669,7 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
@@ -799,7 +868,9 @@ mod tests {
             t.release.labels = vec!["Atlantic & Co".into()];
         }
         tracks[0].release.genres = vec!["Odd".into()];
-        tracks[1].artist_name = Some("Guest".into());
+        // A "feat." credit on a single artist's album stays as tagged.
+        tracks[1].artist_name = Some("Bad Religion feat. Guest".into());
+        tracks[1].release.artists = vec!["Bad Religion".into(), "Guest".into()];
         tracks[2].release.track_number = None;
         tracks[2].path = "/m/A/X/bonus.flac".into();
         tracks[3].release.disc_number = Some(2);
@@ -831,7 +902,11 @@ mod tests {
             "disc 2 after disc 1"
         );
         assert_eq!(order.last(), Some(&(Some(1), None)), "unnumbered last");
-        let guest = album.tracks.iter().filter(|t| t.artist.is_some()).count();
+        let guest = album
+            .tracks
+            .iter()
+            .filter(|t| !t.artists.is_empty())
+            .count();
         assert_eq!(guest, 1, "a track artist only when it differs");
 
         let dir = dir("album");
@@ -845,6 +920,10 @@ mod tests {
         assert!(xml.contains("  <label>Atlantic &amp; Co</label>\n  <studio>"));
         assert!(xml.contains("  <track>\n    <disc>1</disc>\n    <position>1</position>\n"));
         assert!(xml.contains("    <duration>3:05</duration>\n"));
+        assert!(xml.contains("    <artist>Bad Religion feat. Guest</artist>\n"));
+        assert!(xml.contains(
+            "  <artist>Bad Religion</artist>\n  <albumartist>Bad Religion</albumartist>\n"
+        ));
         assert!(
             !xml.contains("musicbrainztrackid"),
             "no ids the tags don't have"
@@ -853,6 +932,99 @@ mod tests {
         assert!(xml.ends_with("  </track>\n</album>\n"));
         assert_eq!(write_album(&dir, &album, false).unwrap(), Outcome::Already);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    pub(crate) const YELLOWCARD: &str = "3630fff3-52fc-4e97-ab01-d68fd88e4135";
+    pub(crate) const HAMMOCK: &str = "5b9d784c-33eb-4a78-a976-c97b672370fa";
+
+    /// A track of "A Hopeful Sign" by Yellowcard + Hammock, tagged as Picard
+    /// does: one `ARTIST`/`ALBUMARTIST` string, each artist and id separately.
+    pub(crate) fn joint_track() -> TrackMetadata {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/joint-credit.flac");
+        crate::metadata::extract(&path).unwrap()
+    }
+
+    #[test]
+    fn the_joint_fixture_reads_each_artist_and_id() {
+        let t = joint_track();
+        assert_eq!(t.album_artist_name.as_deref(), Some("Yellowcard + Hammock"));
+        assert_eq!(t.release.album_artist_values, ["Yellowcard + Hammock"]);
+        assert_eq!(t.release.album_artists, ["Yellowcard", "Hammock"]);
+        assert_eq!(t.release.album_artist_ids, [YELLOWCARD, HAMMOCK]);
+        assert_eq!(t.release.artists, ["Yellowcard", "Hammock"]);
+        assert_eq!(t.release.artist_ids, [YELLOWCARD, HAMMOCK]);
+    }
+
+    #[test]
+    fn a_joint_release_names_each_artist_next_to_its_own_id() {
+        let first = joint_track();
+        let mut second = joint_track();
+        second.path = "/m/x/02.flac".into();
+        second.release.track_number = Some(2);
+        let album = album_from(&[&first, &second]);
+        assert_eq!(album.artists, ["Yellowcard", "Hammock"]);
+        assert_eq!(album.artist_ids, [YELLOWCARD, HAMMOCK]);
+        assert!(album.tracks.iter().all(|t| t.artists.is_empty()));
+
+        let dir = dir("album-joint");
+        write_album(&dir, &album, false).unwrap();
+        let xml = fs::read_to_string(dir.join(ALBUM_FILE)).unwrap();
+        assert!(xml.contains(
+            "  <artist>Yellowcard</artist>\n  <artist>Hammock</artist>\n  <albumartist>Yellowcard</albumartist>\n  <albumartist>Hammock</albumartist>\n"
+        ));
+        assert!(xml.contains(&format!(
+            "  <musicbrainzalbumartistid>{YELLOWCARD}</musicbrainzalbumartistid>\n  <musicbrainzalbumartistid>{HAMMOCK}</musicbrainzalbumartistid>\n"
+        )));
+        assert!(!xml.contains("Yellowcard + Hammock"), "{xml}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_track_on_a_joint_release_lists_each_of_its_artists() {
+        let mut t = joint_track();
+        t.artist_name = Some("Yellowcard + Hammock feat. Guest".into());
+        t.release.artists = vec!["Yellowcard".into(), "Hammock".into(), "Guest".into()];
+        let album = album_from(&[&t]);
+        assert_eq!(album.tracks[0].artists, ["Yellowcard", "Hammock", "Guest"]);
+    }
+
+    #[test]
+    fn a_joint_credit_with_no_one_artist_gets_no_id() {
+        let mut t = joint_track();
+        t.release.album_artists.clear();
+        t.release.artists.clear();
+        let album = album_from(&[&t]);
+        assert_eq!(album.artists, ["Yellowcard + Hammock"]);
+        assert!(album.artist_ids.is_empty(), "not Yellowcard's id");
+        let xml: Vec<String> = album_elements(&album).into_iter().map(|e| e.xml).collect();
+        assert!(!xml.join("\n").contains("musicbrainzalbumartistid"));
+
+        // A lone credit with a lone id is that artist's; a mismatch is no one's.
+        let one = |n: &str| vec![n.to_string()];
+        assert_eq!(
+            credited(Some("Clash"), vec![], one(YELLOWCARD)),
+            (one("Clash"), one(YELLOWCARD))
+        );
+        assert_eq!(
+            credited(None, vec!["A".into(), "B".into()], one(YELLOWCARD)),
+            (vec!["A".into(), "B".into()], vec![])
+        );
+    }
+
+    #[test]
+    fn a_single_album_artist_value_for_several_ids_is_flagged() {
+        let t = joint_track();
+        assert_eq!(
+            joint_album_artist_tag(&[&t]),
+            Some(("Yellowcard + Hammock".into(), 2))
+        );
+        let mut split = joint_track();
+        split.release.album_artist_values = vec!["Yellowcard".into(), "Hammock".into()];
+        assert_eq!(joint_album_artist_tag(&[&split]), None);
+        assert_eq!(
+            joint_album_artist_tag(&[&track("/m/A/X/01.flac", Some(ID), Some(1))]),
+            None
+        );
     }
 
     #[test]

@@ -208,6 +208,11 @@ id in the tags; "Various Artists" is skipped):
    `AC/DC` matches `AC-DC`) and that holds no audio files itself — album folders are never
    used, even for self-titled albums, because `folder.jpg` there would be read as the album
    cover. Tracks with no such folder above them (flat layouts) are reported and skipped.
+   An album credited to several artists (several `ALBUMARTISTS` or album artist ids, as
+   in "Yellowcard + Hammock") is no one artist's: it counts for each artist only through
+   a folder named after that artist (`Yellowcard/`), and a folder named after the credit
+   itself (`Yellowcard + Hammock/`) gets no images, reported as "joint credit, skipped",
+   rather than its first artist's.
 
    These pages are not a supported API: they are plain page fetches and may change without
    notice. The official Apple Music API would be the stable route, but it requires a
@@ -483,13 +488,17 @@ network):
   </artist>
   ```
 
-- **`album.nfo`** in each album folder, with everything the tags say: title, album artists,
-  the release, release group and album artist ids, year (the original release's), release and
+- **`album.nfo`** in each album folder, with everything the tags say: title, album artists
+  (one `<artist>` and `<albumartist>` per artist), the release, release group and album
+  artist ids (in the same order as the artists), year (the original release's), release and
   original dates, genres, labels, catalog number, barcode, release type and country, media,
   disc count, running time, and every track (disc, position, title, artist when it differs
-  from the album's, duration, recording and release track ids, ISRC). A track without
+  from the album's: as tagged, or each artist on an album credited to several; duration, recording and release track ids, ISRC). A track without
   `MusicBrainz` ids is still listed, without them. Album-wide values are the most common
-  among the tracks; genres are all of them, most common first.
+  among the tracks; genres are all of them, most common first. A name and a `MusicBrainz`
+  id are only ever written side by side when they're the same artist's: a credit like
+  "A + B" with ids for both but no `ALBUMARTISTS` keeps its name and gets no id, rather
+  than A's.
 
   ```xml
   <album>
@@ -527,7 +536,13 @@ you wrote, say) stays byte for byte. A value that's already there is never chang
 `artist.nfo`: albums tagged with the "Various Artists" id are never an artist's, a folder
 claimed by more than one album artist or named like `Various Artists`, `VA`, `Compilations` or
 `Soundtracks` is skipped, and so is a folder whose name doesn't match what `MusicBrainz` calls
-the artist (a joint "A & B" tagged with A's id).
+the artist (a joint "A & B" tagged with A's id) or that's named after a credit of several
+artists ("joint credit, skipped"). A joint album inside one artist's folder never changes that
+folder's `artist.nfo`.
+
+gatefold never rewrites artist tags, but it reports an album whose `ALBUMARTIST` is a single
+value ("Yellowcard + Hammock") next to several album artist ids: Jellyfin reads that value as
+the first artist's name and renames the artist. Split it into one value per artist.
 
 The first run after upgrading reads every track's tags again, once, to pick up the fields
 `album.nfo` needs; later runs reuse the cache.

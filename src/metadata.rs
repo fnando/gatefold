@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 
 /// Bumped whenever the set of extracted fields changes, so cached entries from
 /// an older build are re-parsed instead of silently missing new data.
-pub const CURRENT_VERSION: u32 = 5;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// Cheap identity of a file's contents: its modification time and size, both
 /// from a single `stat`. A cached snapshot whose fingerprint no longer matches
@@ -106,8 +106,15 @@ pub struct ReleaseTags {
     pub compilation: Option<bool>,
     /// Each album artist (`ALBUMARTISTS`), when tagged separately.
     pub album_artists: Vec<String>,
-    /// Every `MusicBrainz` album-artist id, not just the first.
+    /// Every `MusicBrainz` album-artist id, not just the first, in credit order.
     pub album_artist_ids: Vec<String>,
+    /// Every `ALBUMARTIST` value. One value naming several artists ("A + B")
+    /// next to several ids is what makes Jellyfin rename the first artist.
+    pub album_artist_values: Vec<String>,
+    /// Each track artist (`ARTISTS`), when tagged separately.
+    pub artists: Vec<String>,
+    /// Every `MusicBrainz` track-artist id, in credit order.
+    pub artist_ids: Vec<String>,
     /// `MusicBrainz` recording id (Picard's `MUSICBRAINZ_TRACKID`).
     pub recording_id: Option<String>,
     /// `MusicBrainz` release-track id (`MUSICBRAINZ_RELEASETRACKID`).
@@ -219,9 +226,12 @@ pub fn extract(path: &Path) -> Result<TrackMetadata> {
 fn release_tags(tag: &lofty::tag::Tag) -> ReleaseTags {
     let one = |key| string_tag(Some(tag), key);
     let ids = |key| tag.get_strings(key).flat_map(mbids).collect::<Vec<_>>();
+    let artist_ids = ids(ItemKey::MusicBrainzArtistId);
     let mut album_artist_ids = ids(ItemKey::MusicBrainzReleaseArtistId);
-    if album_artist_ids.is_empty() {
-        album_artist_ids = ids(ItemKey::MusicBrainzArtistId);
+    // A lone track artist id stands in for a missing album artist id; several
+    // (a "feat." track, say) say nothing about who the album artists are.
+    if album_artist_ids.is_empty() && artist_ids.len() == 1 {
+        album_artist_ids.clone_from(&artist_ids);
     }
     ReleaseTags {
         track_number: tag.track(),
@@ -242,6 +252,9 @@ fn release_tags(tag: &lofty::tag::Tag) -> ReleaseTags {
             .map(|v| matches!(v.trim(), "1" | "true" | "True" | "TRUE")),
         album_artists: many(tag, ItemKey::AlbumArtists),
         album_artist_ids,
+        album_artist_values: many(tag, ItemKey::AlbumArtist),
+        artists: many(tag, ItemKey::TrackArtists),
+        artist_ids,
         recording_id: one(ItemKey::MusicBrainzRecordingId).and_then(|v| first_mbid(&v)),
         release_track_id: one(ItemKey::MusicBrainzTrackId).and_then(|v| first_mbid(&v)),
         isrc: one(ItemKey::Isrc),

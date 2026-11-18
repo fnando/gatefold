@@ -248,7 +248,7 @@ fn run_nfo_pass(
     state: &State,
     progress: &Progress,
     (root, tracks): (&Path, &[Track]),
-    jobs: &BTreeMap<String, ArtistJob>,
+    jobs: &ArtistJobs,
     dry_run: bool,
 ) -> NfoSummary {
     progress.section(if dry_run { "nfo (dry run)" } else { "nfo" });
@@ -278,18 +278,22 @@ fn run_nfo_pass(
 fn write_artist_nfos(
     state: &State,
     progress: &Progress,
-    jobs: &BTreeMap<String, ArtistJob>,
+    jobs: &ArtistJobs,
     dry_run: bool,
 ) -> NfoTally {
     let mut tally = NfoTally::default();
     let mut claims: BTreeMap<&Path, usize> = BTreeMap::new();
-    for job in jobs.values() {
+    for job in jobs.by_id.values() {
         for folder in &job.folders {
             *claims.entry(folder.as_path()).or_default() += 1;
         }
     }
     progress.info(format!("{} artist folder(s)", claims.len()));
-    for job in jobs.values() {
+    for (folder, credit) in &jobs.joint {
+        tally.skipped += 1;
+        progress.info(joint_line(folder, credit, "no artist.nfo"));
+    }
+    for job in jobs.by_id.values() {
         let mb_name = state
             .load_musicbrainz_artist(&job.mbid)
             .ok()
@@ -328,13 +332,21 @@ fn write_artist_nfos(
     tally
 }
 
+/// The log line for an artist folder named after a joint credit, skipped.
+fn joint_line(folder: &Path, credit: &str, what: &str) -> String {
+    format!(
+        "· {}: {what}, joint credit \"{credit}\" (several artists), skipped",
+        folder_label(folder)
+    )
+}
+
 /// An `album.nfo` per album folder, from every track's tags (read from the
 /// metadata cache, so only changed files are parsed again).
 fn write_album_nfos(
     state: &State,
     progress: &Progress,
     (root, tracks): (&Path, &[Track]),
-    jobs: &BTreeMap<String, ArtistJob>,
+    jobs: &ArtistJobs,
     dry_run: bool,
 ) -> NfoTally {
     let mut tally = NfoTally::default();
@@ -350,8 +362,10 @@ fn write_album_nfos(
         }
     }
     let artist_folders: BTreeSet<PathBuf> = jobs
+        .by_id
         .values()
         .flat_map(|job| job.folders.iter().cloned())
+        .chain(jobs.joint.keys().cloned())
         .collect();
     let (albums, skipped) = nfo::album_folders(root, &artist_folders, &read);
     progress.info(format!("{} album folder(s)", albums.len()));
@@ -369,6 +383,12 @@ fn write_album_nfos(
     for (folder, metas) in albums {
         let album = nfo::album_from(&metas);
         let label = album_label(root, &folder);
+        if let Some((credit, ids)) = nfo::joint_album_artist_tag(&metas) {
+            progress.info(format!(
+                "· {label}: ALBUMARTIST is one value, \"{credit}\", for {ids} artists; \
+                 Jellyfin may rename the first one, so split it into one value per artist"
+            ));
+        }
         let id = album.release_id.clone().unwrap_or_default();
         let result = nfo::write_album(&folder, &album, dry_run);
         tally.record(progress, (&label, nfo::ALBUM_FILE, &id), result, dry_run);
@@ -413,7 +433,7 @@ fn run_jellyfin_pass(
     state: &State,
     revisions: &Revisions,
     progress: &Progress,
-    jobs: &BTreeMap<String, ArtistJob>,
+    jobs: &ArtistJobs,
 ) -> jellyfin::Tally {
     progress.section("Jellyfin");
     let mut tally = jellyfin::Tally::default();
@@ -427,7 +447,7 @@ fn run_jellyfin_pass(
     };
     let backups = state.backup_root().join("jellyfin");
     let opts = jellyfin_options(&backups, revisions, cli.dry_run);
-    for job in jobs.values() {
+    for job in jobs.by_id.values() {
         for folder in &job.folders {
             let result = session.sync_folder(folder, Some(&job.mbid), &opts);
             for line in tally.record(&job.name, result, cli.dry_run) {
@@ -760,9 +780,9 @@ fn run_track_pass(
     progress: &Progress,
     tracks: &[Track],
     summary: &mut Summary,
-) -> Result<BTreeMap<String, ArtistJob>> {
+) -> Result<ArtistJobs> {
     let mut cover_misses = CoverMemo::default();
-    let mut artist_jobs: BTreeMap<String, ArtistJob> = BTreeMap::new();
+    let mut artist_jobs = ArtistJobs::default();
     for (i, track) in tracks.iter().enumerate() {
         let name = track_name(track);
         progress.status(name.clone());
@@ -800,7 +820,7 @@ fn run_track_pass(
             progress.log_progress();
         }
     }
-    Ok(artist_jobs)
+    Ok(artist_jobs.finish())
 }
 
 /// The "Scanning" section: what was found, and what this run reads of it.
@@ -837,12 +857,12 @@ fn log_scan(
 fn pin_apple_id(
     state: &State,
     progress: &Progress,
-    jobs: &BTreeMap<String, ArtistJob>,
+    jobs: &ArtistJobs,
     apple_id: &str,
 ) -> Result<()> {
-    let mut artists = jobs.values();
+    let mut artists = jobs.by_id.values();
     let (Some(job), None) = (artists.next(), artists.next()) else {
-        let names: Vec<&str> = jobs.values().map(|job| job.name.as_str()).collect();
+        let names: Vec<&str> = jobs.by_id.values().map(|job| job.name.as_str()).collect();
         anyhow::bail!(
             "--apple-url needs exactly one album artist under --dir, found {}{}",
             names.len(),
@@ -883,8 +903,8 @@ fn run_artist_scan(
     progress: &Progress,
     folders: &[Vec<&Track>],
     summary: &mut Summary,
-) -> Result<BTreeMap<String, ArtistJob>> {
-    let mut jobs = BTreeMap::new();
+) -> Result<ArtistJobs> {
+    let mut jobs = ArtistJobs::default();
     for folder in folders {
         let mut read = Vec::new();
         for &track in folder {
@@ -909,7 +929,7 @@ fn run_artist_scan(
             collect_artist(root, track, meta, &mut jobs);
         }
     }
-    Ok(jobs)
+    Ok(jobs.finish())
 }
 
 /// Fetch and write artist images for every distinct album artist seen during the
@@ -923,21 +943,25 @@ fn run_artist_pass(
     revisions: &Revisions,
     progress: &Progress,
     delay: Duration,
-    jobs: &BTreeMap<String, ArtistJob>,
+    jobs: &ArtistJobs,
     summary: &mut Summary,
 ) {
     let mb = &services.musicbrainz;
     progress.section(&section_title(cli, "Artist images"));
     progress.info(format!(
         "{} distinct album artist(s) with a MusicBrainz id",
-        jobs.len()
+        jobs.by_id.len()
     ));
+    for (folder, credit) in &jobs.joint {
+        summary.artist_joint += 1;
+        progress.info(joint_line(folder, credit, "no artist images"));
+    }
     // Seed: one MusicBrainz lookup, a page fetch, up to two image downloads, plus RTT.
     let seed_secs = mb.delay().as_secs_f64() + delay.as_secs_f64() * 3.0 + 2.0;
-    let bar = progress.phase("artists", "artist", jobs.len(), seed_secs);
+    let bar = progress.phase("artists", "artist", jobs.by_id.len(), seed_secs);
     bar.log_initial_estimate();
 
-    for (i, job) in jobs.values().enumerate() {
+    for (i, job) in jobs.by_id.values().enumerate() {
         bar.status(job.name.clone());
         let start = Instant::now();
         if !cli.dry_run {
@@ -954,7 +978,7 @@ fn run_artist_pass(
             }
         }
         bar.record_track(start.elapsed());
-        if (i + 1) % 10 == 0 && i + 1 < jobs.len() {
+        if (i + 1) % 10 == 0 && i + 1 < jobs.by_id.len() {
             bar.log_progress();
         }
     }
@@ -1090,7 +1114,7 @@ fn process_track(
     name: &str,
     summary: &mut Summary,
     cover_misses: &mut CoverMemo,
-    artist_jobs: &mut BTreeMap<String, ArtistJob>,
+    artist_jobs: &mut ArtistJobs,
 ) -> Result<()> {
     let abs = std::fs::canonicalize(&track.path).unwrap_or_else(|_| track.path.clone());
     let digest = digest_for(&abs);
@@ -1539,6 +1563,7 @@ fn fetch_cover(
 
 /// One album artist seen during the track loop, with every artist folder its
 /// tracks resolved to (an artist split across two roots gets images in both).
+#[derive(Debug)]
 struct ArtistJob {
     mbid: String,
     name: String,
@@ -1547,31 +1572,87 @@ struct ArtistJob {
     sample_dir: PathBuf,
 }
 
+/// Every album artist seen during the track loop, by `MusicBrainz` id, and the
+/// artist folders named after a joint credit.
+#[derive(Debug, Default)]
+struct ArtistJobs {
+    by_id: BTreeMap<String, ArtistJob>,
+    /// Folders named after a credit of several artists ("A + B"), with that
+    /// credit. They aren't one artist's, so they get no images, no
+    /// `artist.nfo` and no Jellyfin push.
+    joint: BTreeMap<PathBuf, String>,
+}
+
+impl ArtistJobs {
+    /// Note `name` (`mbid`) as an album artist, seen in track folder `dir`, with
+    /// its artist `folder` when there's one.
+    fn add(&mut self, mbid: &str, name: &str, dir: &Path, folder: Option<PathBuf>) {
+        let job = self
+            .by_id
+            .entry(mbid.to_string())
+            .or_insert_with(|| ArtistJob {
+                mbid: mbid.to_string(),
+                name: name.to_string(),
+                folders: BTreeSet::new(),
+                sample_dir: dir.to_path_buf(),
+            });
+        job.folders.extend(folder);
+    }
+
+    /// Once every track is seen: no artist gets a joint credit's folder, even
+    /// when a track tagged with just the credit and one artist's id led to it.
+    fn finish(mut self) -> Self {
+        for job in self.by_id.values_mut() {
+            job.folders
+                .retain(|folder| !self.joint.contains_key(folder));
+        }
+        self
+    }
+}
+
 /// Note the track's album artist for the artist-images pass. No network here.
-fn collect_artist(
-    root: &Path,
-    track: &Track,
-    meta: &TrackMetadata,
-    jobs: &mut BTreeMap<String, ArtistJob>,
-) {
+///
+/// A credit of several artists (several `ALBUMARTISTS` or album artist ids) is
+/// no one artist: each artist counts only through a folder named after that
+/// artist (with the name and id paired as tagged), and a folder named after the
+/// credit itself is noted as joint, so it never gets the first artist's images.
+fn collect_artist(root: &Path, track: &Track, meta: &TrackMetadata, jobs: &mut ArtistJobs) {
+    let Some(dir) = track.path.parent() else {
+        return;
+    };
+    let names = &meta.release.album_artists;
+    let ids = &meta.release.album_artist_ids;
+    if names.len() > 1 || ids.len() > 1 {
+        if let Some(credit) = meta.album_artist()
+            && !names
+                .iter()
+                .any(|name| artist::normalize_name(name) == artist::normalize_name(credit))
+            && let Some(folder) = artist::find_artist_folder(dir, root, credit)
+        {
+            jobs.joint.insert(folder, credit.to_string());
+        }
+        if names.len() == ids.len() {
+            for (name, mbid) in names.iter().zip(ids) {
+                if mbid == musicbrainz::VARIOUS_ARTISTS {
+                    continue;
+                }
+                if let Some(folder) = artist::find_artist_folder(dir, root, name) {
+                    jobs.add(mbid, name, dir, Some(folder));
+                }
+            }
+        }
+        return;
+    }
     let Some(mbid) = meta.musicbrainz_album_artist_id.as_deref() else {
         return;
     };
     if mbid == musicbrainz::VARIOUS_ARTISTS {
         return;
     }
-    let (Some(name), Some(dir)) = (meta.album_artist(), track.path.parent()) else {
+    let Some(name) = meta.album_artist() else {
         return;
     };
-    let job = jobs.entry(mbid.to_string()).or_insert_with(|| ArtistJob {
-        mbid: mbid.to_string(),
-        name: name.to_string(),
-        folders: BTreeSet::new(),
-        sample_dir: dir.to_path_buf(),
-    });
-    if let Some(folder) = artist::find_artist_folder(dir, root, name) {
-        job.folders.insert(folder);
-    }
+    jobs.add(mbid, name, dir, artist::find_artist_folder(dir, root, name));
 }
 
 /// What happened to an artist's images.
@@ -2391,6 +2472,8 @@ struct Summary {
     artist_kept: u64,
     artist_fresh: u64,
     artist_no_folder: u64,
+    /// Artist folders named after a joint credit ("A + B"), skipped.
+    artist_joint: u64,
     artist_spotify_only: u64,
     artist_no_links: u64,
     artist_no_image: u64,
@@ -2517,12 +2600,13 @@ impl Summary {
             self.artist_replaced
         ));
         progress.info(format!(
-            "  unchanged {}, skipped {}, kept {}, fresh {}, no folder {}, no apple music link {}, no links {}, no image {}, errors {}",
+            "  unchanged {}, skipped {}, kept {}, fresh {}, no folder {}, joint credit skipped {}, no apple music link {}, no links {}, no image {}, errors {}",
             self.artist_unchanged,
             self.artist_skipped,
             self.artist_kept,
             self.artist_fresh,
             self.artist_no_folder,
+            self.artist_joint,
             self.artist_spotify_only,
             self.artist_no_links,
             self.artist_no_image,
@@ -2593,6 +2677,112 @@ mod tests {
             folders: BTreeSet::from([dir.to_path_buf()]),
             sample_dir: dir.to_path_buf(),
         }
+    }
+
+    /// A library with Yellowcard's own album and the Yellowcard + Hammock split
+    /// both under `Yellowcard/`, and the split again under its own
+    /// `Yellowcard + Hammock/` folder. The split's tracks come first, so the
+    /// joint credit is the first name seen for Yellowcard's id.
+    fn joint_library(name: &str) -> (PathBuf, Vec<(Track, TrackMetadata)>) {
+        use nfo::tests::{YELLOWCARD, joint_track};
+        let root = std::env::temp_dir().join(format!("gatefold-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut own = joint_track();
+        own.album_artist_name = Some("Yellowcard".into());
+        own.release.album_artist_values = vec!["Yellowcard".into()];
+        own.release.album_artists = vec!["Yellowcard".into()];
+        own.release.album_artist_ids = vec![YELLOWCARD.into()];
+        let tracks = [
+            ("Yellowcard/A Hopeful Sign (2024)", joint_track()),
+            ("Yellowcard + Hammock/A Hopeful Sign (2024)", joint_track()),
+            ("Yellowcard/Ocean Avenue (2003)", own),
+        ];
+        let tracks = tracks
+            .into_iter()
+            .map(|(album, meta)| {
+                let dir = root.join(album);
+                fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("01.flac");
+                fs::write(&path, b"").unwrap();
+                (
+                    Track {
+                        path,
+                        has_lrc: false,
+                    },
+                    meta,
+                )
+            })
+            .collect();
+        (root, tracks)
+    }
+
+    #[test]
+    fn a_joint_credit_never_names_or_takes_one_artist_folder() {
+        use nfo::tests::YELLOWCARD;
+        let (root, tracks) = joint_library("joint");
+        let mut jobs = ArtistJobs::default();
+        for (track, meta) in &tracks {
+            collect_artist(&root, track, meta, &mut jobs);
+        }
+        let jobs = jobs.finish();
+
+        let ids: Vec<&String> = jobs.by_id.keys().collect();
+        assert_eq!(ids, [YELLOWCARD], "Hammock has no folder of its own");
+        let yellowcard = &jobs.by_id[YELLOWCARD];
+        assert_eq!(yellowcard.name, "Yellowcard");
+        assert_eq!(
+            yellowcard.folders,
+            BTreeSet::from([root.join("Yellowcard")]),
+            "never the joint folder, so it gets no Yellowcard images"
+        );
+        let joint = root.join("Yellowcard + Hammock");
+        assert_eq!(
+            jobs.joint,
+            BTreeMap::from([(joint.clone(), "Yellowcard + Hammock".to_string())])
+        );
+        assert_eq!(
+            joint_line(&joint, &jobs.joint[&joint], "no artist.nfo"),
+            "· Yellowcard + Hammock: no artist.nfo, joint credit \"Yellowcard + Hammock\" (several artists), skipped"
+        );
+
+        // Yellowcard's artist.nfo stays Yellowcard's.
+        let folder = root.join("Yellowcard");
+        let name = nfo::artist_title("Yellowcard", None, &yellowcard.name, 1).unwrap();
+        nfo::write_artist(&folder, name, &yellowcard.mbid, false).unwrap();
+        let xml = fs::read_to_string(folder.join(nfo::ARTIST_FILE)).unwrap();
+        assert!(xml.contains("<title>Yellowcard</title>"), "{xml}");
+        assert!(xml.contains(&format!("<musicbrainzartistid>{YELLOWCARD}<")));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_joint_folder_stays_joint_when_one_track_has_just_the_first_id() {
+        use nfo::tests::YELLOWCARD;
+        let (root, mut tracks) = joint_library("joint-degraded");
+        // Another copy of the split, tagged with the credit and only
+        // Yellowcard's id: on its own, it looks like Yellowcard's album.
+        let mut meta = nfo::tests::joint_track();
+        meta.release.album_artists.clear();
+        meta.release.album_artist_ids = vec![YELLOWCARD.into()];
+        let path = tracks[1].0.path.with_file_name("02.flac");
+        tracks.push((
+            Track {
+                path,
+                has_lrc: false,
+            },
+            meta,
+        ));
+        let mut jobs = ArtistJobs::default();
+        for (track, meta) in &tracks {
+            collect_artist(&root, track, meta, &mut jobs);
+        }
+        let jobs = jobs.finish();
+        assert_eq!(
+            jobs.by_id[YELLOWCARD].folders,
+            BTreeSet::from([root.join("Yellowcard")])
+        );
+        assert!(jobs.joint.contains_key(&root.join("Yellowcard + Hammock")));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     fn avatar_only(data: &[u8]) -> ArtistImages {
