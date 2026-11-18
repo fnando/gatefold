@@ -6,7 +6,7 @@ you already have.
 
 - **Lyrics** come from [lrclib.net](https://lrclib.net): the plain lyrics are embedded in
   the file's lyrics tag, and synced lyrics are written to a `<track>.lrc` sidecar when the
-  track doesn't already have one.
+  track doesn't already have one (or has one with plain, untimed lyrics).
 - **Cover art** comes from [Apple Music](https://music.apple.com) when the album can be
   found there (via its public lookup API, matched by barcode or `MusicBrainz` link; requested
   at 1500px), falling back to the
@@ -26,7 +26,8 @@ you already have.
 - Recursively scans common audio formats (`mp3`, `flac`, `ogg`, `opus`, `m4a`, `mp4`,
   `wav`, `aac`, `wma`) via [`lofty`](https://crates.io/crates/lofty).
 - Embeds plain lyrics into the unsynced-lyrics tag (ID3v2 `USLT`, Vorbis
-  `UNSYNCEDLYRICS`, MP4 `©lyr`) and creates a synced `.lrc` sidecar when one is missing.
+  `UNSYNCEDLYRICS`, MP4 `©lyr`) and creates a synced `.lrc` sidecar when one is missing or
+  has no timestamps.
 - Embeds the front cover and writes a per-folder `cover.jpg`. Apple Music's artwork is
   requested at up to 1500px (its originals are often 3000–4000px, several megabytes in every
   track for nothing visible; smaller ones come as they are); the Cover Art Archive fallback
@@ -43,7 +44,9 @@ you already have.
   library. See [Optimizing images](#optimizing-images).
 - **Never overwrites** by default. With `--replace-lyrics` / `--replace-cover`, the
   corresponding embedded tag is overwritten and the previous value is snapshotted under
-  `backup/` so it can be restored. Sidecars (`.lrc`, `cover.jpg`) are always create-only.
+  `backup/` so it can be restored. Sidecars (`.lrc`, `cover.jpg`) are create-only, except a
+  `.lrc` with no timestamps, which is moved into the album folder's hidden
+  `.gatefold-archive/lyrics/`, dated, when lrclib has synced lyrics for the track.
   Artist images are create-only too unless `--replace-artist-images` is set, which keeps the
   previous files, dated, in the artist folder's hidden `.gatefold-archive/` before writing the
   new ones.
@@ -159,11 +162,14 @@ For each discovered track:
    Cached metadata is reused on later runs while the mtime and size still match; a file that
    was re-tagged or re-uploaded since is re-read, so changes it needs (e.g. a cover that is no
    longer embedded) are picked up. The snapshot is refreshed after gatefold's own writes.
-2. **Lyrics**: unless the track already has both a lyrics tag and an adjacent `.lrc`, the
+2. **Lyrics**: unless the track already has both a lyrics tag and an adjacent synced `.lrc`
+   (one with at least one `[mm:ss]` timestamp), the
    lyrics record is loaded from `<state-dir>/lrc/<sha256(path)>.json` if present, otherwise
    fetched from `GET /api/get`. Only successful (`200`) responses are cached; `404` is not.
    When applying (not `--dry-run`), the plain lyrics are written to the lyrics tag (if the
-   track has none) and the synced lyrics to `<track>.lrc` (if no sidecar exists).
+   track has none) and the synced lyrics to `<track>.lrc` (if no sidecar exists, or it has
+   no timestamps: the old one is moved to `.gatefold-archive/lyrics/<track>-<YYYY-MM-DD>.lrc`
+   first).
 3. **Cover art**: when the file has a `MusicBrainz` release id, the album is first looked
    for on Apple Music through the public iTunes Lookup API (`itunes.apple.com/lookup`, no
    key): by the `BARCODE` tag if present, else by the barcode or Apple Music link on the
@@ -236,8 +242,8 @@ previous tag value, so before overwriting, that value is snapshotted to:
 Snapshots are only written when a tag is actually replaced with a *different* value, and
 they're versioned by timestamp, so repeated replace runs keep a history you can restore
 from. `--replace-cover` also replaces the folder's `cover.jpg` (snapshotted under the first
-track that triggers it); `.lrc` sidecars and a `folder.jpg` used as album cover are never
-touched.
+track that triggers it); a synced `.lrc` sidecar and a `folder.jpg` used as album cover are
+never touched (an unsynced `.lrc` is archived and replaced, as above).
 
 Artist images are the exception, since artists do refresh their photo to match a new album.
 With `--replace-artist-images`, each artist's page is re-resolved and, when the image URL

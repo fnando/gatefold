@@ -163,18 +163,55 @@ pub fn folder_has_cover(dir: &Path) -> bool {
     COVER_FILENAMES.iter().any(|name| dir.join(name).is_file())
 }
 
-/// Write `<stem>.lrc` next to the track. Never overwrites an existing file.
-/// Returns true when a file was (or, on a `dry_run`, would be) created.
-pub fn write_lrc(path: &Path, synced: &str, dry_run: bool) -> Result<bool> {
+/// Where a folder's replaced `.lrc` files go: its hidden `.gatefold-archive/lyrics/`.
+pub fn lyrics_archive_dir(dir: &Path) -> PathBuf {
+    dir.join(ARCHIVE_DIR).join("lyrics")
+}
+
+/// Whether the `.lrc` at `lrc` holds no timed line: plain lyrics where synced
+/// ones belong (or nothing). One that can't be read as text counts as synced,
+/// so it's left alone.
+pub fn lrc_is_unsynced(lrc: &Path) -> bool {
+    fs::read_to_string(lrc).is_ok_and(|text| !text.lines().any(is_timed_line))
+}
+
+/// `[mm:ss]`, `[mm:ss.xx]` or `[mm:ss:xx]` at the start of the line.
+fn is_timed_line(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('[') else {
+        return false;
+    };
+    let minutes = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = &rest[minutes..];
+    minutes > 0
+        && rest.len() > 3
+        && rest.as_bytes()[0] == b':'
+        && rest.as_bytes()[1..3].iter().all(u8::is_ascii_digit)
+        && matches!(rest.as_bytes()[3], b']' | b'.' | b':')
+}
+
+/// Write `synced` lyrics to `<stem>.lrc` next to the track. An existing file is
+/// kept, unless it has no timestamps ([`lrc_is_unsynced`]): then it's moved
+/// into the folder's `.gatefold-archive/lyrics/`, dated, and replaced. Returns
+/// what happened (on a `dry_run`, what would, with nothing written).
+pub fn write_lrc(path: &Path, synced: &str, revisions: &Revisions, dry_run: bool) -> Result<Write> {
     let lrc = scanner::lrc_path_for(path);
-    if lrc.exists() {
-        return Ok(false);
-    }
+    let outcome = if !lrc.exists() {
+        Write::Created
+    } else if lrc_is_unsynced(&lrc) {
+        Write::Replaced
+    } else {
+        return Ok(Write::Skipped);
+    };
     if dry_run {
-        return Ok(true);
+        return Ok(outcome);
+    }
+    if outcome == Write::Replaced {
+        let dir = lrc.parent().unwrap_or_else(|| Path::new("."));
+        let digest = revision::file_digest(&lrc)?;
+        revisions.archive(&lyrics_archive_dir(dir), &lrc, &digest)?;
     }
     fs::write(&lrc, synced).with_context(|| format!("writing {}", lrc.display()))?;
-    Ok(true)
+    Ok(outcome)
 }
 
 /// Embed `lyrics` into the file's unsynced-lyrics tag. When an existing value is
@@ -724,6 +761,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unsynced_lrc_is_archived_and_replaced() {
+        let dir = artist("lrc");
+        let revisions = Revisions::new();
+        let track = dir.join("01. Song.flac");
+        let lrc = track.with_extension("lrc");
+        fs::write(&lrc, "Plain line\n[Chorus]\nAnother line\n").unwrap();
+        assert_eq!(
+            write_lrc(&track, "[00:01.00] hi", &revisions, false).unwrap(),
+            Write::Replaced
+        );
+        assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:01.00] hi");
+        let archived = lyrics_archive_dir(&dir).join(format!("01. Song-{}.lrc", revisions.date()));
+        assert_eq!(
+            fs::read_to_string(&archived).unwrap(),
+            "Plain line\n[Chorus]\nAnother line\n"
+        );
+        // Now synced, it stays.
+        assert_eq!(
+            write_lrc(&track, "[00:09.00] other", &revisions, false).unwrap(),
+            Write::Skipped
+        );
+        assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:01.00] hi");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn timed_lines_are_told_from_plain_ones() {
+        for line in ["[00:01.00] hi", "[01:02] hi", "  [12:34:56]x", "[123:45.6]"] {
+            assert!(is_timed_line(line), "{line}");
+        }
+        for line in ["hi", "[Chorus]", "[ar:Artist]", "[1:2]", "[00:01", ""] {
+            assert!(!is_timed_line(line), "{line}");
+        }
+    }
+
+    #[test]
     fn a_dry_run_decides_like_a_real_one_and_writes_nothing() {
         let dir = artist("dry");
         let revisions = Revisions::new();
@@ -735,7 +808,10 @@ mod tests {
         let track = dir.join("01. Song.flac");
         fs::write(&track, b"audio").unwrap();
         let before = snapshot(&dir);
-        assert!(write_lrc(&track, "[00:01.00] hi", true).unwrap());
+        assert_eq!(
+            write_lrc(&track, "[00:01.00] hi", &revisions, true).unwrap(),
+            Write::Created
+        );
         assert_eq!(
             write_cover_sidecar(&dir, &old, false, None, true).unwrap(),
             Write::Created
@@ -750,9 +826,18 @@ mod tests {
         // skipped when the same.
         write_cover_sidecar(&dir, &old, false, None, false).unwrap();
         write_artist_image(&dir, ArtistImage::Avatar, &old, false, &revisions, false).unwrap();
-        fs::write(track.with_extension("lrc"), b"mine").unwrap();
+        fs::write(track.with_extension("lrc"), b"plain").unwrap();
+        assert_eq!(
+            write_lrc(&track, "[00:01.00] hi", &revisions, true).unwrap(),
+            Write::Replaced,
+            "an unsynced .lrc would be replaced"
+        );
+        fs::write(track.with_extension("lrc"), b"[00:02.50] mine").unwrap();
         let before = snapshot(&dir);
-        assert!(!write_lrc(&track, "[00:01.00] hi", true).unwrap());
+        assert_eq!(
+            write_lrc(&track, "[00:01.00] hi", &revisions, true).unwrap(),
+            Write::Skipped
+        );
         assert_eq!(
             write_cover_sidecar(&dir, &new, false, None, true).unwrap(),
             Write::Skipped

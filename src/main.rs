@@ -115,7 +115,7 @@ fn main() -> Result<()> {
             &cli,
             &root,
             &state,
-            &services,
+            (&services, &revisions),
             &progress,
             &tracks,
             &mut summary,
@@ -776,7 +776,7 @@ fn run_track_pass(
     cli: &Cli,
     root: &Path,
     state: &State,
-    services: &Services,
+    (services, revisions): (&Services, &Revisions),
     progress: &Progress,
     tracks: &[Track],
     summary: &mut Summary,
@@ -792,7 +792,7 @@ fn run_track_pass(
             cli,
             root,
             state,
-            services,
+            (services, revisions),
             progress,
             track,
             &name,
@@ -1108,7 +1108,7 @@ fn process_track(
     cli: &Cli,
     root: &Path,
     state: &State,
-    services: &Services,
+    (services, revisions): (&Services, &Revisions),
     progress: &Progress,
     track: &Track,
     name: &str,
@@ -1145,7 +1145,7 @@ fn process_track(
             track,
             &meta,
             &digest,
-            &backup,
+            (&backup, revisions),
         ) {
             Ok(outcome) => {
                 summary.record_lyrics(&outcome);
@@ -1229,7 +1229,7 @@ enum LyricsOutcome {
     NoLyrics,
     Applied {
         tag: writer::Write,
-        lrc: bool,
+        lrc: writer::Write,
         reused: bool,
     },
 }
@@ -1243,11 +1243,12 @@ fn process_lyrics(
     track: &Track,
     meta: &TrackMetadata,
     digest: &str,
-    backup: &Backup,
+    (backup, revisions): (&Backup, &Revisions),
 ) -> Result<LyricsOutcome> {
     let path = &track.path;
     // With --replace-lyrics we (re)write the tag even if one is already present.
-    let need_lrc = !track.has_lrc;
+    // An .lrc with no timestamps (plain lyrics) is retried for synced ones.
+    let need_lrc = !track.has_lrc || writer::lrc_is_unsynced(&scanner::lrc_path_for(path));
     let need_tag = !meta.has_lyrics_tag || cli.replace_lyrics;
     if !need_lrc && !need_tag {
         return Ok(LyricsOutcome::SkippedNothingToDo);
@@ -1295,18 +1296,19 @@ fn process_lyrics(
     } else {
         writer::Write::Skipped
     };
-    let wrote_lrc = if need_lrc && record.has_synced() {
-        writer::write_lrc(path, record.synced_lyrics.as_deref().unwrap(), cli.dry_run)?
+    let lrc = if need_lrc && record.has_synced() {
+        writer::write_lrc(
+            path,
+            record.synced_lyrics.as_deref().unwrap(),
+            revisions,
+            cli.dry_run,
+        )?
     } else {
-        false
+        writer::Write::Skipped
     };
 
-    if tag.happened() || wrote_lrc {
-        Ok(LyricsOutcome::Applied {
-            tag,
-            lrc: wrote_lrc,
-            reused,
-        })
+    if tag.happened() || lrc.happened() {
+        Ok(LyricsOutcome::Applied { tag, lrc, reused })
     } else {
         // A record existed, but nothing needed writing (lyrics already match, or
         // only a sidecar we already have) — not the same as lrclib having nothing.
@@ -2287,8 +2289,15 @@ fn log_lyrics(progress: &Progress, name: &str, outcome: &LyricsOutcome, dry_run:
                 )),
                 writer::Write::Skipped => {}
             }
-            if *lrc {
-                parts.push(format!("{} .lrc file", act(dry_run, "wrote", "write")));
+            match lrc {
+                writer::Write::Created => {
+                    parts.push(format!("{} .lrc file", act(dry_run, "wrote", "write")));
+                }
+                writer::Write::Replaced => parts.push(format!(
+                    "{} unsynced .lrc file",
+                    act(dry_run, "replaced", "replace")
+                )),
+                writer::Write::Skipped => {}
             }
             let src = if *reused { " (from cache)" } else { "" };
             progress.info(format!("✓ {name}: {}{src}", parts.join(", ")));
@@ -2450,6 +2459,8 @@ struct Summary {
     wrote_tag: u64,
     replaced_tag: u64,
     wrote_lrc: u64,
+    /// Unsynced `.lrc` files replaced with synced ones (the old one archived).
+    replaced_lrc: u64,
     lyrics_skipped: u64,
     lyrics_not_found: u64,
     no_lyrics: u64,
@@ -2499,8 +2510,10 @@ impl Summary {
                     writer::Write::Replaced => self.replaced_tag += 1,
                     writer::Write::Skipped => {}
                 }
-                if *lrc {
-                    self.wrote_lrc += 1;
+                match lrc {
+                    writer::Write::Created => self.wrote_lrc += 1,
+                    writer::Write::Replaced => self.replaced_lrc += 1,
+                    writer::Write::Skipped => {}
                 }
             }
         }
@@ -2624,9 +2637,11 @@ impl Summary {
             self.replaced_tag
         ));
         progress.info(format!(
-            "  {} {} .lrc file(s)",
+            "  {} {} .lrc file(s), {} {} unsynced",
             act(d, "created", "create"),
-            self.wrote_lrc
+            self.wrote_lrc,
+            act(d, "replaced", "replace"),
+            self.replaced_lrc
         ));
         progress.info(format!(
             "  skipped {}, not found {}, none {}, errors {}",
