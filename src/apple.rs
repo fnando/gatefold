@@ -311,6 +311,22 @@ fn cached_or_fetched(
     Ok(value)
 }
 
+/// The HLS master playlist of an album's square animated cover, read from the
+/// `serialized-server-data` JSON of its Apple Music page. `None` when the album
+/// has none (`"videoArtwork": null`, as most don't).
+pub fn motion_cover(html: &str) -> Option<String> {
+    let json = crate::artist::serialized_server_data(html)?;
+    let value = serde_json::from_str::<Value>(json).ok()?;
+    crate::artist::object_with_key(&value, "videoArtwork")?
+        .get("videoArtwork")?
+        .get("dictionary")?
+        .get("motionDetailSquare")?
+        .get("video")?
+        .as_str()
+        .filter(|url| url.starts_with("https://"))
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +334,38 @@ mod tests {
 
     const BASE: &str =
         "https://is1-ssl.mzstatic.com/image/thumb/Music116/v4/07/60/ba/x/634904078164.png";
+
+    fn album_page(header: &Value) -> String {
+        let data = json!({"data": [{"data": {"sections": [{"items": [header]}]}}]});
+        format!(r#"<script type="application/json" id="serialized-server-data">{data}</script>"#)
+    }
+
+    #[test]
+    fn reads_the_square_motion_cover() {
+        let square = "https://mvod.itunes.apple.com/itunes-assets/HLSVideo221/v4/P1_default.m3u8";
+        let html = album_page(&json!({
+            "id": "album-detail-header - 6822654844",
+            "videoArtwork": {"dictionary": {"motionDetailSquare": {
+                "previewFrame": {"width": 3840, "height": 3840},
+                "video": square
+            }}},
+            "tallVideoArtwork": {"dictionary": {"motionDetailTall": {
+                "video": "https://mvod.itunes.apple.com/tall.m3u8"
+            }}}
+        }));
+        assert_eq!(motion_cover(&html).as_deref(), Some(square));
+    }
+
+    #[test]
+    fn most_albums_have_no_motion_cover() {
+        let html = album_page(&json!({"videoArtwork": null, "tallVideoArtwork": null}));
+        assert_eq!(motion_cover(&html), None);
+        assert_eq!(motion_cover("<html></html>"), None);
+        let insecure = album_page(&json!({"videoArtwork": {"dictionary": {
+            "motionDetailSquare": {"video": "http://example.com/a.m3u8"}
+        }}}));
+        assert_eq!(motion_cover(&insecure), None);
+    }
 
     #[test]
     fn asset_base_strips_renditions_only() {

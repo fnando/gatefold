@@ -1,4 +1,4 @@
-use crate::writer::ArtistImage;
+use crate::writer::{ArtistImage, COVER_VIDEO};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -23,8 +23,13 @@ pub fn lrc_path_for(path: &Path) -> PathBuf {
 /// True when `path` has one of the audio extensions we handle. Motion backdrops
 /// share the `.mp4` extension with audio containers, so anything inside a
 /// `backdrops/` folder (Jellyfin's theme-video folder, where gatefold writes them)
-/// or named like one is excluded.
+/// or named like one is excluded, and so are the animated album cover
+/// (`cover.mp4`) and hidden files (macOS's `._*` metadata files).
 pub fn is_audio(path: &Path) -> bool {
+    let hidden = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'));
     let by_extension = path
         .extension()
         .and_then(|e| e.to_str())
@@ -36,9 +41,9 @@ pub fn is_audio(path: &Path) -> bool {
         .is_some_and(|n| n.eq_ignore_ascii_case("backdrops"));
     let is_backdrop_video = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
         let lower = n.to_ascii_lowercase();
-        ArtistImage::Video.names().contains(&lower.as_str())
+        ArtistImage::Video.names().contains(&lower.as_str()) || lower == COVER_VIDEO
     });
-    by_extension && !in_backdrops && !is_backdrop_video
+    by_extension && !hidden && !in_backdrops && !is_backdrop_video
 }
 
 /// True when `dir` directly contains at least one audio file (not recursive).
@@ -74,4 +79,20 @@ pub fn scan(root: &Path) -> Vec<Track> {
     // lexically (1, 10, 2). Compare the full path string so folder grouping holds.
     tracks.sort_by(|a, b| natord::compare(&a.path.to_string_lossy(), &b.path.to_string_lossy()));
     tracks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_files_and_backdrops_are_not_audio() {
+        assert!(is_audio(Path::new("Album/01. Song.mp4")));
+        assert!(is_audio(Path::new("Album/01. Song.FLAC")));
+        assert!(!is_audio(Path::new("Album/cover.mp4")));
+        assert!(!is_audio(Path::new("Album/Cover.MP4")));
+        assert!(!is_audio(Path::new("Album/._01. Song.flac")));
+        assert!(!is_audio(Path::new("Artist/backdrops/backdrop.mp4")));
+        assert!(!is_audio(Path::new("Album/cover.jpg")));
+    }
 }

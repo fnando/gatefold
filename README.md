@@ -34,6 +34,8 @@ you already have.
   uses its ~1200px variant,
   resolved from the track's `MusicBrainz` release id (then its release group, where art
   often lives). Cover art is fetched once per release and shared across the album's tracks.
+- Saves the album's **animated cover**, when Apple Music has one, as `cover.mp4` in the album
+  folder (square, 1080×1080 H.264; needs `ffmpeg`). See [Animated covers](#animated-covers).
 - Writes artist images once per album artist, into the folder named after the artist that
   sits above the album folders (`Artist/Album/track`). Apple's image host renders the
   renditions server-side from its originals, so the avatar comes at up to 1500×1500 and the
@@ -113,6 +115,7 @@ gatefold [--dir <DIR>] [OPTIONS]
 | `--artist-images-only` | Process artist images only; skip lyrics and cover art. Only needs each album folder's album artist, so it reads the tags of up to 3 tracks per folder (first, middle, last) and goes with the `MusicBrainz` album artist most of them carry. |
 | `--skip-artist-images` | Skip the artist-images pass. `--lyrics-only` / `--cover-only` imply it. |
 | `--skip-artist-videos` | Don't download motion backdrops (`backdrops/backdrop.mp4`); still images only. |
+| `--skip-cover-videos` | Don't download animated album covers (`cover.mp4`); see [Animated covers](#animated-covers). |
 | `--write-nfo` | Write an `artist.nfo` in each artist folder and an `album.nfo` in each album folder; see [nfo files](#nfo-files). |
 | `--jellyfin-url <URL>` | Jellyfin server to keep in line with the artist folders after the artist pass (see [Jellyfin](#jellyfin)). (env: `GATEFOLD_JELLYFIN_URL`) |
 | `--jellyfin-api-key <KEY>` | Jellyfin API key (Dashboard → API Keys). Prefer `--env-file`. (env: `GATEFOLD_JELLYFIN_API_KEY`) |
@@ -181,7 +184,8 @@ For each discovered track:
    — keyed by release, so it's downloaded **once per album** and reused for every track on
    it (a release with no art is remembered for the run and not re-requested); the Apple
    match is cached at `<state-dir>/release/<id>.json`. When applying, the front cover is
-   embedded (if the file has none) and written once per folder as `cover.jpg`.
+   embedded (if the file has none) and written once per folder as `cover.jpg`. The album's
+   [animated cover](#animated-covers), when it has one, is saved alongside as `cover.mp4`.
 
 Then, once per distinct **album artist** seen during the scan (the `MusicBrainz` album-artist
 id in the tags; "Various Artists" is skipped):
@@ -282,6 +286,33 @@ replaced file whose contents are already in the archive (an artist switching bac
 earlier photo) is dropped rather than archived twice. Unchanged images are left alone, so a
 replace run on an up-to-date library is a no-op apart from the page fetches.
 
+### Animated covers
+
+Some albums have an animated cover on Apple Music, a short looping video of the artwork. Gatefold
+saves the square version as `cover.mp4` in the album folder, next to `cover.jpg`:
+
+```
+Music/The Interrupters/2027 - Battle Scars/
+  01. Title.flac
+  cover.jpg
+  cover.mp4
+```
+
+Jellyfin's music libraries index no video files, so it's never taken for a track (gatefold
+skips it by name too). It's found through
+the same Apple Music match as the still cover: gatefold reads the album's Apple Music page,
+takes the best SDR H.264 rendition at or under 1080×1080 and re-encodes it with x264, like the
+[motion backdrops](#how-it-works). This needs `ffmpeg` on `PATH`; without it animated covers are
+skipped, with a note. `--skip-cover-videos` turns them off.
+
+It follows the cover's rules. A missing one is written, `--replace-cover` replaces it (the
+previous one is backed up), a cover keep marker keeps it, and
+[`gatefold skip`](#skipping-an-image) works on it too.
+
+Most albums have no animated cover. Each album is looked up once and a miss is recorded, so
+later runs don't fetch its page again. `--replace-cover` and `--miss-only` look the misses up
+again (`--retry-missed-after` limits how often).
+
 ### Keeping your own images
 
 For artists and albums whose art you picked yourself (a small artist with no photo on Apple
@@ -353,7 +384,7 @@ gatefold skip --dir "Music/Kemuri"   # every image in the folder
 ```
 
 `--dir` skips every image gatefold manages in that folder: `folder.*`, `backdrop.*`, `logo.*` and
-`backdrops/backdrop.*` in an artist folder, `cover.*` in an album folder. The album folders below
+`backdrops/backdrop.*` in an artist folder, `cover.*` and `cover.mp4` in an album folder. The album folders below
 an artist folder are left alone; pass them with their own `--dir`.
 
 It writes an empty `.gatefold-<sha256>-skip` marker next to each image, named after the
@@ -371,7 +402,7 @@ image's contents, and leaves the image where it is. On later runs:
   Music or Cover Art Archive image is picked up. Artist photos are re-checked on
   `--replace-artist-images` runs, as usual.
 
-You can skip `cover.jpg` / `cover.jpeg` / `cover.png` and the artist files (`folder.jpg`,
+You can skip `cover.jpg` / `cover.jpeg` / `cover.png`, the animated `cover.mp4`, and the artist files (`folder.jpg`,
 `backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Delete the marker to undo.
 
 ### Archiving an image

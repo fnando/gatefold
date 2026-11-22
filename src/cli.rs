@@ -156,6 +156,11 @@ pub struct Cli {
     #[arg(long)]
     pub skip_artist_videos: bool,
 
+    /// Don't download Apple Music animated album covers (`cover.mp4` in each
+    /// album folder, remuxed with ffmpeg).
+    #[arg(long)]
+    pub skip_cover_videos: bool,
+
     /// Write an `artist.nfo` in each artist folder (the artist's name and
     /// `MusicBrainz` id, so Jellyfin matches the folder to the right artist) and an
     /// `album.nfo` in each album folder (everything the tags say about the

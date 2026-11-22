@@ -733,6 +733,8 @@ struct Services {
     wikidata: wikidata::Client,
     /// Motion backdrops are wanted and ffmpeg is available to remux them.
     videos: bool,
+    /// Animated album covers are wanted and ffmpeg is available.
+    cover_videos: bool,
 }
 
 impl Services {
@@ -745,11 +747,15 @@ impl Services {
         progress: &Progress,
     ) -> Self {
         let videos = cli.artist_images_enabled() && !cli.skip_artist_videos;
-        let ffmpeg = videos && video::ffmpeg_available();
+        let cover_videos = cli.cover_enabled() && !cli.skip_cover_videos;
+        let ffmpeg = (videos || cover_videos) && video::ffmpeg_available();
         if videos && !ffmpeg {
             progress.info(
                 "ffmpeg not found on PATH: motion backdrops (backdrops/backdrop.mp4) will be skipped",
             );
+        }
+        if cover_videos && !ffmpeg {
+            progress.info("ffmpeg not found on PATH: animated covers (cover.mp4) will be skipped");
         }
         Self {
             lyrics: Client::new(
@@ -763,7 +769,8 @@ impl Services {
             lookup: apple::Lookup::new(cli.user_agent(), delay),
             resolver: artist::Resolver::new(cli.user_agent(), delay),
             wikidata: wikidata::Client::new(cli.user_agent(), delay),
-            videos: ffmpeg,
+            videos: videos && ffmpeg,
+            cover_videos: cover_videos && ffmpeg,
         }
     }
 }
@@ -1184,6 +1191,30 @@ fn process_track(
         }
     }
 
+    if cli.cover_enabled()
+        && services.cover_videos
+        && let Some(dir) = track.path.parent()
+        && !cover_misses.video_dirs.contains(dir)
+    {
+        let album = folder_label(dir);
+        match process_cover_video(cli, root, state, services, progress, dir, &meta, &backup) {
+            Ok(outcome) => {
+                // A track without a release id says nothing about the album:
+                // let the next track of the folder have a go.
+                if !matches!(outcome, CoverVideoOutcome::SkippedNoMbid) {
+                    cover_misses.video_dirs.insert(dir.to_path_buf());
+                }
+                summary.record_cover_video(&outcome);
+                log_cover_video(progress, &album, &outcome, cli.dry_run);
+            }
+            Err(err) => {
+                cover_misses.video_dirs.insert(dir.to_path_buf());
+                summary.cover_video_errors += 1;
+                progress.info(format!("✗ {album} (animated cover): {err:#}"));
+            }
+        }
+    }
+
     if cli.artist_images_enabled() {
         collect_artist(root, track, &meta, artist_jobs);
     }
@@ -1355,6 +1386,8 @@ struct CoverMemo {
     /// Releases whose cached art was skipped and has been looked up again this
     /// run, for a different image.
     rechecked: HashSet<String>,
+    /// Album folders whose animated cover was dealt with this run.
+    video_dirs: HashSet<PathBuf>,
 }
 
 /// What happened to a track's cover art.
@@ -1561,6 +1594,169 @@ fn fetch_cover(
         }
         Ok(None)
     }
+}
+
+/// The cache key variant for animated covers, kept apart from the still ones.
+const COVER_VIDEO_CACHE_VARIANT: &str = "apple-motion-square";
+
+/// What happened to an album folder's animated cover (`cover.mp4`).
+enum CoverVideoOutcome {
+    SkippedNoMbid,
+    /// Already there, or left out by `--new-only` / `--miss-only` /
+    /// `--retry-missed-after`, or a recorded miss.
+    Skipped,
+    /// `--replace-cover`, but a keep marker covers the album.
+    Kept,
+    /// Apple Music has no animated cover for the album (or no album).
+    NotFound,
+    /// The animated cover on offer was skipped (`gatefold skip`).
+    Rejected,
+    Applied {
+        write: writer::Write,
+        reused: bool,
+    },
+}
+
+/// Write the animated cover of album folder `dir` (once per folder a run),
+/// using `meta`, the tags of one of its tracks. Follows the still cover's
+/// rules: missing ones are written, `--replace-cover` replaces (unless kept),
+/// and a skipped one is replaced by a different one when there is one.
+///
+/// Most albums have none, so a recorded miss is only looked up again with
+/// `--replace-cover` or `--miss-only` (within `--retry-missed-after`); any
+/// other run would otherwise fetch every album's page every time.
+#[allow(clippy::too_many_arguments)]
+fn process_cover_video(
+    cli: &Cli,
+    root: &Path,
+    state: &State,
+    services: &Services,
+    progress: &Progress,
+    dir: &Path,
+    meta: &TrackMetadata,
+    backup: &Backup,
+) -> Result<CoverVideoOutcome> {
+    let Some(release) = meta
+        .musicbrainz_release_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(CoverVideoOutcome::SkippedNoMbid);
+    };
+    let group = meta
+        .musicbrainz_release_group_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
+
+    let present = dir.join(writer::COVER_VIDEO).is_file();
+    let kept = keep::cover(dir, root);
+    let replace = (cli.replace_cover && !kept) || skip::cover_video(dir);
+    if present && !replace {
+        return Ok(if cli.replace_cover && kept {
+            CoverVideoOutcome::Kept
+        } else {
+            CoverVideoOutcome::Skipped
+        });
+    }
+
+    let key = digest_str(&format!("{release}:{COVER_VIDEO_CACHE_VARIANT}"));
+    let missed = state.has_cover_miss(&key);
+    if (cli.new_only && state.has_cover_state(&key))
+        || (cli.miss_only && !missed)
+        || miss_fresh(cli, state.cover_miss_age(&key))
+        || (missed && !cli.replace_cover && !cli.miss_only)
+    {
+        return Ok(CoverVideoOutcome::Skipped);
+    }
+
+    let label = folder_label(dir);
+    let fetch = |recheck| {
+        fetch_cover_video(
+            services,
+            state,
+            progress,
+            &key,
+            meta,
+            (release, group),
+            &label,
+            recheck,
+        )
+    };
+    let (mut art, mut reused) = if state.has_art(&key) {
+        (state.load_art(&key)?, true)
+    } else {
+        (fetch(false)?, false)
+    };
+    // The cached one was skipped here: look again, in case Apple has another.
+    if reused
+        && art.as_ref().is_some_and(|art| skip::rejects_art(dir, art))
+        && let Some(fresh) = fetch(true)?
+    {
+        art = Some(fresh);
+        reused = false;
+    }
+    let Some(art) = art else {
+        return Ok(CoverVideoOutcome::NotFound);
+    };
+    if skip::rejects_art(dir, &art) {
+        return Ok(CoverVideoOutcome::Rejected);
+    }
+    let write = writer::write_cover_video(dir, &art, replace, Some(backup), cli.dry_run)?;
+    Ok(if write.happened() {
+        CoverVideoOutcome::Applied { write, reused }
+    } else {
+        CoverVideoOutcome::Skipped
+    })
+}
+
+/// Download a release's square animated cover from its Apple Music album page,
+/// caching it under `key`. `None` when the album isn't on Apple Music or has no
+/// animated cover (recorded as a miss, unless this is a `recheck`), or when
+/// the download fails (logged, not recorded, so the next run tries again).
+#[allow(clippy::too_many_arguments)]
+fn fetch_cover_video(
+    services: &Services,
+    state: &State,
+    progress: &Progress,
+    key: &str,
+    meta: &TrackMetadata,
+    (release, group): (&str, Option<&str>),
+    label: &str,
+    recheck: bool,
+) -> Result<Option<state::CachedArt>> {
+    let album = apple::resolve_release_art(
+        state,
+        &services.musicbrainz,
+        &services.lookup,
+        progress,
+        release,
+        group,
+        meta.barcode.as_deref(),
+        false,
+    )?;
+    let master = match album {
+        Some(album) => services
+            .resolver
+            .apple_album_page(&album.album_id, progress)?
+            .as_deref()
+            .and_then(apple::motion_cover),
+        None => None,
+    };
+    let Some(master) = master else {
+        if !recheck {
+            state.save_cover_miss(key)?;
+        }
+        return Ok(None);
+    };
+    motion_video(
+        state,
+        &services.resolver,
+        progress,
+        key,
+        &master,
+        label,
+        "animated cover",
+    )
 }
 
 // ---- Artist images ----------------------------------------------------------
@@ -2178,9 +2374,8 @@ fn artist_images(
     }))
 }
 
-/// An artist's motion backdrop: from the art cache, else the best fitting HLS
-/// variant written to MP4 by ffmpeg and cached. `None` (logged) when the
-/// playlist is gone or ffmpeg fails, so the still images are still written.
+/// An artist's motion backdrop: from the art cache, else downloaded (see
+/// [`motion_video`]) and cached under the playlist's URL.
 fn artist_video(
     state: &State,
     resolver: &artist::Resolver,
@@ -2192,6 +2387,29 @@ fn artist_video(
     if state.has_art(&key) {
         return state.load_art(&key);
     }
+    motion_video(
+        state,
+        resolver,
+        progress,
+        &key,
+        master_url,
+        &job.name,
+        "motion backdrop",
+    )
+}
+
+/// Apple motion artwork: the best fitting HLS variant written to MP4 by ffmpeg
+/// and cached under `key`. `None` (logged, as `<who>: <what> …`) when the
+/// playlist is gone or ffmpeg fails, so the rest of the run carries on.
+fn motion_video(
+    state: &State,
+    resolver: &artist::Resolver,
+    progress: &Progress,
+    key: &str,
+    master_url: &str,
+    who: &str,
+    what: &str,
+) -> Result<Option<state::CachedArt>> {
     let remuxed = (|| -> Result<Option<Vec<u8>>> {
         let Some(master) = resolver.fetch_text(master_url, progress)? else {
             return Ok(None);
@@ -2208,15 +2426,15 @@ fn artist_video(
     })();
     match remuxed {
         Ok(Some(data)) => {
-            let art = state.save_art(&key, "mp4", "video/mp4", Some("apple music"), data)?;
+            let art = state.save_art(key, "mp4", "video/mp4", Some("apple music"), data)?;
             Ok(Some(art))
         }
         Ok(None) => {
-            progress.info(format!("· {}: motion backdrop unavailable", job.name));
+            progress.info(format!("· {who}: {what} unavailable"));
             Ok(None)
         }
         Err(err) => {
-            progress.info(format!("· {}: motion backdrop skipped: {err:#}", job.name));
+            progress.info(format!("· {who}: {what} skipped: {err:#}"));
             Ok(None)
         }
     }
@@ -2360,6 +2578,24 @@ fn log_cover(progress: &Progress, name: &str, outcome: &CoverOutcome, dry_run: b
     }
 }
 
+fn log_cover_video(progress: &Progress, album: &str, outcome: &CoverVideoOutcome, dry_run: bool) {
+    // Most albums have no animated cover; the summary counts them.
+    let CoverVideoOutcome::Applied { write, reused } = outcome else {
+        return;
+    };
+    let verb = match write {
+        writer::Write::Created => act(dry_run, "wrote", "write"),
+        writer::Write::Replaced => act(dry_run, "replaced", "replace"),
+        writer::Write::Skipped => return,
+    };
+    let src = if *reused {
+        "cache, apple music"
+    } else {
+        "apple music"
+    };
+    progress.info(format!("✓ {album}: {verb} {} ({src})", writer::COVER_VIDEO));
+}
+
 fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome, dry_run: bool) {
     let name = &job.name;
     match outcome {
@@ -2477,6 +2713,14 @@ struct Summary {
     cover_rejected: u64,
     cover_not_found: u64,
     cover_errors: u64,
+    // animated covers
+    wrote_cover_video: u64,
+    replaced_cover_video: u64,
+    cover_video_skipped: u64,
+    cover_video_kept: u64,
+    cover_video_rejected: u64,
+    cover_video_not_found: u64,
+    cover_video_errors: u64,
     // artist images
     artist_wrote: u64,
     artist_replaced: u64,
@@ -2548,6 +2792,22 @@ impl Summary {
         }
     }
 
+    fn record_cover_video(&mut self, outcome: &CoverVideoOutcome) {
+        match outcome {
+            // Counted per album, not per track without a release id.
+            CoverVideoOutcome::SkippedNoMbid => {}
+            CoverVideoOutcome::Skipped => self.cover_video_skipped += 1,
+            CoverVideoOutcome::Kept => self.cover_video_kept += 1,
+            CoverVideoOutcome::NotFound => self.cover_video_not_found += 1,
+            CoverVideoOutcome::Rejected => self.cover_video_rejected += 1,
+            CoverVideoOutcome::Applied { write, .. } => match write {
+                writer::Write::Created => self.wrote_cover_video += 1,
+                writer::Write::Replaced => self.replaced_cover_video += 1,
+                writer::Write::Skipped => {}
+            },
+        }
+    }
+
     fn record_artist(&mut self, outcome: &ArtistOutcome) {
         match outcome {
             ArtistOutcome::SkippedNothingToDo | ArtistOutcome::SkippedByFilter => {
@@ -2588,6 +2848,9 @@ impl Summary {
         }
         if cli.cover_enabled() {
             self.print_cover(progress, cli.dry_run);
+            if !cli.skip_cover_videos {
+                self.print_cover_video(progress, cli.dry_run);
+            }
         }
         if cli.artist_images_enabled() {
             self.print_artist(progress, cli.dry_run);
@@ -2648,6 +2911,26 @@ impl Summary {
         progress.info(format!(
             "  skipped {}, not found {}, none {}, errors {}",
             self.lyrics_skipped, self.lyrics_not_found, self.no_lyrics, self.lyrics_errors
+        ));
+    }
+
+    fn print_cover_video(&self, progress: &Progress, d: bool) {
+        progress.info("animated covers:");
+        progress.info(format!(
+            "  {} {} {}, {} {}",
+            act(d, "wrote", "write"),
+            self.wrote_cover_video,
+            writer::COVER_VIDEO,
+            act(d, "replaced", "replace"),
+            self.replaced_cover_video
+        ));
+        progress.info(format!(
+            "  skipped {}, kept {}, rejected {}, none {}, errors {}",
+            self.cover_video_skipped,
+            self.cover_video_kept,
+            self.cover_video_rejected,
+            self.cover_video_not_found,
+            self.cover_video_errors
         ));
     }
 

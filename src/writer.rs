@@ -27,6 +27,11 @@ const COVER_FILENAMES: &[&str] = &[
 /// images and videos are never indexed or played as theme videos.
 pub const ARCHIVE_DIR: &str = ".gatefold-archive";
 
+/// An album folder's animated cover (Apple Music's square motion artwork).
+/// Jellyfin's music libraries index no video files, so it's never taken for a
+/// track there; gatefold's own scan skips it by name (see `scanner::is_audio`).
+pub const COVER_VIDEO: &str = "cover.mp4";
+
 /// Where archives lived before [`ARCHIVE_DIR`] (`primary/`, `backdrops/`,
 /// `logos/` in the artist folder itself), with the stem of the files archived
 /// there and their subfolder under [`ARCHIVE_DIR`] now.
@@ -469,6 +474,42 @@ pub fn write_cover_sidecar(
     })
 }
 
+/// Write the animated cover `art` to album folder `dir` as [`COVER_VIDEO`].
+/// An existing one is left alone unless `replace`, and never rewritten with
+/// the same contents; a replaced one is snapshotted into `backup`. Returns what
+/// happened (on a `dry_run`, what would, with nothing written).
+pub fn write_cover_video(
+    dir: &Path,
+    art: &CachedArt,
+    replace: bool,
+    backup: Option<&Backup>,
+    dry_run: bool,
+) -> Result<Write> {
+    let path = dir.join(COVER_VIDEO);
+    let previous = if path.is_file() {
+        if !replace {
+            return Ok(Write::Skipped);
+        }
+        let current = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if art.is(&digest_bytes(&current)) {
+            return Ok(Write::Skipped);
+        }
+        Some(current)
+    } else {
+        None
+    };
+    if dry_run {
+        return Ok(Write::of(previous.is_some()));
+    }
+    if let (Some(bytes), Some(backup)) = (&previous, backup) {
+        backup.snapshot("cover-video.mp4", bytes)?;
+    }
+    let work = temp_sibling(&path);
+    fs::write(&work, &art.data).with_context(|| format!("writing {}", work.display()))?;
+    fs::rename(&work, &path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(Write::of(previous.is_some()))
+}
+
 /// Move archives left by earlier versions in `primary/`, `backdrops/` and
 /// `logos/` of artist folder `dir` (where Jellyfin indexes them, and plays old
 /// motion backdrops as theme videos) into [`ARCHIVE_DIR`]. Only dated archive
@@ -624,6 +665,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn cover_video_is_written_once_and_replaced_only_when_asked() {
+        let dir = artist("cover-video");
+        let old = CachedArt::new("mp4", b"old motion");
+        let new = CachedArt::new("mp4", b"new motion");
+        let path = dir.join(COVER_VIDEO);
+
+        // A dry run reports the write without making it.
+        assert_eq!(
+            write_cover_video(&dir, &old, false, None, true).unwrap(),
+            Write::Created
+        );
+        assert!(!path.exists());
+
+        assert_eq!(
+            write_cover_video(&dir, &old, false, None, false).unwrap(),
+            Write::Created
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"old motion");
+        // Present: left alone unless replacing, and never rewritten as is.
+        assert_eq!(
+            write_cover_video(&dir, &new, false, None, false).unwrap(),
+            Write::Skipped
+        );
+        assert_eq!(
+            write_cover_video(&dir, &old, true, None, false).unwrap(),
+            Write::Skipped
+        );
+        assert_eq!(
+            write_cover_video(&dir, &new, true, None, false).unwrap(),
+            Write::Replaced
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"new motion");
+        assert!(!dir.join("cover.mp4.gatefold-tmp").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

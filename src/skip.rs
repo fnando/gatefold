@@ -13,7 +13,7 @@
 //! is welcome. Delete the marker to take the image back.
 
 use crate::state::{CachedArt, digest_bytes};
-use crate::writer::ArtistImage;
+use crate::writer::{ArtistImage, COVER_VIDEO};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -78,6 +78,13 @@ pub fn cover(dir: &Path) -> bool {
         .is_some_and(|path| rejected(&path))
 }
 
+/// True when album folder `dir` has an animated cover (`cover.mp4`) that was
+/// skipped.
+pub fn cover_video(dir: &Path) -> bool {
+    let path = dir.join(COVER_VIDEO);
+    path.is_file() && rejected(&path)
+}
+
 /// The `kind` file in artist folder `dir`, unless there is none or it was skipped.
 pub fn present(dir: &Path, kind: ArtistImage) -> Option<PathBuf> {
     kind.existing(dir).filter(|path| !rejected(path))
@@ -139,7 +146,8 @@ fn managed(image: &Path) -> bool {
 /// An image a run writes and may replace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Managed {
-    /// An album cover sidecar (`cover.*`), standing for the album's cover.
+    /// An album cover sidecar (`cover.*`) or animated cover (`cover.mp4`),
+    /// standing for the album's cover.
     Cover,
     Artist(ArtistImage),
 }
@@ -151,7 +159,7 @@ pub fn classify(image: &Path) -> Option<(Managed, PathBuf)> {
     let name = image.file_name()?.to_str()?.to_ascii_lowercase();
     let parent = image.parent().unwrap_or_else(|| Path::new("."));
     let in_backdrops = parent.file_name().is_some_and(|dir| dir == "backdrops");
-    if COVER_NAMES.contains(&name.as_str()) {
+    if COVER_NAMES.contains(&name.as_str()) || name == COVER_VIDEO {
         return Some((Managed::Cover, parent.to_path_buf()));
     }
     if in_backdrops && ArtistImage::Video.names().contains(&name.as_str()) {
@@ -168,12 +176,13 @@ pub fn classify(image: &Path) -> Option<(Managed, PathBuf)> {
     .map(|kind| (Managed::Artist(kind), parent.to_path_buf()))
 }
 
-/// The images a run manages in `dir` itself: an album folder's `cover.*`, an
+/// The images a run manages in `dir` itself: an album folder's `cover.*` and
+/// `cover.mp4`, an
 /// artist folder's `folder.*`, `backdrop.*`, `logo.*` and
 /// `backdrops/backdrop.*`. Album folders below are left alone.
 pub fn managed_in(dir: &Path) -> Vec<PathBuf> {
     let backdrops = dir.join("backdrops");
-    let top = COVER_NAMES.iter().copied().chain(
+    let top = COVER_NAMES.iter().copied().chain([COVER_VIDEO]).chain(
         [
             ArtistImage::Avatar,
             ArtistImage::Backdrop,
@@ -264,6 +273,19 @@ mod tests {
     }
 
     #[test]
+    fn skipped_cover_video() {
+        let dir = dir("cover-video");
+        assert!(!cover_video(&dir));
+        fs::write(dir.join("cover.mp4"), b"motion").unwrap();
+        assert!(!cover_video(&dir));
+        mark(&dir.join("cover.mp4")).unwrap();
+        assert!(cover_video(&dir));
+        // The still cover isn't affected.
+        assert!(!cover(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn classifies_by_name_and_folder() {
         let album = Path::new("Music/Kemuri/1997 - Little Playmate");
         let artist = Path::new("Music/Kemuri");
@@ -278,6 +300,10 @@ mod tests {
         assert_eq!(
             classify(&artist.join("logo.png")),
             Some((Managed::Artist(ArtistImage::Logo), artist.to_path_buf()))
+        );
+        assert_eq!(
+            classify(&album.join("cover.mp4")),
+            Some((Managed::Cover, album.to_path_buf()))
         );
         assert_eq!(classify(&artist.join("backdrop.mp4")), None);
         assert_eq!(classify(&album.join("01. Song.flac")), None);
@@ -333,6 +359,7 @@ mod tests {
         }
         fs::write(dir.join("backdrops/backdrop.mp4"), b"video").unwrap();
         fs::write(album.join("cover.jpg"), b"cover").unwrap();
+        fs::write(album.join("cover.mp4"), b"motion").unwrap();
         let names = |dir: &Path| {
             managed_in(dir)
                 .iter()
@@ -348,7 +375,7 @@ mod tests {
                 "backdrops/backdrop.mp4"
             ]
         );
-        assert_eq!(names(&album), ["cover.jpg"]);
+        assert_eq!(names(&album), ["cover.jpg", "cover.mp4"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

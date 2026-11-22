@@ -255,6 +255,17 @@ impl Resolver {
         }
     }
 
+    /// The public Apple Music page of album `id` (a collection id). `None` on
+    /// 404.
+    pub fn apple_album_page<W: RateLimitWaiter>(
+        &self,
+        id: &str,
+        waiter: &W,
+    ) -> Result<Option<String>> {
+        let url = format!("https://music.apple.com/us/album/{id}");
+        self.page(&url, "apple music", waiter)
+    }
+
     /// The `User-Agent` these requests identify with (also handed to ffmpeg).
     pub fn user_agent(&self) -> &str {
         &self.user_agent
@@ -402,7 +413,7 @@ fn is_artist_asset(base: &str) -> bool {
 }
 
 /// Depth-first search for the first object that has `key`.
-fn object_with_key<'a>(value: &'a Value, key: &str) -> Option<&'a Map<String, Value>> {
+pub fn object_with_key<'a>(value: &'a Value, key: &str) -> Option<&'a Map<String, Value>> {
     match value {
         Value::Object(map) => {
             if map.contains_key(key) {
