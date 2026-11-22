@@ -478,6 +478,24 @@ Cached images from before this existed are optimized the next time they're used.
 gatefold wrote before then still count as the same image, so `--replace-*` runs don't
 rewrite them just because they weren't optimized.
 
+### Printing a tracklist
+
+To print an album's tracks with their durations, read from the tags:
+
+```sh
+gatefold tracklist --dir "Music/Kemuri/Little Playmate"
+```
+
+```
+1. Prayer 3:12
+2. Ato Ichinichi 2:58
+…
+```
+
+Only the audio files directly in the folder are listed, in disc and track-number order (a
+track with no number is numbered by its position). An album with more than one disc gets a
+`Disc N` heading before each disc. A file whose tags can't be read is reported and left out.
+
 ### nfo files
 
 With `--write-nfo`, gatefold writes the `.nfo` files Jellyfin (and Kodi) read, from the tags (no

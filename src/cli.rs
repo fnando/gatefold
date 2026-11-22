@@ -281,6 +281,14 @@ pub enum Command {
         #[command(subcommand)]
         action: JellyfinCommand,
     },
+    /// Print an album folder's tracks, one per line, as `<track>. <title>
+    /// <duration>`, read from the tags of the audio files directly in it.
+    /// Albums with several discs get a `Disc N` heading per disc.
+    Tracklist {
+        /// Album folder (not walked recursively).
+        #[arg(long, value_parser = crate::paths::parse, value_name = "DIR", required = true)]
+        dir: PathBuf,
+    },
     /// Bring back an artist file from an artist folder's `.gatefold-archive/`.
     /// The file it replaces is skipped (see `skip`) and archived. With the
     /// Jellyfin server set, Jellyfin is told to show it.

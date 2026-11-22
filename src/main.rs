@@ -21,6 +21,7 @@ mod sample;
 mod scanner;
 mod skip;
 mod state;
+mod tracklist;
 mod verify;
 mod video;
 mod wikidata;
@@ -618,6 +619,7 @@ fn run_command(command: &cli::Command) -> Result<()> {
             },
         ),
         cli::Command::Jellyfin { action } => jellyfin_command(action),
+        cli::Command::Tracklist { dir } => tracklist::run(dir),
         cli::Command::Restore {
             dir,
             file,
