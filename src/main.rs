@@ -1267,6 +1267,13 @@ enum LyricsOutcome {
     },
 }
 
+/// True when a cached lrclib answer should be asked again because the
+/// track's `.lrc` is missing or plain and the answer had no synced lyrics
+/// (an instrumental never will).
+fn ask_again_for_synced(need_lrc: bool, cached: Option<&LyricsRecord>) -> bool {
+    need_lrc && cached.is_some_and(|record| !record.instrumental && !record.has_synced())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_lyrics(
     cli: &Cli,
@@ -1302,9 +1309,18 @@ fn process_lyrics(
 
     // Reuse a cached hit; otherwise (re)query. A recorded miss is deliberately
     // ignored here (--new-only and --retry-missed-after consult it above), so a
-    // normal run rechecks it.
-    let (record, reused) = if state.has_response(digest) {
-        (state.load_response(digest)?, true)
+    // normal run rechecks it. So is a cached answer without the synced lyrics
+    // the track's .lrc still wants: lrclib may have them by now. Both are
+    // spaced out by --retry-missed-after, from the last lookup.
+    let cached: Option<LyricsRecord> = if state.has_response(digest) {
+        state.load_response(digest)?
+    } else {
+        None
+    };
+    let ask_again = ask_again_for_synced(need_lrc, cached.as_ref())
+        && !miss_fresh(cli, state.lyrics_lookup_age(digest));
+    let (record, reused) = if state.has_response(digest) && !ask_again {
+        (cached, true)
     } else {
         fetch_lyrics(client, state, progress, meta, digest)?
     };
@@ -2964,6 +2980,25 @@ impl Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cached_answer_without_synced_lyrics_is_asked_again() {
+        let record = |json: &str| serde_json::from_str::<LyricsRecord>(json).unwrap();
+        let plain = record(r#"{"plainLyrics": "words"}"#);
+        let synced = record(r#"{"plainLyrics": "words", "syncedLyrics": "[00:01.00]words"}"#);
+        let instrumental = record(r#"{"instrumental": true}"#);
+        assert!(ask_again_for_synced(true, Some(&plain)));
+        assert!(
+            !ask_again_for_synced(false, Some(&plain)),
+            "the .lrc is synced already"
+        );
+        assert!(!ask_again_for_synced(true, Some(&synced)));
+        assert!(!ask_again_for_synced(true, Some(&instrumental)));
+        assert!(
+            !ask_again_for_synced(true, None),
+            "nothing cached: looked up anyway"
+        );
+    }
     use std::fs;
 
     fn art(data: &[u8]) -> state::CachedArt {

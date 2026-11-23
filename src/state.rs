@@ -214,6 +214,14 @@ impl State {
         age(&self.lrc_miss_path(digest))
     }
 
+    /// How long ago lyrics were last looked up for this track, hit or miss.
+    pub fn lyrics_lookup_age(&self, digest: &str) -> Option<Duration> {
+        [age(&self.lrc_path(digest)), self.lyrics_miss_age(digest)]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     fn clear_lyrics_miss(&self, digest: &str) -> Result<()> {
         remove_if_exists(&self.lrc_miss_path(digest))
     }
