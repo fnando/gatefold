@@ -1,11 +1,21 @@
+mod album_archive;
 mod apple;
 mod archive;
 mod artist;
 mod backup;
+mod casefix;
+mod changes;
 mod cli;
+mod config;
+mod config_edit;
 mod coverart;
+mod daemon;
+mod db;
+mod events;
+mod folders;
 mod jellyfin;
 mod keep;
+mod lock;
 mod lossless;
 mod lrclib;
 mod metadata;
@@ -19,18 +29,20 @@ mod restore;
 mod revision;
 mod sample;
 mod scanner;
+mod shutdown;
 mod skip;
 mod state;
 mod tracklist;
 mod verify;
 mod video;
+mod web;
 mod wikidata;
 mod writer;
 
 use anyhow::{Context, Result};
 use artist::{ArtistRecord, Resolved, Source};
 use backup::Backup;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli::Cli;
 use lrclib::{Client, Fetched, LyricsRecord, Query, Unauthorized};
 use metadata::{Fingerprint, TrackMetadata};
@@ -40,19 +52,129 @@ use scanner::Track;
 use state::{State, digest_for, digest_str};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use writer::ArtistImage;
 
 fn main() -> Result<()> {
     load_env_file()?;
-    let cli = Cli::parse();
+    let config = config::init(config::flag_from_args(std::env::args().skip(1)))?;
+    config::export_env(config);
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    config.apply(&mut cli, &matches);
 
+    if matches!(cli.command, Some(cli::Command::Run)) {
+        return daemon::start(cli);
+    }
     if let Some(command) = &cli.command {
         return run_command(command);
     }
+    // Without --dir, every library folder in the config gets its own run.
+    let dir_given = matches!(
+        matches.value_source("dir"),
+        Some(clap::parser::ValueSource::CommandLine)
+    );
+    let dirs = match config.library() {
+        libraries if !dir_given && !libraries.is_empty() => libraries,
+        _ => vec![cli.dir.clone()],
+    };
     let state_dir = resolve_state_dir(cli.state_dir.as_ref())?;
-    let state_dir = state_dir.as_path();
+    for dir in dirs {
+        let cli = Cli { dir, ..cli.clone() };
+        let recorder = open_recorder(&state_dir, &cli);
+        let result = run(&cli, &state_dir, recorder.clone());
+        if let Some(recorder) = &recorder {
+            finish_recorded_run(recorder, &result);
+        }
+        result?;
+    }
+    Ok(())
+}
 
+/// A run ended early because a stop was asked for (`gatefold run`).
+#[derive(Debug)]
+struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// Fail with [`Stopped`] once a stop was asked for.
+fn check_stop() -> Result<()> {
+    if events::stopping() {
+        Err(Stopped.into())
+    } else {
+        Ok(())
+    }
+}
+
+/// How a run ended: `ok`, `stopped` or `failed`.
+fn run_status(result: &Result<Summary>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(err) if err.is::<Stopped>() => "stopped",
+        Err(_) => "failed",
+    }
+}
+
+/// Note in `gatefold.db` how a recorded run ended, with its counts.
+fn finish_recorded_run(recorder: &changes::Recorder, result: &Result<Summary>) {
+    let Some(id) = recorder.run_id() else {
+        return;
+    };
+    let status = run_status(result);
+    let (summary, error) = match result {
+        Ok(summary) => (serde_json::to_string(summary).ok(), None),
+        Err(_) if status == "stopped" => (None, None),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    if let Err(err) = recorder
+        .db()
+        .finish_run(id, status, summary.as_deref(), error.as_deref())
+    {
+        eprintln!("warning: couldn't record the run in gatefold.db: {err:#}");
+    }
+}
+
+/// The run's entry in `gatefold.db`, where its changes are recorded. A dry run
+/// changes nothing, so it records nothing. A database that can't be opened
+/// is reported and the run goes on without it.
+fn open_recorder(state_dir: &Path, cli: &Cli) -> Option<Arc<changes::Recorder>> {
+    if cli.dry_run {
+        return None;
+    }
+    open_recorder_for(state_dir, cli, ("cli", None))
+}
+
+/// A run's entry in `gatefold.db`, started by `trigger` (`cli`, `schedule`,
+/// `manual`). A dry run gets one too (its log is kept), but records no changes.
+fn open_recorder_for(
+    state_dir: &Path,
+    cli: &Cli,
+    trigger: (&str, Option<&str>),
+) -> Option<Arc<changes::Recorder>> {
+    let root = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
+    let opened = db::Db::open_in(state_dir).and_then(|db| {
+        let id = db.start_run(trigger, &root, cli.dry_run)?;
+        Ok(changes::Recorder::new(db, Some(id)))
+    });
+    match opened {
+        Ok(recorder) => Some(Arc::new(recorder)),
+        Err(err) => {
+            eprintln!("warning: not recording changes in gatefold.db: {err:#}");
+            None
+        }
+    }
+}
+
+/// One run over `cli.dir`: lyrics and covers track by track, then artist
+/// images, nfo files and Jellyfin. Prints as it goes and returns the counts.
+fn run(cli: &Cli, state_dir: &Path, recorder: Option<Arc<changes::Recorder>>) -> Result<Summary> {
     if cli.verify {
         verify::ensure_available()?;
     }
@@ -86,11 +208,11 @@ fn main() -> Result<()> {
     } else {
         "processing"
     };
-    let progress = Progress::new(bar, to_read, seed_secs);
+    let progress = Progress::new(bar, to_read, seed_secs).with_recorder(recorder);
 
     let mb_client = musicbrainz::Client::new(&cli.musicbrainz_url, cli.user_agent(), delay);
     let mb_host = (!mb_client.is_public()).then(|| mb_client.host());
-    progress.headline(&run_summary(&cli, mb_host.as_deref()));
+    progress.headline(&run_summary(cli, mb_host.as_deref()));
 
     log_scan(&progress, &root, &tracks, folders.as_deref(), to_read);
 
@@ -101,11 +223,11 @@ fn main() -> Result<()> {
         progress.log_initial_estimate();
     }
 
-    let services = Services::new(&cli, mb_client, delay, &progress);
+    let services = Services::new(cli, mb_client, delay, &progress);
     let revisions = Revisions::new();
 
     if !artist_only {
-        progress.section(&section_title(&cli, "Processing"));
+        progress.section(&section_title(cli, "Processing"));
     }
 
     let mut summary = Summary::default();
@@ -113,7 +235,7 @@ fn main() -> Result<()> {
         run_artist_scan(&root, &state, &progress, folders, &mut summary)?
     } else {
         run_track_pass(
-            &cli,
+            cli,
             &root,
             &state,
             (&services, &revisions),
@@ -130,7 +252,7 @@ fn main() -> Result<()> {
 
     if cli.artist_images_enabled() {
         run_artist_pass(
-            &cli,
+            cli,
             &state,
             &services,
             &revisions,
@@ -141,6 +263,7 @@ fn main() -> Result<()> {
         );
     }
 
+    check_stop()?;
     if cli.write_nfo && cli.artist_images_enabled() {
         summary.nfo = Some(run_nfo_pass(
             &state,
@@ -156,7 +279,7 @@ fn main() -> Result<()> {
         && let Some(server) = cli.jellyfin.server()
     {
         summary.jellyfin = Some(run_jellyfin_pass(
-            &cli,
+            cli,
             server,
             &state,
             &revisions,
@@ -166,12 +289,12 @@ fn main() -> Result<()> {
     }
 
     progress.section("Summary");
-    summary.print(&progress, &cli);
-    Ok(())
+    summary.print(&progress, cli);
+    Ok(summary)
 }
 
 /// Counts for one kind of nfo file.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 struct NfoTally {
     wrote: u64,
     completed: u64,
@@ -183,11 +306,12 @@ struct NfoTally {
 impl NfoTally {
     /// Count one file and log what needs saying; `file` names it
     /// (`artist.nfo`), `id` is the `MusicBrainz` id the tags give.
+    /// `change` describes the file, recorded when it was written or completed.
     fn record(
         &mut self,
         progress: &Progress,
         (label, file, id): (&str, &str, &str),
-        result: Result<nfo::Outcome>,
+        (result, mut change): (Result<nfo::Outcome>, changes::Change),
         dry_run: bool,
     ) {
         match result {
@@ -195,11 +319,18 @@ impl NfoTally {
                 self.wrote += 1;
                 let wrote = act(dry_run, "wrote", "write");
                 progress.info(format!("✓ {label}: {wrote} {file}"));
+                if !dry_run {
+                    progress.change(&change);
+                }
             }
             Ok(nfo::Outcome::Completed) => {
                 self.completed += 1;
                 let completed = act(dry_run, "completed", "complete");
                 progress.info(format!("✓ {label}: {completed} {file}"));
+                if !dry_run {
+                    change.action = changes::Action::Replaced;
+                    progress.change(&change);
+                }
             }
             Ok(nfo::Outcome::Already) => self.already += 1,
             Ok(nfo::Outcome::Differs(found)) => {
@@ -236,7 +367,7 @@ impl NfoTally {
 }
 
 /// What the nfo pass did, per kind of file.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 struct NfoSummary {
     artists: NfoTally,
     albums: NfoTally,
@@ -325,9 +456,20 @@ fn write_artist_nfos(
                     continue;
                 }
             };
+            let held = folders::hold([folder.as_path()]);
             let result = nfo::write_artist(folder, name, &job.mbid, dry_run);
+            drop(held);
             let what = (label.as_str(), nfo::ARTIST_FILE, job.mbid.as_str());
-            tally.record(progress, what, result, dry_run);
+            let change = changes::Change {
+                kind: changes::Kind::ArtistNfo,
+                action: changes::Action::Created,
+                artist: Some(job.name.clone()),
+                artist_dir: Some(folder.clone()),
+                album_dir: None,
+                file: folder.join(nfo::ARTIST_FILE),
+                source: None,
+            };
+            tally.record(progress, what, (result, change), dry_run);
         }
     }
     tally
@@ -391,8 +533,28 @@ fn write_album_nfos(
             ));
         }
         let id = album.release_id.clone().unwrap_or_default();
+        let held = folders::hold([folder.as_path()]);
         let result = nfo::write_album(&folder, &album, dry_run);
-        tally.record(progress, (&label, nfo::ALBUM_FILE, &id), result, dry_run);
+        drop(held);
+        let change = changes::Change {
+            kind: changes::Kind::AlbumNfo,
+            action: changes::Action::Created,
+            artist: album
+                .artists
+                .first()
+                .cloned()
+                .or_else(|| album.credit.clone()),
+            artist_dir: folder.parent().map(Path::to_path_buf),
+            album_dir: Some(folder.clone()),
+            file: folder.join(nfo::ALBUM_FILE),
+            source: None,
+        };
+        tally.record(
+            progress,
+            (&label, nfo::ALBUM_FILE, &id),
+            (result, change),
+            dry_run,
+        );
     }
     tally
 }
@@ -419,8 +581,8 @@ fn track_metadata(state: &State, track: &Track) -> Result<TrackMetadata> {
 
 /// `--state-dir`, else `$XDG_DATA_HOME/gatefold` or `~/.local/share/gatefold`.
 fn resolve_state_dir(given: Option<&PathBuf>) -> Result<PathBuf> {
-    match given {
-        Some(dir) => Ok(dir.clone()),
+    match given.cloned().or_else(|| config::get().state_dir()) {
+        Some(dir) => Ok(dir),
         None => state::default_dir(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
             .context("no --state-dir given and neither $XDG_DATA_HOME nor $HOME is set"),
     }
@@ -604,8 +766,26 @@ fn sync_jellyfin(
 /// The subcommands, which work on the music folder directly (no state dir).
 fn run_command(command: &cli::Command) -> Result<()> {
     match command {
-        cli::Command::Skip { images, dirs } => skip_images(images, dirs),
-        cli::Command::Keep { files, dirs } => keep_paths(files, dirs),
+        cli::Command::Skip {
+            images,
+            dirs,
+            undo: false,
+        } => skip_images(images, dirs),
+        cli::Command::Skip {
+            images,
+            dirs,
+            undo: true,
+        } => unskip_images(images, dirs),
+        cli::Command::Keep {
+            files,
+            dirs,
+            undo: false,
+        } => keep_paths(files, dirs),
+        cli::Command::Keep {
+            files,
+            dirs,
+            undo: true,
+        } => unkeep_paths(files, dirs),
         cli::Command::Archive { files } => archive::run(files),
         cli::Command::Optimize {
             dirs,
@@ -620,6 +800,38 @@ fn run_command(command: &cli::Command) -> Result<()> {
         ),
         cli::Command::Jellyfin { action } => jellyfin_command(action),
         cli::Command::Tracklist { dir } => tracklist::run(dir),
+        cli::Command::Config { action } => config_command(action.as_ref()),
+        cli::Command::Run => unreachable!("`gatefold run` starts in main"),
+        cli::Command::FixCase { dirs, dry_run } => fix_case(dirs, *dry_run),
+        cli::Command::Changes {
+            artist,
+            dir,
+            kind,
+            limit,
+            state_dir,
+        } => {
+            let state_dir = resolve_state_dir(state_dir.as_ref())?;
+            let dir = dir
+                .as_ref()
+                .map(|dir| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()));
+            let kinds: Vec<changes::Kind> = changes::KINDS
+                .iter()
+                .copied()
+                .filter(|k| kind.as_deref().is_none_or(|group| k.group() == group))
+                .collect();
+            let query = db::ChangeQuery {
+                artist_dir: dir.as_deref(),
+                artist: artist.as_deref(),
+                kinds: if kind.is_some() { &kinds } else { &[] },
+                limit: *limit,
+                ..db::ChangeQuery::default()
+            };
+            let rows = db::Db::open_in(&state_dir)?.changes(&query)?;
+            for line in changes::render(&rows) {
+                println!("{line}");
+            }
+            Ok(())
+        }
         cli::Command::Restore {
             dir,
             file,
@@ -645,6 +857,39 @@ fn run_command(command: &cli::Command) -> Result<()> {
     }
 }
 
+/// `gatefold config`: the effective config, its path, or a fresh example.
+fn config_command(action: Option<&cli::ConfigCommand>) -> Result<()> {
+    let path = config::loaded_path();
+    match action {
+        Some(cli::ConfigCommand::Path) => {
+            let path = path.context("neither $XDG_CONFIG_HOME nor $HOME is set")?;
+            println!("{}", path.display());
+        }
+        Some(cli::ConfigCommand::Init) => {
+            let path = path.context("neither $XDG_CONFIG_HOME nor $HOME is set")?;
+            if path.exists() {
+                anyhow::bail!("{} already exists", path.display());
+            }
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+            }
+            std::fs::write(path, config::EXAMPLE)
+                .with_context(|| format!("writing {}", path.display()))?;
+            println!("✓ wrote {}", path.display());
+        }
+        None => {
+            match path {
+                Some(path) if path.is_file() => println!("# {}", path.display()),
+                Some(path) => println!("# {} (not there: these are the defaults)", path.display()),
+                None => println!("# no config file (these are the defaults)"),
+            }
+            print!("{}", config::get().masked());
+        }
+    }
+    Ok(())
+}
+
 /// `gatefold skip`: mark each image (`--file`), and every image in each folder
 /// (`--dir`), as unwanted. Every image is attempted; the
 /// command fails if any of them couldn't be marked.
@@ -665,11 +910,14 @@ fn skip_images(images: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
     }
     for image in &all {
         match skip::mark(image) {
-            Ok(skip::Marked::Created(marker)) => println!(
-                "✓ {}: skipped ({}); replaced once a different image is available",
-                image.display(),
-                marker.display()
-            ),
+            Ok(skip::Marked::Created(marker)) => {
+                println!(
+                    "✓ {}: skipped ({}); replaced once a different image is available",
+                    image.display(),
+                    marker.display()
+                );
+                record_file_change(changes::Kind::Skipped, image);
+            }
             Ok(skip::Marked::AlreadySkipped(_)) => {
                 println!("· {}: already skipped", image.display());
             }
@@ -699,7 +947,10 @@ fn keep_paths(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
             Ok(kept) => {
                 let marker = kept.marker.path().display();
                 match kept.marker {
-                    keep::Marked::Created(_) => println!("✓ {}: kept ({marker})", path.display()),
+                    keep::Marked::Created(_) => {
+                        println!("✓ {}: kept ({marker})", path.display());
+                        record_file_change(changes::Kind::Kept, path);
+                    }
                     keep::Marked::AlreadyKept(_) => {
                         println!("· {}: already kept ({marker})", path.display());
                     }
@@ -721,6 +972,127 @@ fn keep_paths(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
         anyhow::bail!("{failed} path(s) could not be kept");
     }
     Ok(())
+}
+
+/// `gatefold skip --undo`: remove the skip marker of each image (`--file`) and
+/// of every image in each folder (`--dir`).
+fn unskip_images(images: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
+    let mut failed = 0;
+    let all = images
+        .iter()
+        .cloned()
+        .chain(dirs.iter().flat_map(|dir| skip::managed_in(dir)));
+    for image in all {
+        match skip::unmark(&image) {
+            Ok(Some(marker)) => {
+                println!(
+                    "✓ {}: skip taken back (removed {})",
+                    image.display(),
+                    marker.display()
+                );
+                record_file_change(changes::Kind::Unskipped, &image);
+            }
+            Ok(None) => println!("· {}: wasn't skipped", image.display()),
+            Err(err) => {
+                failed += 1;
+                eprintln!("✗ {err:#}");
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} path(s) could not be taken back");
+    }
+    Ok(())
+}
+
+/// `gatefold keep --undo`: remove the keep marker of each image (`--file`) and
+/// folder (`--dir`).
+fn unkeep_paths(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
+    let mut failed = 0;
+    let marks = files
+        .iter()
+        .map(|path| (path, keep::unmark_file(path)))
+        .chain(dirs.iter().map(|path| (path, keep::unmark_dir(path))));
+    for (path, result) in marks {
+        match result {
+            Ok(Some(marker)) => {
+                println!(
+                    "✓ {}: no longer kept (removed {})",
+                    path.display(),
+                    marker.display()
+                );
+                if keep::file_is_kept(path) {
+                    println!("  still kept by its folder's {}", keep::ALL);
+                }
+                record_file_change(changes::Kind::Unkept, path);
+            }
+            Ok(None) => println!("· {}: wasn't kept", path.display()),
+            Err(err) => {
+                failed += 1;
+                eprintln!("✗ {err:#}");
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} path(s) could not be taken back");
+    }
+    Ok(())
+}
+
+/// `gatefold fix-case`: find sidecars named in another case than expected,
+/// and (unless `dry_run`) fix them.
+fn fix_case(dirs: &[PathBuf], dry_run: bool) -> Result<()> {
+    let revisions = Revisions::new();
+    let (mut found, mut failed) = (0, 0);
+    for dir in dirs {
+        paths::require_dir(dir, None)?;
+        for problem in casefix::scan(dir) {
+            found += 1;
+            let label = problem
+                .expected
+                .parent()
+                .map_or_else(String::new, folder_label);
+            if dry_run {
+                println!("· {label}: {}", problem.describe());
+                continue;
+            }
+            match casefix::fix(&problem, &revisions) {
+                Ok(fixed) => {
+                    println!("✓ {label}: {}", problem.describe());
+                    for (from, to) in &fixed.archived {
+                        println!("  archived {} as {}", from.display(), to.display());
+                    }
+                    record_file_change(changes::Kind::FixedCase, &fixed.kept);
+                }
+                Err(err) => {
+                    failed += 1;
+                    eprintln!("✗ {label}: {err:#}");
+                }
+            }
+        }
+    }
+    match found {
+        0 => println!("· nothing to fix"),
+        n if dry_run => println!("· {n} to fix; run without --dry-run to fix them"),
+        _ => {}
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} file(s) could not be fixed");
+    }
+    Ok(())
+}
+
+/// Record a change made outside a run (`gatefold keep`, `skip`, `archive`,
+/// `restore`) in `gatefold.db`. Trouble is reported, never fatal.
+fn record_file_change(kind: changes::Kind, path: &Path) {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let change = changes::for_file(kind, changes::Action::Created, &path);
+    let recorded = resolve_state_dir(None)
+        .and_then(|dir| db::Db::open_in(&dir))
+        .and_then(|db| db.insert_change(None, db::now(), &change));
+    if let Err(err) = recorded {
+        eprintln!("warning: couldn't record the change in gatefold.db: {err:#}");
+    }
 }
 
 /// Every remote service a run talks to, built once.
@@ -793,10 +1165,14 @@ fn run_track_pass(
     let mut cover_misses = CoverMemo::default();
     let mut artist_jobs = ArtistJobs::default();
     for (i, track) in tracks.iter().enumerate() {
+        check_stop()?;
         let name = track_name(track);
         progress.status(name.clone());
 
         let start = Instant::now();
+        // Another run (`gatefold run`'s jobs run in parallel) may be writing
+        // in this album folder: wait for it.
+        let held = folders::hold(track.path.parent());
         let result = process_track(
             cli,
             root,
@@ -809,6 +1185,7 @@ fn run_track_pass(
             &mut cover_misses,
             &mut artist_jobs,
         );
+        drop(held);
         progress.record_track(start.elapsed());
 
         if let Err(err) = result {
@@ -971,15 +1348,24 @@ fn run_artist_pass(
     bar.log_initial_estimate();
 
     for (i, job) in jobs.by_id.values().enumerate() {
+        if events::stopping() {
+            break;
+        }
         bar.status(job.name.clone());
         let start = Instant::now();
         if !cli.dry_run {
             migrate_archives(&bar, job);
         }
-        match process_artist(cli, state, services, revisions, &bar, job) {
+        let held = folders::hold(job.folders.iter().map(PathBuf::as_path));
+        let outcome = process_artist(cli, state, services, revisions, &bar, job);
+        drop(held);
+        match outcome {
             Ok(outcome) => {
                 summary.record_artist(&outcome);
                 log_artist(&bar, job, &outcome, cli.dry_run);
+                if !cli.dry_run {
+                    record_artist_changes(&bar, job, &outcome);
+                }
             }
             Err(err) => {
                 summary.artist_errors += 1;
@@ -1159,6 +1545,9 @@ fn process_track(
             Ok(outcome) => {
                 summary.record_lyrics(&outcome);
                 log_lyrics(progress, name, &outcome, cli.dry_run);
+                if !cli.dry_run {
+                    record_lyrics_change(progress, root, track, &meta, &outcome);
+                }
             }
             Err(err) if err.downcast_ref::<Unauthorized>().is_some() => return Err(err),
             Err(err) => {
@@ -1183,6 +1572,9 @@ fn process_track(
             Ok(outcome) => {
                 summary.record_cover(&outcome);
                 log_cover(progress, name, &outcome, cli.dry_run);
+                if !cli.dry_run {
+                    record_cover_change(progress, root, track, &meta, &outcome);
+                }
             }
             Err(err) => {
                 summary.cover_errors += 1;
@@ -1191,28 +1583,17 @@ fn process_track(
         }
     }
 
-    if cli.cover_enabled()
-        && services.cover_videos
-        && let Some(dir) = track.path.parent()
-        && !cover_misses.video_dirs.contains(dir)
-    {
-        let album = folder_label(dir);
-        match process_cover_video(cli, root, state, services, progress, dir, &meta, &backup) {
-            Ok(outcome) => {
-                // A track without a release id says nothing about the album:
-                // let the next track of the folder have a go.
-                if !matches!(outcome, CoverVideoOutcome::SkippedNoMbid) {
-                    cover_misses.video_dirs.insert(dir.to_path_buf());
-                }
-                summary.record_cover_video(&outcome);
-                log_cover_video(progress, &album, &outcome, cli.dry_run);
-            }
-            Err(err) => {
-                cover_misses.video_dirs.insert(dir.to_path_buf());
-                summary.cover_video_errors += 1;
-                progress.info(format!("✗ {album} (animated cover): {err:#}"));
-            }
-        }
+    if cli.cover_enabled() && services.cover_videos {
+        cover_video_step(
+            cli,
+            root,
+            state,
+            services,
+            progress,
+            (track, &meta, &backup),
+            summary,
+            cover_misses,
+        );
     }
 
     if cli.artist_images_enabled() {
@@ -1612,6 +1993,58 @@ fn fetch_cover(
     }
 }
 
+/// The animated cover of the track's album folder, once per folder a run
+/// (see [`process_cover_video`]): counted, logged and recorded.
+#[allow(clippy::too_many_arguments)]
+fn cover_video_step(
+    cli: &Cli,
+    root: &Path,
+    state: &State,
+    services: &Services,
+    progress: &Progress,
+    (track, meta, backup): (&Track, &TrackMetadata, &Backup),
+    summary: &mut Summary,
+    cover_misses: &mut CoverMemo,
+) {
+    if let Some(dir) = track.path.parent()
+        && !cover_misses.video_dirs.contains(dir)
+    {
+        let album = folder_label(dir);
+        match process_cover_video(cli, root, state, services, progress, dir, meta, backup) {
+            Ok(outcome) => {
+                // A track without a release id says nothing about the album:
+                // let the next track of the folder have a go.
+                if !matches!(outcome, CoverVideoOutcome::SkippedNoMbid) {
+                    cover_misses.video_dirs.insert(dir.to_path_buf());
+                }
+                summary.record_cover_video(&outcome);
+                log_cover_video(progress, &album, &outcome, cli.dry_run);
+                if !cli.dry_run
+                    && let CoverVideoOutcome::Applied { write, .. } = &outcome
+                    && let Some(action) = changes::Action::of(*write)
+                {
+                    let file = dir.join(writer::COVER_VIDEO);
+                    let change = changes::Kind::CoverVideo;
+                    let source = Some("apple music");
+                    progress.change(&track_change(
+                        root,
+                        dir,
+                        meta,
+                        (change, action),
+                        file,
+                        source,
+                    ));
+                }
+            }
+            Err(err) => {
+                cover_misses.video_dirs.insert(dir.to_path_buf());
+                summary.cover_video_errors += 1;
+                progress.info(format!("✗ {album} (animated cover): {err:#}"));
+            }
+        }
+    }
+}
+
 /// The cache key variant for animated covers, kept apart from the still ones.
 const COVER_VIDEO_CACHE_VARIANT: &str = "apple-motion-square";
 
@@ -1664,7 +2097,7 @@ fn process_cover_video(
         .as_deref()
         .filter(|s| !s.trim().is_empty());
 
-    let present = dir.join(writer::COVER_VIDEO).is_file();
+    let present = writer::existing_cover_video(dir).is_some();
     let kept = keep::cover(dir, root);
     let replace = (cli.replace_cover && !kept) || skip::cover_video(dir);
     if present && !replace {
@@ -1773,6 +2206,130 @@ fn fetch_cover_video(
         label,
         "animated cover",
     )
+}
+
+/// A change to one of a track's files (or its album folder's), credited to
+/// its album artist and linked to that artist's folder, when there's one.
+fn track_change(
+    root: &Path,
+    dir: &Path,
+    meta: &TrackMetadata,
+    (kind, action): (changes::Kind, changes::Action),
+    file: PathBuf,
+    source: Option<&str>,
+) -> changes::Change {
+    let artist = meta.album_artist().map(str::to_string);
+    let artist_dir = artist
+        .as_deref()
+        .and_then(|name| artist::find_artist_folder(dir, root, name));
+    changes::Change {
+        kind,
+        action,
+        artist,
+        artist_dir,
+        album_dir: Some(dir.to_path_buf()),
+        file,
+        source: source.map(str::to_string),
+    }
+}
+
+/// Record what a lyrics outcome wrote: the tag and the `.lrc`.
+fn record_lyrics_change(
+    progress: &Progress,
+    root: &Path,
+    track: &Track,
+    meta: &TrackMetadata,
+    outcome: &LyricsOutcome,
+) {
+    let LyricsOutcome::Applied { tag, lrc, .. } = outcome else {
+        return;
+    };
+    let dir = track.path.parent().unwrap_or_else(|| Path::new("."));
+    let writes = [
+        (changes::Kind::LyricsTag, *tag, track.path.clone()),
+        (changes::Kind::Lrc, *lrc, scanner::lrc_path_for(&track.path)),
+    ];
+    for (kind, write, file) in writes {
+        if let Some(action) = changes::Action::of(write) {
+            let change = track_change(root, dir, meta, (kind, action), file, Some("lrclib"));
+            progress.change(&change);
+        }
+    }
+}
+
+/// Record what a cover outcome wrote: the embedded cover and `cover.*`.
+fn record_cover_change(
+    progress: &Progress,
+    root: &Path,
+    track: &Track,
+    meta: &TrackMetadata,
+    outcome: &CoverOutcome,
+) {
+    let CoverOutcome::Applied {
+        embedded,
+        sidecar,
+        source,
+        ..
+    } = outcome
+    else {
+        return;
+    };
+    let dir = track.path.parent().unwrap_or_else(|| Path::new("."));
+    let sidecar_file = writer::existing_cover_sidecar(dir).unwrap_or_else(|| dir.join("cover.jpg"));
+    let writes = [
+        (changes::Kind::CoverEmbedded, *embedded, track.path.clone()),
+        (changes::Kind::CoverSidecar, *sidecar, sidecar_file),
+    ];
+    for (kind, write, file) in writes {
+        if let Some(action) = changes::Action::of(write) {
+            let change = track_change(root, dir, meta, (kind, action), file, Some(source));
+            progress.change(&change);
+        }
+    }
+}
+
+/// Record the artist files an artist outcome wrote, in each artist folder.
+fn record_artist_changes(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome) {
+    let ArtistOutcome::Applied {
+        avatar,
+        backdrop,
+        video,
+        logo,
+        source,
+        ..
+    } = outcome
+    else {
+        return;
+    };
+    let writes = [
+        (changes::Kind::ArtistAvatar, ArtistImage::Avatar, *avatar),
+        (
+            changes::Kind::ArtistBackdrop,
+            ArtistImage::Backdrop,
+            *backdrop,
+        ),
+        (changes::Kind::ArtistVideo, ArtistImage::Video, *video),
+        (changes::Kind::ArtistLogo, ArtistImage::Logo, *logo),
+    ];
+    for folder in &job.folders {
+        for (kind, image, write) in writes {
+            let Some(action) = changes::Action::of(write) else {
+                continue;
+            };
+            let file = image
+                .existing(folder)
+                .unwrap_or_else(|| image.target_dir(folder).join(image.names()[0]));
+            progress.change(&changes::Change {
+                kind,
+                action,
+                artist: Some(job.name.clone()),
+                artist_dir: Some(folder.clone()),
+                album_dir: None,
+                file,
+                source: Some(source.label().to_string()),
+            });
+        }
+    }
 }
 
 // ---- Artist images ----------------------------------------------------------
@@ -2705,7 +3262,7 @@ fn no_apple_photo(apple_link: bool) -> &'static str {
 }
 
 /// Aggregate counts printed at the end of the run.
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 struct Summary {
     /// Files whose tags could not be read; nothing was done for them.
     unreadable: u64,

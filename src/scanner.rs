@@ -15,9 +15,19 @@ pub struct Track {
     pub has_lrc: bool,
 }
 
-/// The `<stem>.lrc` path that sits alongside a given track.
+/// The `<stem>.lrc` path that sits alongside a given track: an existing one
+/// whose name differs only in case counts (see [`crate::paths::find_ignoring_case`]),
+/// so it's read and replaced rather than joined by a second one.
 pub fn lrc_path_for(path: &Path) -> PathBuf {
-    path.with_extension("lrc")
+    let exact = path.with_extension("lrc");
+    if exact.is_file() {
+        return exact;
+    }
+    let found = exact
+        .parent()
+        .zip(exact.file_name().and_then(|n| n.to_str()))
+        .and_then(|(dir, name)| crate::paths::find_ignoring_case(dir, name));
+    found.unwrap_or(exact)
 }
 
 /// True when `path` has one of the audio extensions we handle. Motion backdrops

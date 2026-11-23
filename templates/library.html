@@ -1,0 +1,35 @@
+{% extends "layout.html" %}
+{% block title %}Library · gatefold{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Library</h1>
+    <div class="totals"><span>{{ total }} artist folder{% if total != 1 %}s{% endif %}</span></div>
+  </div>
+</header>
+<form method="get" action="/library" class="search" role="search">
+  <input type="search" name="q" value="{{ query }}" placeholder="Artist" aria-label="Artist" autofocus>
+  <button type="submit">Search</button>
+</form>
+{% if artists.is_empty() %}
+<div class="card"><p class="empty">No artist folders{% if !query.is_empty() %} match{% endif %}.</p></div>
+{% else %}
+<div class="card">
+{% for artist in artists %}
+  <div class="row">
+    <div class="row-main with-thumb">
+      {% if let Some(thumb) = artist.thumb %}<img class="thumb" src="{{ thumb }}" alt="" loading="lazy">{% else %}<span class="thumb"></span>{% endif %}
+      <div>
+        <a class="row-title" href="{{ artist.link }}">{{ artist.name }}</a>
+        <div class="meta">
+          <span>{{ artist.albums }} folder{% if artist.albums != 1 %}s{% endif %}</span>
+          {% if artist.kept %}<span class="pill st-kept">kept</span>{% endif %}
+          {% if artist.video %}<span>motion backdrop</span>{% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+{% endfor %}
+</div>
+{% endif %}
+{% endblock %}

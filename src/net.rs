@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow, bail};
 use rand::RngExt;
+use std::collections::HashMap;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use ureq::http::Response;
 use ureq::typestate::WithoutBody;
 use ureq::{Agent, Body, RequestBuilder};
@@ -35,6 +36,32 @@ pub struct Policy<'a> {
 /// The usual throttling signals.
 pub const THROTTLE: &[u16] = &[429, 503];
 
+/// When each service may be asked next, across every run in the process
+/// (`gatefold run` runs jobs in parallel; they share each service's pace).
+static NEXT_REQUEST: std::sync::Mutex<Option<HashMap<String, Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// Wait until `service` may be asked again, then book the next slot `delay`
+/// later: requests to one service are at least `delay` apart, whichever run
+/// makes them.
+fn pace(service: &str, delay: Duration) {
+    let wait = {
+        let mut next = NEXT_REQUEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = next.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        let at = next
+            .get(service)
+            .copied()
+            .filter(|at| *at > now)
+            .unwrap_or(now);
+        next.insert(service.to_string(), at + delay);
+        at - now
+    };
+    sleep(wait);
+}
+
 /// An agent that follows redirects and hands 4xx/5xx responses back to us (so
 /// status codes and `Retry-After` can be inspected) instead of raising them.
 pub fn agent() -> Agent {
@@ -58,7 +85,7 @@ pub fn get<W: RateLimitWaiter>(
 ) -> Result<Response<Body>> {
     let mut throttle_retries = 0;
     loop {
-        sleep(delay);
+        pace(policy.service, delay);
 
         let response = build().call().map_err(|e| anyhow!("request failed: {e}"))?;
         let status = response.status().as_u16();

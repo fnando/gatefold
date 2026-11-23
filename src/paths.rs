@@ -117,6 +117,28 @@ pub fn parse(value: &str) -> Result<PathBuf, Infallible> {
     Ok(resolve(Path::new(value)))
 }
 
+/// The file `name` in `dir`, or the one whose name differs from it only in
+/// case (`01. song.lrc` for `01. Song.lrc`, `Cover.JPG` for `cover.jpg`).
+/// A library shared with macOS, which ignores case, often has those; on a
+/// disk that doesn't, they'd otherwise count as missing.
+pub fn find_ignoring_case(dir: &Path, name: &str) -> Option<PathBuf> {
+    let exact = dir.join(name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    let wanted = name.to_lowercase();
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.to_lowercase() == wanted)
+                && path.is_file()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

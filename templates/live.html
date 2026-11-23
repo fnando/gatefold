@@ -1,0 +1,65 @@
+<section id="live">
+  <div class="section-head">
+    <h2>Now</h2>
+    <span class="hint">{% if live.running() %}{{ live.runs.len() }} running{% else %}Not running{% endif %}</span>
+  </div>
+  {% if live.runs.is_empty() %}
+  <div class="card"><p class="empty">Nothing running.</p></div>
+  {% endif %}
+  {% for run in live.runs %}
+  <div class="card">
+    <div class="row">
+      <div class="row-main">
+        <div class="change-title">
+          <span class="row-title">{{ run.lane }}</span>
+          {% if let Some(id) = run.run_id %}<a class="muted" href="/runs/{{ id }}"><small>run #{{ id }}</small></a>{% endif %}
+        </div>
+        <div class="meta">
+          {% if run.stopping %}<span class="pill st-stopped">Stopping</span>{% else %}<span class="pill st-running">Running</span>{% endif %}
+          {% if let Some(section) = run.section %}<span>{{ section }}</span>{% endif %}
+          {% if let Some(current) = run.current %}<span>{{ current }}</span>{% endif %}
+          {% if let Some(waiting) = run.waiting %}<span class="pill st-waiting">{{ waiting }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="progress-wrap">
+        {% if run.total > 0 %}
+        <span class="percent">{{ run.done }} / {{ run.total }}</span>
+        <div class="bar st-downloading"><span style="width: {{ run.percent() }}%"></span></div>
+        <span class="progress-note">{% if let Some(label) = run.label %}{{ label }}{% endif %}{% if let Some(eta) = run.eta %} · ETA ~{{ eta }}{% endif %}</span>
+        {% else %}
+        <span class="percent quiet">Starting…</span>
+        <div class="bar st-downloading indeterminate"><span></span></div>
+        {% endif %}
+      </div>
+    </div>
+    {% if !run.lines.is_empty() %}
+    <details class="log-details" data-key="lines:{{ run.lane }}">
+      <summary class="muted">Latest lines</summary>
+      <div class="log">
+        {% for line in run.lines %}
+        <div class="line l-{{ line.kind }}"><time>{{ line.at }}</time><span>{{ line.text }}</span></div>
+        {% endfor %}
+      </div>
+    </details>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% if !live.changes.is_empty() %}
+  <details data-key="just-changed"{% if !live.running() %} open{% endif %}><summary>Just changed · {{ live.changes.len() }}</summary>
+    <div class="card">
+    {% for change in live.changes %}
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">{{ change.text }}</div>
+          <div class="meta">
+            {% if let Some(artist) = change.artist %}{% if let Some(dir) = change.artist_dir %}<a href="{{ crate::web::data::artist_link(&dir.display().to_string()) }}">{{ artist }}</a>{% else %}<span>{{ artist }}</span>{% endif %}{% endif %}
+            <span>{{ change.file }}</span>
+          </div>
+        </div>
+        <div class="row-side"><small class="muted">{{ change.at }}</small></div>
+      </div>
+    {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</section>

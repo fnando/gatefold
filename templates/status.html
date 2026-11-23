@@ -1,0 +1,125 @@
+{% import "macros.html" as m %}
+<div id="status">
+  {% if let Some(message) = message %}<section><p class="flash" role="status">{{ message }}</p></section>{% endif %}
+
+  <section>
+    <div class="section-head">
+      <h2>Jobs</h2>
+      <div class="actions">
+        {% if status.running %}<button class="small danger" hx-post="/actions/stop" hx-target="#status" hx-swap="outerHTML" hx-confirm="Stop every run after its current track or artist?">Stop all</button>{% endif %}
+        {% if status.has_schedules() %}
+        {% if status.paused %}
+        <button class="small" hx-post="/actions/schedule/resume" hx-target="#status" hx-swap="outerHTML">Resume schedule</button>
+        {% else %}
+        <button class="small" hx-post="/actions/schedule/pause" hx-target="#status" hx-swap="outerHTML" hx-confirm="Pause every job's schedule? Runs you ask for still happen.">Pause schedule</button>
+        {% endif %}
+        {% endif %}
+        <div class="split">
+          <button class="small primary" hx-post="/actions/run" hx-target="#status" hx-swap="outerHTML">Run everything now</button>
+          <details class="menu">
+            <summary class="small primary" aria-label="More ways to run"></summary>
+            <div class="menu-items">
+              <button hx-post="/actions/run" hx-vals='{"dry_run": "1"}' hx-target="#status" hx-swap="outerHTML">Dry run</button>
+              <button hx-post="/actions/run" hx-vals='{"only": "lyrics"}' hx-target="#status" hx-swap="outerHTML">Lyrics only</button>
+              <button hx-post="/actions/run" hx-vals='{"only": "cover"}' hx-target="#status" hx-swap="outerHTML">Covers only</button>
+              <button hx-post="/actions/run" hx-vals='{"only": "artist"}' hx-target="#status" hx-swap="outerHTML">Artist images only</button>
+              <button hx-post="/actions/run" hx-vals='{"replace_cover": "1"}' hx-target="#status" hx-swap="outerHTML" hx-confirm="Replace covers that differ from the current source?">Replace covers</button>
+              <button hx-post="/actions/run" hx-vals='{"replace_artist_images": "1"}' hx-target="#status" hx-swap="outerHTML" hx-confirm="Replace artist images that changed at the source? The old ones are archived.">Replace artist images</button>
+              <button hx-post="/actions/run" hx-vals='{"replace_lyrics": "1"}' hx-target="#status" hx-swap="outerHTML" hx-confirm="Replace embedded lyrics?">Replace lyrics</button>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      {% if status.jobs.is_empty() %}
+      <p class="empty">No jobs: everything runs when you ask. Add <code>[jobs.&lt;name&gt;]</code> with an <code>interval</code> to the config to run on a schedule.</p>
+      {% endif %}
+      {% for job in status.jobs %}
+      <div class="row inline">
+        <div class="row-main">
+          <div class="row-title">{{ job.name }}</div>
+          {% if job.does != job.name %}<div class="row-sub">{{ job.does }}</div>{% endif %}
+          <div class="meta">
+            {% if job.running %}<span class="pill st-running">running</span>{% endif %}
+            <span>{% if let Some(schedule) = job.schedule %}{{ schedule }}{% if status.paused %} (paused){% endif %}{% else %}only when asked{% endif %}</span>
+            {% if !job.running %}{% if let Some(next) = job.next %}<span>next {{ next }}</span>{% endif %}{% endif %}
+            {% if let Some(last) = job.last %}
+            <span>last run <a href="/runs/{{ last.id }}" title="{{ last.started_full }}">{{ last.started }}</a></span>
+            <span class="pill st-{{ last.status }}">{{ last.status }}</span>
+            {% if let Some(took) = last.duration %}<span>took {{ took }}</span>{% endif %}
+            {% endif %}
+          </div>
+        </div>
+        <div class="row-side actions">
+          {% if job.running %}<button class="small danger" hx-post="/actions/stop" hx-vals='{"lane": {{ job.name|json|safe }}}' hx-target="#status" hx-swap="outerHTML" hx-confirm="Stop {{ job.name }} after its current track or artist?">Stop</button>{% endif %}
+          <button class="small" hx-post="/actions/jobs/{{ job.name }}/run" hx-target="#status" hx-swap="outerHTML">Run now</button>
+        </div>
+      </div>
+      {% endfor %}
+      {% if status.manual_running || status.queued > 0 %}
+      <div class="row inline">
+        <div class="row-main">
+          <div class="row-title">Asked from here</div>
+          <div class="meta">{% if status.manual_running %}<span class="pill st-running">running</span>{% endif %}{% if status.queued > 0 %}<span>{{ status.queued }} waiting</span>{% endif %}</div>
+        </div>
+        <div class="row-side actions">
+          <button class="small danger" hx-post="/actions/stop" hx-vals='{"lane": "manual"}' hx-target="#status" hx-swap="outerHTML" hx-confirm="Stop the run and drop the waiting ones?">Stop</button>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>Recent runs</h2></div>
+    <div class="card">
+      {% if status.runs.is_empty() %}<p class="empty">No runs yet.</p>{% endif %}
+      {% for run in status.runs %}
+      <div class="row inline">
+        <div class="row-main">
+          <a class="row-title" href="/runs/{{ run.id }}">Run #{{ run.id }}</a>
+          <div class="meta">
+            <span class="pill st-{{ run.status }}">{{ run.status }}</span>
+            {% if run.dry_run %}<span class="pill st-dry">dry run</span>{% endif %}
+            <span>{{ run.trigger_label() }}</span>
+            <span title="{{ run.started_full }}">{{ run.started }}</span>
+            {% if let Some(duration) = run.duration %}<span>took {{ duration }}</span>{% endif %}
+          </div>
+        </div>
+        <div class="stats">
+          <a class="stat s-downloaded{% if run.changes == 0 %} zero{% endif %}" href="/runs/{{ run.id }}"><b>{{ run.changes }}</b><span>changes</span></a>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  {% if !status.problems.is_empty() %}
+  <section>
+    <div class="section-head danger">
+      <h2>File names in the wrong case · {{ status.problems.len() }}</h2>
+      <button class="small" hx-post="/actions/fix-case" hx-target="#status" hx-swap="outerHTML" hx-confirm="Rename them to what gatefold and Jellyfin expect? Duplicates go to .gatefold-archive.">Fix all</button>
+    </div>
+    <div class="card err">
+    {% for problem in status.problems.iter().take(20) %}
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">{{ problem.text }}</div>
+          <div class="meta"><a href="{{ problem.link }}">{{ problem.folder }}</a></div>
+        </div>
+      </div>
+    {% endfor %}
+    {% if status.problems.len() > 20 %}<p class="empty">and {{ status.problems.len() - 20 }} more</p>{% endif %}
+    </div>
+  </section>
+  {% endif %}
+
+  <section>
+    <div class="section-head">
+      <h2>Latest changes</h2>
+      <a class="hint" href="/changes">All changes →</a>
+    </div>
+    {% call m::change_groups(status.changes) %}{% endcall %}
+  </section>
+</div>

@@ -1,0 +1,94 @@
+{% extends "layout.html" %}
+{% import "macros.html" as m %}
+{% block title %}{{ name }} · gatefold{% endblock %}
+{% block content %}
+<a class="back" href="/library">← Library</a>
+<header class="page-head">
+  <div>
+    <h1>{{ name }}</h1>
+    <div class="totals">
+      <span>{{ shown_dir }}</span>
+      {% if kept %}<span class="pill st-kept">everything here is kept</span>{% endif %}
+    </div>
+  </div>
+  <div class="actions">
+    {% if kept %}
+    <button class="small" hx-post="/actions/folder/unkeep" hx-vals='{"dir": {{ dir|json|safe }}}' hx-confirm="Stop keeping everything in this artist folder (its images and the album covers below)? Replace runs may swap it again.">Unkeep folder</button>
+    {% else %}
+    <button class="small" hx-post="/actions/folder/keep" hx-vals='{"dir": {{ dir|json|safe }}}' hx-confirm="Keep everything in this artist folder (its images and the album covers below)? Replace runs will never swap it." title="Replace runs never swap any image here, nor the album covers below">Keep folder</button>
+    {% endif %}
+    <button class="small primary" hx-post="/actions/run" hx-vals='{"dir": {{ dir|json|safe }}}'>Run on this artist</button>
+  </div>
+</header>
+{% call m::flash(message) %}{% endcall %}
+
+{% if !problems.is_empty() %}
+<section>
+  <div class="section-head danger">
+    <h2>File names in the wrong case · {{ problems.len() }}</h2>
+    <button class="small" hx-post="/actions/fix-case" hx-vals='{"dir": {{ dir|json|safe }}}' hx-confirm="Rename them to what gatefold and Jellyfin expect? Duplicates go to .gatefold-archive.">Fix all</button>
+  </div>
+  <div class="card err">
+  {% for problem in problems %}
+    <div class="row"><div class="row-main"><div class="row-title">{{ problem.text }}</div><div class="meta"><a href="{{ problem.link }}">{{ problem.folder }}</a></div></div></div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<section>
+  <div class="section-head"><h2>Artist images</h2></div>
+  <div class="media-grid">
+    {% for image in images %}{% include "image_card.html" %}{% endfor %}
+  </div>
+</section>
+
+{% if !archived.is_empty() %}
+<section>
+  <div class="section-head"><h2>Archive · {{ archived.len() }}</h2><span class="hint">Earlier versions, newest first</span></div>
+  <div class="card">
+  {% for file in archived %}
+    <div class="row">
+      <div class="row-main with-thumb">
+        {% if file.video %}<video class="thumb" src="{{ file.url }}" muted preload="metadata"></video>{% else %}<img class="thumb" src="{{ file.url }}" alt="" loading="lazy">{% endif %}
+        <div>
+          <a class="row-title" href="{{ file.url }}" target="_blank">{{ file.label }}</a>
+          <div class="meta"><span>{{ file.size }}</span>{% if file.skipped %}<span class="pill st-skipped">skipped</span>{% endif %}</div>
+        </div>
+      </div>
+      <div class="row-side actions">
+        <button class="small" hx-post="/actions/restore" hx-vals='{"path": {{ file.path|json|safe }}}' hx-confirm="Restore {{ file.label }}? The current file is skipped and archived.">Restore</button>
+        <button class="small" hx-post="/actions/restore" hx-vals='{"path": {{ file.path|json|safe }}, "keep": "1"}' hx-confirm="Restore {{ file.label }} and keep it?">Restore and keep</button>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<section>
+  <div class="section-head"><h2>Albums · {{ albums.len() }}</h2></div>
+  {% if albums.is_empty() %}
+  <div class="card"><p class="empty">No album folders here.</p></div>
+  {% else %}
+  <div class="card">
+  {% for album in albums %}
+    <div class="row">
+      <div class="row-main with-thumb">
+        {% if let Some(thumb) = album.thumb %}<img class="thumb" src="{{ thumb }}" alt="" loading="lazy">{% else %}<span class="thumb"></span>{% endif %}
+        <div>
+          <a class="row-title" href="{{ album.link }}">{{ album.name }}</a>
+          <div class="meta"><span>{{ album.tracks }} tracks</span>{% if album.animated %}<span>animated cover</span>{% endif %}</div>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+<section>
+  <div class="section-head"><h2>History</h2></div>
+  {% call m::change_groups(history) %}{% endcall %}
+</section>
+{% endblock %}

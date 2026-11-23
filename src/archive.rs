@@ -65,11 +65,14 @@ pub fn run(files: &[PathBuf]) -> Result<()> {
     let mut failed = 0;
     for path in files {
         match file(path, &revisions) {
-            Ok(moved) => println!(
-                "✓ {}: skipped and archived as {}",
-                path.display(),
-                moved.dir.join(&moved.archived).display()
-            ),
+            Ok(moved) => {
+                println!(
+                    "✓ {}: skipped and archived as {}",
+                    path.display(),
+                    moved.dir.join(&moved.archived).display()
+                );
+                crate::record_file_change(crate::changes::Kind::Archived, path);
+            }
             Err(err) => {
                 failed += 1;
                 eprintln!("✗ {err:#}");

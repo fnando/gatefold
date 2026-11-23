@@ -155,9 +155,80 @@ pub fn mark_file(path: &Path) -> Result<Kept> {
     })
 }
 
+/// Take back `gatefold keep --dir <dir>`: remove the folder's
+/// `.gatefold-keep`. Returns the marker removed, `None` when there was none.
+pub fn unmark_dir(dir: &Path) -> Result<Option<PathBuf>> {
+    remove_marker(&dir.join(ALL))
+}
+
+/// Take back `gatefold keep --file <image>`: remove the granular marker for
+/// the image's kind. A `.gatefold-keep` in the folder still keeps it (see
+/// [`unmark_dir`]). Returns the marker removed, `None` when there was none.
+pub fn unmark_file(path: &Path) -> Result<Option<PathBuf>> {
+    let Some((managed, dir)) = skip::classify(path) else {
+        bail!("{} is not an image gatefold writes", path.display());
+    };
+    let marker = match managed {
+        Managed::Cover => dir.join(COVER),
+        Managed::Artist(kind) => dir.join(artist_marker(kind)),
+    };
+    remove_marker(&marker)
+}
+
+/// True when `path` (an image gatefold manages) is kept, by its own marker or
+/// its folder's `.gatefold-keep`.
+pub fn file_is_kept(path: &Path) -> bool {
+    match skip::classify(path) {
+        Some((Managed::Cover, dir)) => has(&dir, ALL) || has(&dir, COVER),
+        Some((Managed::Artist(kind), dir)) => artist_image(&dir, kind),
+        None => false,
+    }
+}
+
+fn remove_marker(marker: &Path) -> Result<Option<PathBuf>> {
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(Some(marker.to_path_buf())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("removing {}", marker.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeping_can_be_taken_back() {
+        let dir = std::env::temp_dir().join(format!("gatefold-unkeep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("backdrops")).unwrap();
+        let logo = dir.join("logo.png");
+        let video = dir.join("backdrops/backdrop.mp4");
+        fs::write(&logo, b"logo").unwrap();
+        fs::write(&video, b"video").unwrap();
+
+        mark_file(&logo).unwrap();
+        mark_file(&video).unwrap();
+        assert!(file_is_kept(&logo) && file_is_kept(&video));
+        assert_eq!(
+            unmark_file(&logo).unwrap(),
+            Some(dir.join(".gatefold-logo-keep"))
+        );
+        assert_eq!(unmark_file(&logo).unwrap(), None);
+        assert!(!file_is_kept(&logo));
+        // The video's marker lives in the artist folder, not in backdrops/.
+        assert_eq!(
+            unmark_file(&video).unwrap(),
+            Some(dir.join(".gatefold-video-keep"))
+        );
+
+        mark_dir(&dir).unwrap();
+        assert!(file_is_kept(&logo));
+        assert_eq!(unmark_dir(&dir).unwrap(), Some(dir.join(ALL)));
+        assert_eq!(unmark_dir(&dir).unwrap(), None);
+        assert!(!file_is_kept(&logo));
+        fs::remove_dir_all(&dir).unwrap();
+    }
     use std::fs;
     use std::path::PathBuf;
 

@@ -117,8 +117,7 @@ impl ArtistImage {
         let target = self.target_dir(dir);
         self.names()
             .iter()
-            .map(|name| target.join(name))
-            .find(|path| path.is_file())
+            .find_map(|name| crate::paths::find_ignoring_case(&target, name))
     }
 }
 
@@ -165,7 +164,14 @@ pub fn tag_has_front_cover(tag: &Tag) -> bool {
 
 /// True when the folder already contains a recognized cover-art image.
 pub fn folder_has_cover(dir: &Path) -> bool {
-    COVER_FILENAMES.iter().any(|name| dir.join(name).is_file())
+    COVER_FILENAMES
+        .iter()
+        .any(|name| crate::paths::find_ignoring_case(dir, name).is_some())
+}
+
+/// The album folder's animated cover, whatever the case of its name.
+pub fn existing_cover_video(dir: &Path) -> Option<PathBuf> {
+    crate::paths::find_ignoring_case(dir, COVER_VIDEO)
 }
 
 /// Where a folder's replaced `.lrc` files go: its hidden `.gatefold-archive/lyrics/`.
@@ -178,6 +184,31 @@ pub fn lyrics_archive_dir(dir: &Path) -> PathBuf {
 /// so it's left alone.
 pub fn lrc_is_unsynced(lrc: &Path) -> bool {
     fs::read_to_string(lrc).is_ok_and(|text| !text.lines().any(is_timed_line))
+}
+
+/// True when `text` has a timed line: synced lyrics, for an `.lrc`.
+pub fn has_timestamps(text: &str) -> bool {
+    text.lines().any(is_timed_line)
+}
+
+/// Synced lyrics as plain text: the `[mm:ss.xx]` stamps and `[ar:…]` style
+/// header lines dropped.
+pub fn plain_lyrics(text: &str) -> String {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let mut rest = line.trim_start();
+        let mut tagged = false;
+        while let Some(after) = rest.strip_prefix('[') {
+            let Some(end) = after.find(']') else { break };
+            tagged = true;
+            rest = after[end + 1..].trim_start();
+        }
+        if tagged && rest.is_empty() && !is_timed_line(line) {
+            continue; // `[ar:Artist]` and other headers
+        }
+        lines.push(rest.trim_end());
+    }
+    lines.join("\n").trim().to_string()
 }
 
 /// `[mm:ss]`, `[mm:ss.xx]` or `[mm:ss:xx]` at the start of the line.
@@ -420,11 +451,10 @@ fn temp_sibling(path: &Path) -> PathBuf {
 /// The `cover.*` file gatefold manages in a folder, if present. `folder.jpg` and
 /// friends count as "a cover exists" (see [`folder_has_cover`]) but are never
 /// written or replaced by us.
-fn existing_cover_sidecar(dir: &Path) -> Option<PathBuf> {
+pub fn existing_cover_sidecar(dir: &Path) -> Option<PathBuf> {
     ["cover.jpg", "cover.jpeg", "cover.png"]
         .iter()
-        .map(|name| dir.join(name))
-        .find(|path| path.is_file())
+        .find_map(|name| crate::paths::find_ignoring_case(dir, name))
 }
 
 /// Write `cover.<ext>` into the track's folder. An existing `cover.*` is kept
@@ -485,7 +515,7 @@ pub fn write_cover_video(
     backup: Option<&Backup>,
     dry_run: bool,
 ) -> Result<Write> {
-    let path = dir.join(COVER_VIDEO);
+    let path = existing_cover_video(dir).unwrap_or_else(|| dir.join(COVER_VIDEO));
     let previous = if path.is_file() {
         if !replace {
             return Ok(Write::Skipped);

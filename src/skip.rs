@@ -73,16 +73,14 @@ pub fn rejected(file: &Path) -> bool {
 pub fn cover(dir: &Path) -> bool {
     COVER_NAMES
         .iter()
-        .map(|name| dir.join(name))
-        .find(|path| path.is_file())
+        .find_map(|name| crate::paths::find_ignoring_case(dir, name))
         .is_some_and(|path| rejected(&path))
 }
 
 /// True when album folder `dir` has an animated cover (`cover.mp4`) that was
 /// skipped.
 pub fn cover_video(dir: &Path) -> bool {
-    let path = dir.join(COVER_VIDEO);
-    path.is_file() && rejected(&path)
+    crate::writer::existing_cover_video(dir).is_some_and(|path| rejected(&path))
 }
 
 /// The `kind` file in artist folder `dir`, unless there is none or it was skipped.
@@ -191,15 +189,18 @@ pub fn managed_in(dir: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flat_map(|kind| kind.names().iter().copied()),
     );
-    top.map(|name| dir.join(name))
+    let mut found: Vec<PathBuf> = top
+        .filter_map(|name| crate::paths::find_ignoring_case(dir, name))
         .chain(
             ArtistImage::Video
                 .names()
                 .iter()
-                .map(|name| backdrops.join(name)),
+                .filter_map(|name| crate::paths::find_ignoring_case(&backdrops, name)),
         )
-        .filter(|path| path.is_file())
-        .collect()
+        .collect();
+    // `cover.jpg` and `Cover.jpg` on a disk that ignores case are one file.
+    found.dedup();
+    found
 }
 
 /// Take back a skip of `image`'s contents: remove the marker next to it, if

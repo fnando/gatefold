@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{% block title %}gatefold{% endblock %}</title>
+  <link rel="stylesheet" href="{{ crate::web::asset_url("app.css") }}">
+  <script src="{{ crate::web::asset_url("htmx.min.js") }}" defer></script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'>
+  <div class="app">
+    <nav class="topnav">
+      <a href="/" class="brand">gatefold</a>
+      <div class="links">
+        <a href="/" data-section="/">Dashboard</a>
+        <a href="/changes" data-section="/changes">Changes</a>
+        <a href="/library" data-section="/library">Library</a>
+        <a href="/config" data-section="/config">Config</a>
+      </div>
+    </nav>
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  <div id="toast" class="flash error toast" role="alert" hidden></div>
+  <script>
+    (function () {
+      var path = location.pathname;
+      var current = path.indexOf("/config") === 0 ? "/config"
+        : /^\/(changes|runs)/.test(path) ? "/changes"
+        : /^\/(library|artist|album)/.test(path) ? "/library"
+        : (path === "/login" ? "" : "/");
+      document.querySelectorAll(".topnav [data-section]").forEach(function (link) {
+        if (link.getAttribute("data-section") === current) link.classList.add("active");
+      });
+
+      // htmx drops failed requests silently; say so.
+      var toast = document.getElementById("toast");
+      var timer = null;
+      function fail(text) {
+        toast.textContent = text;
+        toast.hidden = false;
+        clearTimeout(timer);
+        timer = setTimeout(function () { toast.hidden = true; }, 8000);
+      }
+      toast.addEventListener("click", function () { toast.hidden = true; });
+      document.addEventListener("htmx:responseError", function (event) {
+        var xhr = event.detail.xhr;
+        var why = (xhr.responseText || "").trim().slice(0, 300) || xhr.statusText;
+        fail("That didn't work (" + xhr.status + "): " + why);
+      });
+      document.addEventListener("htmx:sendError", function () {
+        fail("Couldn't reach gatefold. Is it still running?");
+      });
+      document.addEventListener("htmx:beforeRequest", function () { toast.hidden = true; });
+
+      // Live updates swap parts of the page; a list you opened (or closed)
+      // stays that way: <details data-key> keep their state across swaps.
+      var expanded = {};
+      document.addEventListener("toggle", function (event) {
+        var key = event.target.getAttribute && event.target.getAttribute("data-key");
+        if (key) expanded[key] = event.target.open;
+      }, true);
+      document.addEventListener("htmx:afterSwap", function (event) {
+        event.detail.target.ownerDocument.querySelectorAll("details[data-key]").forEach(function (details) {
+          var key = details.getAttribute("data-key");
+          if (key in expanded && details.open !== expanded[key]) details.open = expanded[key];
+        });
+      });
+
+      // Upload forms open over their image, one at a time; Escape closes them.
+      function closeUploads(except) {
+        document.querySelectorAll(".media.uploading").forEach(function (card) {
+          if (card !== except) card.classList.remove("uploading");
+        });
+      }
+      document.addEventListener("click", function (event) {
+        var open = event.target.closest("[data-upload-open]");
+        var close = event.target.closest("[data-upload-close]");
+        if (open) {
+          var card = open.closest(".media");
+          closeUploads(card);
+          card.classList.add("uploading");
+          var input = card.querySelector(".upload-overlay input[type=file]");
+          if (input) input.focus();
+        } else if (close) {
+          closeUploads(null);
+        }
+      });
+      document.addEventListener("keydown", function (event) {
+        if (event.key === "Escape") closeUploads(null);
+      });
+
+      // Menus close when you click elsewhere, pick an option, or press Escape.
+      function closeMenus(except) {
+        document.querySelectorAll("details.menu[open]").forEach(function (menu) {
+          if (menu !== except) menu.open = false;
+        });
+      }
+      document.addEventListener("click", function (event) {
+        var menu = event.target.closest("details.menu");
+        closeMenus(event.target.closest(".menu-items") ? null : menu);
+      });
+      document.addEventListener("keydown", function (event) {
+        if (event.key === "Escape") closeMenus(null);
+      });
+    })();
+  </script>
+</body>
+</html>

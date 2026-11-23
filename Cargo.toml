@@ -5,19 +5,33 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+askama = { version = "0.16.1", features = ["serde_json"] }
+axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dotenvy = "0.15.7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4.3"
 indicatif = "0.18.6"
+jiff = "0.2.38"
 lofty = "0.25.4"
 mozjpeg-sys = { version = "2.2.3", default-features = false, features = ["unwinding"] }
 natord = "1.0.9"
 oxipng = { version = "10.2.1", default-features = false, features = ["parallel", "zopfli"] }
 rand = "0.10.3"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2.6.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+similar = "3.2.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "fs", "io-util"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
+toml = "1.1.8"
+toml_edit = "0.25.17"
 unicode-normalization = "0.1.26"
 ureq = "3.4.2"
 walkdir = "2.5.0"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }

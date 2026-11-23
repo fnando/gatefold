@@ -46,7 +46,7 @@ pub fn run(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read(path: &Path) -> Result<Entry> {
+pub fn read(path: &Path) -> Result<Entry> {
     let tagged =
         read_from_path(path).with_context(|| format!("reading tags from {}", path.display()))?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag());

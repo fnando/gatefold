@@ -1,0 +1,61 @@
+# gatefold config. gatefold reads it from $XDG_CONFIG_HOME/gatefold/config.toml
+# (~/.config/gatefold/config.toml), or from --config / GATEFOLD_CONFIG.
+#
+# Flags and environment variables win over what's here. Secrets can hold the
+# value itself or name an environment variable: "$NAME" or "${NAME}".
+
+version = 1
+
+[general]
+library = ["~/Music"]                   # music folders; each gets its own run
+delay_ms = 300                          # between API requests
+write_nfo = false                       # artist.nfo and album.nfo
+verify = false                          # check every tag write with ffprobe (needs ffmpeg)
+replace = ["artist_images"]             # replace what changed at the source: true, or any of
+                                        # "lyrics", "covers", "artist_images" (kept files stay)
+artist_videos = true                    # motion backdrops (needs ffmpeg)
+cover_videos = true                     # animated album covers, cover.mp4 (needs ffmpeg)
+retry_missed_after = "7d"               # don't look up a "not found" again within this
+artist_refresh_after = "30d"            # with --replace-artist-images: re-check an artist this often
+# state_dir = "~/.local/share/gatefold" # caches, backups and gatefold.db
+# user_agent = "my-library/1.0"         # default: gatefold/<version> (+repo)
+
+# gatefold run's jobs run in parallel, each on its own interval, and never
+# overlap themselves. Each one's options override [general]. A job without an
+# interval runs only when asked; without any jobs, everything runs when you ask
+# (from the web UI).
+[jobs.new-tracks]                       # everything for tracks never looked up
+interval = "5m"
+new_only = true
+write_nfo = true
+verify = true
+
+[jobs.artist-images]                    # keep artist images current
+interval = "5m"
+only = "artist_images"                  # or "lyrics", "covers"
+replace = ["artist_images"]
+retry_missed_after = "1d"
+artist_refresh_after = "1d"
+
+[jobs.missed]                           # look again for what wasn't found
+interval = "5m"
+miss_only = true
+retry_missed_after = "1d"
+artist_images = false
+artist_videos = false
+
+[server]                                # web UI served by gatefold run
+enabled = true
+listen = "127.0.0.1:8788"
+token = "$GATEFOLD_SERVER_TOKEN"        # required for a non-loopback listen address
+
+[lrclib]
+app_id = "$GATEFOLD_LRCLIB_APP_ID"
+api_key = "$GATEFOLD_LRCLIB_API_KEY"
+
+[musicbrainz]
+# url = "http://musicbrainz.local:5000" # a local mirror; default https://musicbrainz.org
+
+[jellyfin]
+url = "$GATEFOLD_JELLYFIN_URL"
+api_key = "$GATEFOLD_JELLYFIN_API_KEY"

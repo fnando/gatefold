@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Scan a folder of music files and backfill lyrics, cover art, and artist images.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "gatefold",
     version,
@@ -16,7 +16,13 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Folder to scan recursively for music files.
+    /// Config file (default `$XDG_CONFIG_HOME/gatefold/config.toml`); see
+    /// `gatefold config`.
+    #[arg(long, global = true, value_name = "FILE", env = "GATEFOLD_CONFIG")]
+    pub config: Option<PathBuf>,
+
+    /// Folder to scan recursively for music files (default: the config's first
+    /// `library` folder, else the current directory).
     #[arg(long, value_parser = crate::paths::parse, value_name = "DIR", default_value = ".")]
     pub dir: PathBuf,
 
@@ -210,7 +216,7 @@ impl JellyfinArgs {
     }
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Reject an image you don't want, but stay open to a different one: writes a
     /// `.gatefold-<sha256>-skip` marker next to it. Later runs replace the image as
@@ -228,6 +234,11 @@ pub enum Command {
         /// several.
         #[arg(long = "dir", value_parser = crate::paths::parse, value_name = "DIR")]
         dirs: Vec<PathBuf>,
+
+        /// Take the skip back: remove the marker, so these contents are welcome
+        /// again.
+        #[arg(long)]
+        undo: bool,
     },
     /// Never replace an image, even with `--replace-cover` /
     /// `--replace-artist-images`: writes the keep marker for its kind
@@ -245,6 +256,11 @@ pub enum Command {
         /// for several.
         #[arg(long = "dir", value_parser = crate::paths::parse, value_name = "DIR")]
         dirs: Vec<PathBuf>,
+
+        /// Stop keeping: remove the marker (`--file`: the image's own marker;
+        /// `--dir`: the folder's `.gatefold-keep`).
+        #[arg(long)]
+        undo: bool,
     },
     /// Move an artist file into its artist folder's `.gatefold-archive/`,
     /// dated, as `--replace-artist-images` would. The file is skipped first
@@ -285,6 +301,55 @@ pub enum Command {
     Jellyfin {
         #[command(subcommand)]
         action: JellyfinCommand,
+    },
+    /// Run as a daemon: run the config's `[jobs]` over the library, each on
+    /// its own interval, run what the web UI asks for, and serve the web UI
+    /// (see `[server]`). Stops on Ctrl-C / SIGTERM.
+    Run,
+    /// Fix sidecars named in another case than gatefold (and Jellyfin, on a
+    /// disk that minds case) expect: `01. song.lrc` for `01. Song.flac`,
+    /// `Cover.JPG`. Of several spellings side by side, the best is kept under
+    /// the expected name (synced lyrics over plain) and the others are moved
+    /// into the folder's `.gatefold-archive/`.
+    FixCase {
+        /// Folders to walk (a whole library, an artist, an album). Repeat for
+        /// several.
+        #[arg(long = "dir", value_parser = crate::paths::parse, value_name = "DIR", required = true)]
+        dirs: Vec<PathBuf>,
+
+        /// List what would be fixed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the config gatefold uses (secrets masked), where it lives, or write
+    /// an example one.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigCommand>,
+    },
+    /// List what gatefold changed, newest first: lyrics, covers, artist images,
+    /// nfo files and markers, with the artist each belongs to. Every run that
+    /// isn't a dry run records its changes in the state dir's `gatefold.db`.
+    Changes {
+        /// Only this artist's changes (any part of the name, any case).
+        #[arg(long, value_name = "NAME")]
+        artist: Option<String>,
+
+        /// Only changes in this artist (or album) folder.
+        #[arg(long, value_parser = crate::paths::parse, value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// Only this kind of change: lyrics, covers, artist, nfo or files.
+        #[arg(long, value_name = "KIND", value_parser = ["lyrics", "covers", "artist", "nfo", "files"])]
+        kind: Option<String>,
+
+        /// How many to show.
+        #[arg(long, default_value_t = 50, value_name = "N")]
+        limit: usize,
+
+        /// Base directory for gatefold's state (see the main command).
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
     },
     /// Print an album folder's tracks, one per line, as `<track>. <title>
     /// <duration>`, read from the tags of the audio files directly in it.
@@ -342,7 +407,7 @@ pub enum Command {
 }
 
 /// `gatefold jellyfin` actions.
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum JellyfinCommand {
     /// Make Jellyfin show each artist folder's own images: `folder.*` as its
     /// photo, `logo.*` as its logo, and `backdrop.*` as its first backdrop.
@@ -402,7 +467,7 @@ fn parse_apple_url(text: &str) -> Result<String, String> {
     })
 }
 
-fn parse_duration(text: &str) -> Result<Duration, String> {
+pub fn parse_duration(text: &str) -> Result<Duration, String> {
     let text = text.trim();
     let digits = text.trim_end_matches(|c: char| c.is_ascii_alphabetic());
     let unit = &text[digits.len()..];
@@ -591,7 +656,7 @@ mod tests {
             "b/cover.jpg",
         ])
         .unwrap();
-        let Some(Command::Skip { images, dirs }) = cli.command else {
+        let Some(Command::Skip { images, dirs, .. }) = cli.command else {
             panic!("expected the skip subcommand");
         };
         assert_eq!(
@@ -600,7 +665,7 @@ mod tests {
         );
         assert_eq!(dirs, Vec::<PathBuf>::new());
         assert!(Cli::try_parse_from(["gatefold", "skip"]).is_err());
-        let Some(Command::Skip { images, dirs }) =
+        let Some(Command::Skip { images, dirs, .. }) =
             Cli::try_parse_from(["gatefold", "skip", "--dir", "Kemuri", "--dir", "AFI"])
                 .unwrap()
                 .command
@@ -711,7 +776,7 @@ mod tests {
     #[test]
     fn keep_takes_files_and_dirs() {
         let parse = |args: &[&str]| Cli::try_parse_from(["gatefold", "keep"].iter().chain(args));
-        let Some(Command::Keep { files, dirs }) = parse(&[
+        let Some(Command::Keep { files, dirs, .. }) = parse(&[
             "--dir",
             "Kemuri",
             "--file",
@@ -760,4 +825,12 @@ mod tests {
             "no positional folder"
         );
     }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the config file's path.
+    Path,
+    /// Write an example config to the config path (never over an existing one).
+    Init,
 }

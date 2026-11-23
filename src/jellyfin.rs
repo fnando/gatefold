@@ -997,7 +997,7 @@ impl PullTally {
 }
 
 /// Counts for a run's summary.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Tally {
     pub updated: u64,
     pub in_order: u64,

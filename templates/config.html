@@ -1,0 +1,49 @@
+{% extends "layout.html" %}
+{% block title %}Config · gatefold{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Config</h1>
+    <div class="totals">
+      <span>Revision {{ rev }}</span>
+      <span><code>{{ file }}</code></span>
+    </div>
+  </div>
+</header>
+{% if let Some(message) = message %}<p class="flash ok" role="status">{{ message }}</p>{% endif %}
+<form hx-post="/config/check" hx-target="#result" hx-swap="innerHTML">
+  <input type="hidden" name="base" value="{{ rev }}">
+  <div class="card editor-wrap">
+    <pre aria-hidden="true"><code></code></pre>
+    <textarea name="text" class="editor" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-label="Config">{{ text }}</textarea>
+  </div>
+  <div class="section-head">
+    <span class="hint">API keys and the token are shown masked; leave them as they are to keep them. Changes take effect when <code>gatefold run</code> restarts.</span>
+    <div class="actions">
+      <button type="submit">Check</button>
+      <button type="submit" class="primary" hx-post="/config/save" hx-target="#result">Save</button>
+    </div>
+  </div>
+</form>
+<div id="result"></div>
+
+<section>
+  <div class="section-head"><h2>History</h2></div>
+  <div class="card table-wrap">
+    <table>
+      <thead><tr><th>Revision</th><th>When</th><th>From</th><th></th></tr></thead>
+      <tbody>
+      {% for revision in history %}
+        <tr>
+          <td>{{ revision.rev }}{% if revision.rev == rev %} <small>(current)</small>{% endif %}</td>
+          <td class="nowrap"><small>{{ revision.created_at }}</small></td>
+          <td><small>{{ revision.from }}</small></td>
+          <td class="end"><a class="btn small" href="/config/revisions/{{ revision.rev }}">View</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+<script src="{{ crate::web::asset_url("toml.js") }}" defer></script>
+{% endblock %}

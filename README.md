@@ -92,7 +92,8 @@ gatefold [--dir <DIR>] [OPTIONS]
 
 | Option | Description |
 | --- | --- |
-| `--dir <DIR>` | Folder to scan recursively (default: the current directory). |
+| `--config <FILE>` | Config file (default `$XDG_CONFIG_HOME/gatefold/config.toml`); see [Config file](#config-file). (env: `GATEFOLD_CONFIG`) |
+| `--dir <DIR>` | Folder to scan recursively (default: the config's `library` folders, else the current directory). |
 | `--state-dir <DIR>` | Use a different directory for the cached lyrics (`lrc/`), images (`art/`), artist lookups (`artist/`), metadata (`metadata/`), and tag backups (`backup/`). Defaults to `$XDG_DATA_HOME/gatefold`, or `~/.local/share/gatefold` when `$XDG_DATA_HOME` is unset. |
 | `--api-key <KEY>` | Secret `Lrclib-Api-Key` header (server-side model). Pair with `--app-id`. Prefer `--env-file` on shared hosts — a flag value shows up in `ps`. (env: `GATEFOLD_LRCLIB_API_KEY`) |
 | `--app-id <ID>` | `Lrclib-App-Id` header. Required alongside `--api-key` to unlock the higher rate-limit tier. (env: `GATEFOLD_LRCLIB_APP_ID`) |
@@ -120,6 +121,140 @@ gatefold [--dir <DIR>] [OPTIONS]
 | `--jellyfin-url <URL>` | Jellyfin server to keep in line with the artist folders after the artist pass (see [Jellyfin](#jellyfin)). (env: `GATEFOLD_JELLYFIN_URL`) |
 | `--jellyfin-api-key <KEY>` | Jellyfin API key (Dashboard → API Keys). Prefer `--env-file`. (env: `GATEFOLD_JELLYFIN_API_KEY`) |
 | `--skip-jellyfin` | Don't talk to Jellyfin after the artist pass, even with the server set. |
+
+Besides a run, gatefold has these commands:
+
+| Command | What it does |
+| --- | --- |
+| `gatefold run` | Run on a schedule and serve the web UI; see [The web UI](#the-web-ui-gatefold-run). |
+| `gatefold changes` | List what gatefold changed; see [What changed](#what-changed). |
+| `gatefold config [path\|init]` | Show the config in use (secrets masked), its path, or write an example. |
+| `gatefold keep` / `skip` / `archive` / `restore` | Mark or move images; see below. `keep --undo` and `skip --undo` take a marker back. |
+| `gatefold fix-case --dir <DIR>` | Fix sidecars named in another case; see [File names in the wrong case](#file-names-in-the-wrong-case). |
+| `gatefold optimize`, `jellyfin`, `tracklist` | See their sections below. |
+
+### Config file
+
+Everything a run needs can live in `~/.config/gatefold/config.toml` (or
+`$XDG_CONFIG_HOME/gatefold/config.toml`, `--config`, `GATEFOLD_CONFIG`), so nothing has to be
+passed as a flag. `gatefold config init` writes [the example](examples/config.toml):
+
+```toml
+version = 1
+
+[general]
+library = ["~/Music"]               # music folders; each gets its own run
+write_nfo = true
+verify = true                       # --verify
+replace = ["covers", "artist_images"] # or true for lyrics too (--replace-lyrics, -cover, -artist-images)
+retry_missed_after = "7d"
+
+[jobs.new-tracks]                   # jobs run in parallel, each on its own interval
+interval = "5m"
+new_only = true
+write_nfo = true
+
+[jobs.artist-images]
+only = "artist_images"
+replace = ["artist_images"]
+artist_refresh_after = "1d"
+
+[jobs.missed]
+miss_only = true
+retry_missed_after = "1d"
+artist_images = false
+
+[server]
+listen = "127.0.0.1:8788"
+token = "$GATEFOLD_SERVER_TOKEN"    # required for a non-loopback address
+
+[lrclib]
+api_key = "$GATEFOLD_LRCLIB_API_KEY"
+
+[jellyfin]
+url = "$GATEFOLD_JELLYFIN_URL"
+api_key = "$GATEFOLD_JELLYFIN_API_KEY"
+```
+
+Flags and environment variables (including `--env-file`) win over the config; the config wins
+over the defaults. Secrets and the Jellyfin URL can name an environment variable (`"$NAME"` or
+`"${NAME}"`) instead of holding the value, and that's their default: left out, `api_key`
+reads `$GATEFOLD_LRCLIB_API_KEY`, `token` `$GATEFOLD_SERVER_TOKEN`, and so on. Settings
+without a value (`state_dir`, `user_agent`, a job's `interval`, …) are left out rather than
+set to `""`. `gatefold config` prints the config in effect, with literal
+secrets masked.
+
+### The web UI (`gatefold run`)
+
+`gatefold run` replaces cron: it runs the config's **jobs** over every `library` folder and
+serves a web UI at `server.listen` (default <http://127.0.0.1:8788>).
+
+Each `[jobs.<name>]` runs on its own `interval` (none: only when asked), in parallel with the
+others, and never overlaps itself: a job whose run takes longer
+than its interval starts again when that run ends. A job's options override `[general]`:
+`new_only`, `miss_only`, `only` (`"lyrics"`, `"covers"` or `"artist_images"`), `replace`,
+`write_nfo`, `verify`, `artist_images`, `artist_videos`, `cover_videos`, `retry_missed_after`
+and `artist_refresh_after`. Without any jobs, nothing runs on its own: everything runs when you
+ask, from the web UI.
+
+Parallel jobs don't get in each other's way: requests to each service (lrclib, `MusicBrainz`,
+Apple Music, …) are paced across all of them, so running three jobs never asks a service more
+often than one would, and a folder is worked on by one job at a time.
+
+The web UI:
+
+- **Dashboard**: the runs going on now, one per job (section, progress, ETA, the track or
+  artist at hand, rate-limit waits, its latest log lines), live; each job with its schedule,
+  next and last run, **Run now** and **Stop**; **Run everything now** (or a dry run,
+  lyrics/covers/artist images only, or a replace run), **Stop all**, and pausing the schedule;
+  the latest changes, grouped by artist; recent runs.
+- **Changes**: every file gatefold wrote, replaced or marked, filtered by kind or artist,
+  each linked to its artist.
+- **Runs**: each run's counts, changes and full log.
+- **Library**: each artist's photo, backdrop, motion backdrop and logo, and each album's cover,
+  animated cover and tracks (with their lyrics state). **Keep**, **Skip** and **Archive** an
+  image (or take a keep or skip back), **Restore** an archived one, **Run on this artist** or
+  album, and **upload** your own: artist images, covers (written as `cover.*` and embedded in
+  every track), animated covers and lyrics (synced ones become the `.lrc`). An upload can be
+  kept (replace runs leave it alone), skip the file it replaces (never written again), or just
+  replace it; the replaced file is archived either way.
+- **Config**: the config file, checked before it's saved (with the settings it changes), and
+  every saved version. Changes take effect when `gatefold run` restarts.
+
+With `server.token` set, the UI asks for it (or takes `Authorization: Bearer <token>`); it's
+required when `listen` isn't a loopback address. Only one `gatefold run` works on a state
+dir at a time. The first Ctrl-C (or SIGTERM) stops every run after its current track or
+artist; a second one exits right away.
+
+The API: `GET /api/v1/status`, `GET /api/v1/events` (server-sent events, each tagged with its
+job's `lane`) and `POST /api/v1/run` (JSON: `job` to run one now, or `dir`, `dry_run`,
+`replace_cover`, …, `only` for a one-off run).
+
+### What changed
+
+Every run that isn't a dry run (from the command line too) records what it wrote in
+`gatefold.db`, in the state dir: lyrics embedded, plain lyrics replaced with synced ones,
+covers and animated covers, artist photos, backdrops and logos, nfo files, and the images
+you kept, skipped, archived or restored. `gatefold changes` lists them, newest first:
+
+```
+$ gatefold changes --artist interrupters
+2026-11-23
+  10:32  The Interrupters · Added animated cover: 2027 - Battle Scars/cover.mp4 (apple music)
+  10:32  The Interrupters · Added cover: 2027 - Battle Scars/cover.jpg (apple music)
+```
+
+`--dir <artist or album folder>` and `--kind lyrics|covers|artist|nfo|files` narrow it down.
+
+### File names in the wrong case
+
+A library edited on macOS, which ignores case in file names, and processed on Linux, which
+doesn't, gets sidecars named in another case than their track: `01. song.lrc` next to
+`01. Song.flac`, or `Cover.JPG`. gatefold reads those as the track's (or folder's) sidecar,
+so it never writes a second one, but Jellyfin on Linux doesn't. `gatefold fix-case --dir
+~/Music` renames them to what's expected; where two spellings sit side by side, it keeps the
+best (synced lyrics over plain) and moves the other into `.gatefold-archive/`. `--dry-run`
+lists them. `gatefold run` finds them after every run, and the dashboard can fix them.
 
 ### Examples
 
@@ -330,6 +465,7 @@ Keeping an image you had [skipped](#skipping-an-image) takes the skip back.
 gatefold keep --file "Music/Kemuri/folder.jpg"                        # .gatefold-primary-keep
 gatefold keep --file "Music/Kemuri/1997 - Little Playmate/cover.jpg"  # .gatefold-cover-keep in the album
 gatefold keep --dir "Music/Bad Cop Bad Cop"                           # .gatefold-keep
+gatefold keep --undo --file "Music/Kemuri/folder.jpg"                 # removes .gatefold-primary-keep
 ```
 
 `.gatefold-keep` keeps everything its folder governs. Without it, the granular markers keep
@@ -403,7 +539,8 @@ image's contents, and leaves the image where it is. On later runs:
   `--replace-artist-images` runs, as usual.
 
 You can skip `cover.jpg` / `cover.jpeg` / `cover.png`, the animated `cover.mp4`, and the artist files (`folder.jpg`,
-`backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). Delete the marker to undo.
+`backdrop.jpg`, `backdrops/backdrop.mp4`, `logo.png`). `gatefold skip --undo --file <image>`
+(or deleting the marker) takes it back.
 
 ### Archiving an image
 

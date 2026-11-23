@@ -38,6 +38,17 @@ impl CachedArt {
         digest == digest_bytes(&self.data) || self.original.as_deref() == Some(digest)
     }
 
+    /// An image (or video) uploaded from the web UI.
+    pub fn uploaded(ext: &str, mime: &str, data: Vec<u8>) -> Self {
+        CachedArt {
+            mime: mime.to_string(),
+            ext: ext.to_string(),
+            data,
+            source: Some("upload".to_string()),
+            original: None,
+        }
+    }
+
     /// An uncached image, for tests.
     #[cfg(test)]
     pub fn new(ext: &str, data: &[u8]) -> Self {
@@ -390,10 +401,7 @@ impl State {
         };
         meta.optimized = true;
         let bytes_path = self.art_dir.join(format!("{digest}.{}", meta.ext));
-        let work = self.art_dir.join(format!(".{digest}.{}.part", meta.ext));
-        fs::write(&work, &data).with_context(|| format!("writing {}", work.display()))?;
-        fs::rename(&work, &bytes_path)
-            .with_context(|| format!("replacing {}", bytes_path.display()))?;
+        write_atomically(&bytes_path, &data)?;
         write_json(&self.art_meta_path(digest), meta)?;
         Ok(data)
     }
@@ -456,7 +464,20 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+    write_atomically(path, &bytes)
+}
+
+/// Write `bytes` to `path` through a temporary file of its own, so a reader
+/// (or another run writing the same entry) never sees half of it.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let work = path.with_file_name(format!(".{name}.{}-{n}.part", std::process::id()));
+    fs::write(&work, bytes).with_context(|| format!("writing {}", work.display()))?;
+    fs::rename(&work, path).with_context(|| format!("replacing {}", path.display()))
 }
 
 /// Create an empty marker file (used for persisted "not found" results).

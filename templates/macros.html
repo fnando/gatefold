@@ -1,0 +1,38 @@
+{% macro change_groups(groups) %}
+{% if groups.is_empty() %}
+<div class="card"><p class="empty">Nothing changed yet.</p></div>
+{% else %}
+<div class="card">
+{% for group in groups %}
+  <div class="row change">
+    <div class="row-main">
+      <div class="change-title">
+        <span class="dots">{% for g in group.groups() %}{% let label = crate::web::data::group_label(g) %}<span class="dot g-{{ g }}" title="{{ label }}" role="img" aria-label="{{ label }}"></span>{% endfor %}</span>
+        {% if let Some(dir) = group.artist_dir %}<a class="row-title" href="{{ crate::web::data::artist_link(dir) }}">{{ group.artist }}</a>{% else %}<span class="row-title">{{ group.artist }}</span>{% endif %}
+      </div>
+      <div class="row-sub">{{ group.summary() }}{% let sources = group.sources() %}{% if !sources.is_empty() %} <span class="muted">· from {{ sources }}</span>{% endif %}</div>
+    </div>
+    <div class="row-side">
+      <small class="muted" title="{{ group.at_full }}">{{ group.at }}</small>
+      {% if let Some(run) = group.run_id %}<a class="muted" href="/runs/{{ run }}"><small>run #{{ run }}</small></a>{% endif %}
+    </div>
+    <details class="change-files" data-key="files:{% if let Some(run) = group.run_id %}{{ run }}{% endif %}:{{ group.artist_dir.as_deref().unwrap_or(group.artist.as_str()) }}">
+      <summary class="muted">{{ group.items.len() }} file{% if group.items.len() != 1 %}s{% endif %}</summary>
+      {% for folder in group.folders() %}
+      {% if let Some(name) = folder.folder %}<div class="folder">{{ name }}</div>{% endif %}
+      <ul class="items">
+      {% for file in folder.files %}
+        <li><span class="file">{{ file.name }}</span>{% if file.transition %}<span class="sequence">{% for tag in file.tags %}{% if !loop.first %}<span class="arrow">→</span>{% endif %}<span class="state">{{ tag }}</span>{% endfor %}</span>{% else %}{% for tag in file.tags %}<span class="tag">{{ tag }}</span>{% endfor %}{% endif %}</li>
+      {% endfor %}
+      </ul>
+      {% endfor %}
+    </details>
+  </div>
+{% endfor %}
+</div>
+{% endif %}
+{% endmacro %}
+
+{% macro flash(message) %}
+{% if let Some(message) = message %}<p class="flash" role="status">{{ message }}</p>{% endif %}
+{% endmacro %}

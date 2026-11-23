@@ -1,0 +1,87 @@
+{% extends "layout.html" %}
+{% import "macros.html" as m %}
+{% block title %}{{ name }} · gatefold{% endblock %}
+{% block content %}
+<a class="back" href="{{ artist_link }}">← {{ artist_name }}</a>
+<header class="page-head">
+  <div>
+    <h1>{{ name }}</h1>
+    <div class="totals">
+      <span>{{ shown_dir }}</span>
+      <span>{{ tracks.len() }} tracks</span>
+      {% if kept %}<span class="pill st-kept">cover kept</span>{% endif %}
+    </div>
+  </div>
+  <div class="actions">
+    {% if kept %}
+    <button class="small" hx-post="/actions/folder/unkeep" hx-vals='{"dir": {{ dir|json|safe }}}' hx-confirm="Stop keeping this album's cover? Replace runs may swap it again.">Unkeep folder</button>
+    {% else %}
+    <button class="small" hx-post="/actions/folder/keep" hx-vals='{"dir": {{ dir|json|safe }}}' hx-confirm="Keep this album's cover? Replace runs will never swap it." title="Replace runs never swap this album's cover">Keep folder</button>
+    {% endif %}
+    <button class="small primary" hx-post="/actions/run" hx-vals='{"dir": {{ dir|json|safe }}}'>Run on this album</button>
+  </div>
+</header>
+{% call m::flash(message) %}{% endcall %}
+
+<section>
+  <div class="section-head"><h2>Covers</h2></div>
+  <div class="media-grid">
+    {% for image in covers %}{% include "image_card.html" %}{% endfor %}
+  </div>
+</section>
+
+<section>
+  <div class="section-head"><h2>Tracks</h2></div>
+  <div class="card">
+  {% for track in tracks %}
+    <div class="row inline">
+      <div class="row-main">
+        <div class="row-title">{% if !track.number.is_empty() %}{{ track.number }}. {% endif %}{{ track.title }}</div>
+        <div class="meta">
+          <span>{{ track.duration }}</span>
+          <span class="pill st-{{ track.lyrics }}">{% if track.lyrics == "synced" %}synced lyrics{% else if track.lyrics == "plain" %}plain lyrics{% else %}no .lrc{% endif %}</span>
+        </div>
+        <details class="upload">
+          <summary class="muted">Lyrics</summary>
+          <form hx-post="/actions/upload" hx-encoding="multipart/form-data" class="upload-form">
+            <input type="hidden" name="target" value="lyrics">
+            <input type="hidden" name="path" value="{{ track.path }}">
+            <input type="file" name="file" accept=".lrc,.txt,text/plain">
+            <textarea name="text" rows="6" placeholder="…or paste them. Lines with [mm:ss.xx] stamps make an .lrc; plain text is embedded."></textarea>
+            <button class="small primary" type="submit">Save lyrics</button>
+          </form>
+        </details>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+
+{% if !archived.is_empty() %}
+<section>
+  <div class="section-head"><h2>Archive · {{ archived.len() }}</h2><span class="hint">Earlier covers and lyrics, newest first</span></div>
+  <div class="card">
+  {% for file in archived %}
+    <div class="row">
+      <div class="row-main with-thumb">
+        {% if file.shown_as == "image" %}<img class="thumb" src="{{ file.url }}" alt="" loading="lazy">{% else if file.shown_as == "video" %}<video class="thumb" src="{{ file.url }}" muted preload="metadata"></video>{% else %}<span class="thumb lyrics">.lrc</span>{% endif %}
+        <div>
+          <a class="row-title" href="{{ file.url }}" target="_blank">{{ file.label }}</a>
+          <div class="meta"><span>{{ file.name }}</span><span>{{ file.size }}</span></div>
+        </div>
+      </div>
+      <div class="row-side actions">
+        <button class="small" hx-post="/actions/restore-album" hx-vals='{"path": {{ file.path|json|safe }}}' hx-confirm="Restore {{ file.name }}? What it replaces is archived{% if file.keepable %} and skipped{% endif %}.">Restore</button>
+        {% if file.keepable %}<button class="small" hx-post="/actions/restore-album" hx-vals='{"path": {{ file.path|json|safe }}, "keep": "1"}' hx-confirm="Restore {{ file.name }} and keep it?">Restore and keep</button>{% endif %}
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<section>
+  <div class="section-head"><h2>History</h2></div>
+  {% call m::change_groups(history) %}{% endcall %}
+</section>
+{% endblock %}

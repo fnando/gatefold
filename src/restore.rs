@@ -39,7 +39,7 @@ const SECTIONS: [(&str, &[ArtistImage]); 3] = [
 
 /// The kind of artist file an archived `path` is a version of, by its folder
 /// under `.gatefold-archive/` and its extension.
-fn kind_of(path: &Path) -> Option<ArtistImage> {
+pub fn kind_of(path: &Path) -> Option<ArtistImage> {
     let sub = path.parent()?.file_name()?.to_str()?;
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     let (_, kinds) = SECTIONS.iter().find(|(name, _)| *name == sub)?;
@@ -54,7 +54,7 @@ fn kind_of(path: &Path) -> Option<ArtistImage> {
 
 /// The artist folder an archived `path` belongs to:
 /// `<artist>/.gatefold-archive/<sub>/<file>`.
-fn artist_dir_of(path: &Path) -> Option<&Path> {
+pub fn artist_dir_of(path: &Path) -> Option<&Path> {
     let archive = path.parent()?.parent()?;
     (archive.file_name()? == ARCHIVE_DIR).then(|| archive.parent())?
 }
@@ -185,6 +185,7 @@ pub fn run(target: &Target, keep: bool) -> Result<Option<PathBuf>> {
     if let Some((previous, archived)) = &restored.replaced {
         println!("  {} skipped and archived as {archived}", name(previous));
     }
+    crate::record_file_change(crate::changes::Kind::Restored, &restored.current);
     if keep {
         let marker = keep::mark_artist_image(&dir, entry.kind)?;
         println!("  kept ({})", name(marker.path()));

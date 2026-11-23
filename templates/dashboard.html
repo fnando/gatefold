@@ -1,0 +1,16 @@
+{% extends "layout.html" %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Dashboard</h1>
+    <div class="totals">
+      <span class="live stale" id="connection">Connecting</span>
+      <span class="version">gatefold {{ version }}</span>
+      {% for library in status.libraries %}<span>{{ library }}</span>{% endfor %}
+    </div>
+  </div>
+</header>
+{% include "live.html" %}
+{% include "status.html" %}
+<script src="{{ crate::web::asset_url("live.js") }}" defer></script>
+{% endblock %}

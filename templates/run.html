@@ -1,0 +1,57 @@
+{% extends "layout.html" %}
+{% import "macros.html" as m %}
+{% block title %}Run #{{ run.id }} · gatefold{% endblock %}
+{% block content %}
+<a class="back" href="/">← Dashboard</a>
+<header class="page-head">
+  <div>
+    <h1>Run #{{ run.id }}</h1>
+    <div class="totals">
+      <span class="pill st-{{ run.status }}">{{ run.status }}</span>
+      {% if run.dry_run %}<span class="pill st-dry">dry run</span>{% endif %}
+      <span>{{ run.trigger_label() }}</span>
+      <span>{{ run.started_full }}</span>
+      {% if let Some(duration) = run.duration %}<span>took {{ duration }}</span>{% endif %}
+      <span>{{ run.dir }}</span>
+    </div>
+  </div>
+  {% if !stats.is_empty() %}
+  <div class="stats">
+    {% for stat in stats %}<span class="stat {{ stat.class }}{% if stat.value == 0 %} zero{% endif %}"><b>{{ stat.value }}</b><span>{{ stat.label }}</span></span>{% endfor %}
+  </div>
+  {% endif %}
+</header>
+{% if let Some(error) = run.error %}<p class="flash error" role="alert">{{ error }}</p>{% endif %}
+{% if live %}<p class="flash" role="status">This run is going on now; <a href="/">the dashboard</a> follows it live.</p>{% endif %}
+
+<section>
+  <div class="section-head"><h2>Changes · {{ run.changes }}</h2></div>
+  {% call m::change_groups(groups) %}{% endcall %}
+</section>
+
+<section>
+  <div class="section-head"><h2>Log</h2></div>
+  <nav class="filter-bar" aria-label="Lines">
+    <a class="chip{% if kind.is_empty() %} active{% endif %}" href="{{ self.link("", 1) }}">All</a>
+    <a class="chip{% if kind == "ok" %} active{% endif %}" href="{{ self.link("ok", 1) }}"><span class="dot g-covers"></span>Done</a>
+    <a class="chip{% if kind == "error" %} active{% endif %}" href="{{ self.link("error", 1) }}"><span class="dot g-files"></span>Errors</a>
+    <a class="chip{% if kind == "info" %} active{% endif %}" href="{{ self.link("info", 1) }}"><span class="dot g-nfo"></span>Notes</a>
+  </nav>
+  {% if lines.is_empty() %}
+  <div class="card"><p class="empty">No log kept for this run.</p></div>
+  {% else %}
+  <div class="card log">
+    {% for line in lines %}
+    <div class="line l-{{ line.kind }}"><time>{{ line.at }}</time><span>{{ line.text }}</span></div>
+    {% endfor %}
+  </div>
+  {% if pages > 1 %}
+  <nav class="pages">
+    {% if page > 1 %}<a class="btn" href="{{ self.link(kind, page - 1) }}">← Earlier</a>{% endif %}
+    <span class="muted">Page {{ page }} of {{ pages }} · {{ total }} lines</span>
+    {% if page < pages %}<a class="btn" href="{{ self.link(kind, page + 1) }}">Later →</a>{% endif %}
+  </nav>
+  {% endif %}
+  {% endif %}
+</section>
+{% endblock %}
