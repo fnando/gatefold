@@ -3060,14 +3060,11 @@ fn pad_track_number(name: &str) -> String {
 
 fn log_lyrics(progress: &Progress, name: &str, outcome: &LyricsOutcome, dry_run: bool) {
     match outcome {
-        LyricsOutcome::SkippedNothingToDo => {
-            progress.info(format!("· {name}: lyrics already present"));
-        }
         LyricsOutcome::SkippedMissingTags => {
             progress.info(format!("· {name}: lyrics skip (missing artist/title tags)"));
         }
-        // Skipped by --new-only/--miss-only selection — stay quiet.
-        LyricsOutcome::SkippedByFilter => {}
+        // Nothing to do, or skipped by --new-only/--miss-only — stay quiet.
+        LyricsOutcome::SkippedNothingToDo | LyricsOutcome::SkippedByFilter => {}
         LyricsOutcome::NotFound => progress.info(format!("· {name}: lyrics not found on lrclib")),
         LyricsOutcome::NoLyrics => progress.info(format!("· {name}: no lyrics available")),
         LyricsOutcome::Applied { tag, lrc, reused } => {
@@ -3172,13 +3169,16 @@ fn log_cover_video(progress: &Progress, album: &str, outcome: &CoverVideoOutcome
 fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome, dry_run: bool) {
     let name = &job.name;
     match outcome {
-        ArtistOutcome::SkippedNothingToDo | ArtistOutcome::SkippedByFilter => {}
+        // Nothing changed — stay quiet; the summary counts them.
+        ArtistOutcome::SkippedNothingToDo
+        | ArtistOutcome::SkippedByFilter
+        | ArtistOutcome::Kept
+        | ArtistOutcome::Fresh
+        | ArtistOutcome::Unchanged => {}
         ArtistOutcome::NoFolder => progress.info(format!(
             "· {name}: no artist folder above {}",
             job.sample_dir.display()
         )),
-        ArtistOutcome::Kept => progress.info(format!("· {name}: artist images kept")),
-        ArtistOutcome::Fresh => progress.info(format!("· {name}: artist page checked recently")),
         ArtistOutcome::SpotifyOnly { apple_link } => progress.info(format!(
             "· {name}: {}; Spotify only has an avatar, and {} is already there (set one with --apple-url)",
             no_apple_photo(*apple_link),
@@ -3192,7 +3192,6 @@ fn log_artist(progress: &Progress, job: &ArtistJob, outcome: &ArtistOutcome, dry
         ArtistOutcome::NoImage => {
             progress.info(format!("· {name}: no artist image on Apple Music/Spotify"));
         }
-        ArtistOutcome::Unchanged => progress.info(format!("· {name}: artist images unchanged")),
         ArtistOutcome::Applied {
             avatar,
             backdrop,
